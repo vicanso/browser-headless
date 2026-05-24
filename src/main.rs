@@ -398,6 +398,24 @@ struct SummaryQuery {
     #[serde(default)]
     resources: bool,
 
+    /// Convenience switch that turns ON every **analytical** flag:
+    /// `web_vitals` / `metrics` / `metadata` / `render_blocking` /
+    /// `service_worker` / `initiators` / `console_messages` /
+    /// `image_sizing` / `dom_mutations` / `resources`. Equivalent to
+    /// setting all ten manually — saves long query strings in AI
+    /// comparison / regression-audit workflows.
+    ///
+    /// **Does NOT enable binary captures** (`screenshot` / `pdf` / `har`
+    /// / `save_dom_snapshot`) — those produce MB-scale payloads and are
+    /// kept on explicit opt-in so a stray `all_metrics=true` can't
+    /// accidentally balloon a response by 10×.
+    ///
+    /// Combine semantics: OR with each individual flag (anything already
+    /// `true` stays `true`). When `false` (default), individual flags
+    /// behave exactly as before — fully backwards compatible.
+    #[serde(default)]
+    all_metrics: bool,
+
     /// Optional client-supplied request ID for tracing/log correlation.
     /// If absent, falls back to the `X-Request-ID` header; if that's also
     /// missing, an auto-generated UUID v4 is used. Every tracing log
@@ -627,19 +645,29 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         data_format: q.data_format,
         normalize_custom_elements: q.normalize_custom_elements.unwrap_or(true),
         disable_javascript: q.disable_javascript,
+        // Binary captures stay on explicit opt-in (intentionally NOT
+        // touched by `all_metrics` — MB-scale payloads). Caller still
+        // sets `pdf=true` / `screenshot=true` etc. when they really want
+        // them.
         pdf: q.pdf,
         har: q.har,
         save_dom_snapshot: q.save_dom_snapshot,
-        web_vitals: q.web_vitals,
-        metrics: q.metrics,
-        metadata: q.metadata,
-        render_blocking: q.render_blocking,
-        service_worker: q.service_worker,
-        initiators: q.initiators,
-        console_messages: q.console_messages,
-        image_sizing: q.image_sizing,
-        dom_mutations: q.dom_mutations,
-        resources: q.resources,
+        // Analytical flags — `all_metrics` is a convenience OR-mask over
+        // every "indicator" feature. Individual `true` stays `true`
+        // (already-set flags are unaffected); the only effect is
+        // bringing untouched defaults UP to true when the master switch
+        // is on. Backwards compatible: `all_metrics=false` (default)
+        // leaves every flag exactly as the caller wrote it.
+        web_vitals: q.web_vitals || q.all_metrics,
+        metrics: q.metrics || q.all_metrics,
+        metadata: q.metadata || q.all_metrics,
+        render_blocking: q.render_blocking || q.all_metrics,
+        service_worker: q.service_worker || q.all_metrics,
+        initiators: q.initiators || q.all_metrics,
+        console_messages: q.console_messages || q.all_metrics,
+        image_sizing: q.image_sizing || q.all_metrics,
+        dom_mutations: q.dom_mutations || q.all_metrics,
+        resources: q.resources || q.all_metrics,
     };
 
     // Snapshot the current browser handle out from under the RwLock so the

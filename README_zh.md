@@ -149,6 +149,7 @@ curl -X POST http://localhost:3000/summary \
 | `image_sizing` | bool | false | 逐张 `<img>` 审计：解码后的原始尺寸 vs 实际布局尺寸（已按 DPR 修正，retina 优化图不会误报浪费）、`loading` 模式、是否在首屏、是否缺 `alt`；服务端关联 `transferred_bytes` 并计算 `waste_ratio`。结果按浪费率降序写入 `stat.image_sizing`。一次 `evaluate` 调用，~2ms（100+ 张图）。 |
 | `dom_mutations` | bool | false | 导航前注入 `MutationObserver`，统计整个渲染期间的 DOM 变更（childList 增删 + 属性修改）。输出 `stat.dom_mutations`：总数 + 观测窗口 + top tags + top attributes。重度 SPA 也 ≤5ms 开销（只增不读、不存原始 records、跳过 `characterData`）。 |
 | `resources` | bool | false | 是否在响应中包含完整的 `stat.resources[]` 列表。默认关闭 —— 功能校验（"页面是否正常加载"）只需要标量 `total_size` + `resource_count` + 聚合 `resource_summary`（按 MIME bucket 的字节/数量、状态码分布、缓存命中率、第三方字节、最大资源），覆盖度足够。只在需要逐条 forensics（timing / mime / 缓存命中 / initiator）时打开。内部始终采集，所以依赖 resources 的下游特性（HAR、`image_sizing.transferred_bytes`、`resource_summary`）不受影响。 |
+| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）—— 这些是 MB 级 payload，保持显式 opt-in 避免一个 flag 误把响应体撑大 10 倍。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
 | `normalize_custom_elements` | bool | true | （仅 markdown 模式生效）把自定义元素（如 `taro-view-core`）按 computed `display` 重写成 `<div>` / `<span>`。 |
@@ -559,17 +560,16 @@ curl -X POST http://localhost:3000/summary \
   -d '{
     "url": "https://example.com/critical-page",
     "format": "markdown",
-    "web_vitals": true,
-    "metrics": true,
-    "metadata": true,
-    "render_blocking": true,
-    "service_worker": true,
-    "initiators": true,
-    "image_sizing": true,
-    "dom_mutations": true,
+    "all_metrics": true,
     "settle_ms": 500
   }'
 ```
+
+(`all_metrics: true` 是简写，一次性开启全部 10 个分析类 flag ——
+`web_vitals` / `metrics` / `metadata` / `render_blocking` /
+`service_worker` / `initiators` / `console_messages` / `image_sizing` /
+`dom_mutations` / `resources`。大体积二进制 `screenshot` / `pdf`
+等仍需显式开启。)
 
 返回的单一 markdown 文档包含：加载摘要、异常、Web Vitals + LCP 元素 +
 top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-host

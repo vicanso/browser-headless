@@ -166,6 +166,7 @@ curl -X POST http://localhost:3000/summary \
 | `image_sizing` | bool | false | Per-`<img>` audit: decoded natural dimensions vs laid-out display dimensions (DPR-corrected so retina-tuned images aren't false-flagged), `loading` mode, viewport overlap, missing alt, server-joined `transferred_bytes` and computed `waste_ratio`. Output sorted worst-first into `stat.image_sizing`. One `evaluate` call, ~2ms even for 100+ images. |
 | `dom_mutations` | bool | false | Install a pre-navigation `MutationObserver` and count DOM mutations (childList adds/removes + attribute changes) during the full render window. Output: `stat.dom_mutations` with totals + observation duration + top tags + top attributes. ≤5ms overhead even on heavy SPAs (counter-only, never stores raw records, `characterData` skipped). |
 | `resources` | bool | false | Include the full per-resource list (`stat.resources[]`) in the response. Default off — for "did the page load OK" validation, scalar `total_size` + `resource_count` + aggregated `resource_summary` (bytes & count by MIME bucket, status distribution, cache hit ratio, third-party bytes, largest resource) cover the signal at a fraction of the payload. Enable only when you need per-entry forensics (timing / mime / cache flag / initiator). Internal collection is always on, so dependent features (HAR, `image_sizing.transferred_bytes`, `resource_summary`) keep working regardless. |
+| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) — those produce MB-scale payloads and stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
 | `normalize_custom_elements` | bool | true | (Markdown only) Rewrite custom elements (`taro-view-core`, etc.) to `<div>`/`<span>` based on computed `display`. |
@@ -584,17 +585,16 @@ curl -X POST http://localhost:3000/summary \
   -d '{
     "url": "https://example.com/critical-page",
     "format": "markdown",
-    "web_vitals": true,
-    "metrics": true,
-    "metadata": true,
-    "render_blocking": true,
-    "service_worker": true,
-    "initiators": true,
-    "image_sizing": true,
-    "dom_mutations": true,
+    "all_metrics": true,
     "settle_ms": 500
   }'
 ```
+
+(`all_metrics: true` is shorthand for enabling all ten analytical flags at
+once — `web_vitals` / `metrics` / `metadata` / `render_blocking` /
+`service_worker` / `initiators` / `console_messages` / `image_sizing` /
+`dom_mutations` / `resources`. Binary captures like `screenshot` / `pdf`
+stay separate.)
 
 You get back a single markdown document with sections for: load summary,
 exceptions, web vitals + LCP element + top CLS offenders, resource
