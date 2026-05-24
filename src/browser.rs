@@ -108,7 +108,7 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
             match handler.next().await {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    tracing::debug!("browser handler error: {e}");
+                    tracing::debug!(error = %e, "browser handler error");
                 }
                 None => {
                     tracing::error!("browser handler stream ended; signalling supervisor");
@@ -225,7 +225,7 @@ pub async fn apply_block_resource_types(
                                 .map(|_| ())
                         };
                         if let Err(e) = result {
-                            tracing::debug!("fetch handler error: {e}");
+                            tracing::debug!(error = %e, "fetch handler error");
                         }
                     }
                     None => break,
@@ -819,10 +819,10 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
 
         // Third-party = different host from the target URL.
         // Also collect unique hosts (DNS lookup approximation) — done
-        // here once per resource regardless of cache state.
-        if let Ok(parsed) = url::Url::parse(&r.url)
-            && let Some(h) = parsed.host_str()
-        {
+        // here once per resource regardless of cache state. Uses the
+        // `parsed_url` cache populated in `collect_summary`; avoids a
+        // second per-resource `Url::parse` call.
+        if let Some(h) = r.parsed_url.as_ref().and_then(|u| u.host_str()) {
             hosts.insert(h.to_string());
             if !target_host.is_empty() && h != target_host {
                 summary.third_party_bytes += r.content_size;
@@ -894,8 +894,12 @@ fn mime_bucket(mime: &str) -> &'static str {
 /// into `PageMetrics`. Memory + DOM counts are sourced directly; CPU
 /// durations are converted from CDP seconds to ms. Unknown metric names
 /// are ignored.
+///
+/// **Precondition:** `apply_performance_enable(page, true)` must have been
+/// called earlier in the request (handled by `capture()` in the apply
+/// stage when `req.metrics = true`). Without it, CDP returns the error
+/// "Performance domain is not enabled" and this function fails.
 pub async fn collect_page_metrics(page: &Page) -> Result<PageMetrics, Error> {
-    page.execute(PerformanceEnableParams::default()).await?;
     let resp = page.execute(GetMetricsParams::default()).await?;
 
     let mut m = PageMetrics::default();
@@ -1063,14 +1067,63 @@ const WEB_VITALS_READ_JS: &str = r#"
 })()
 "#;
 
-/// Install the Web Vitals collection script (runs on every new document).
-/// Must be called before navigation so observers are in place for the
-/// initial paint / shift / longtask entries.
-pub async fn apply_web_vitals_setup(page: &Page) -> Result<(), Error> {
+/// Install pre-navigation observer scripts in a single CDP call.
+///
+/// Each enabled flag contributes its IIFE-wrapped setup block to a combined
+/// payload, which is then injected via **one** `Page.addScriptToEvaluateOnNewDocument`.
+/// Saves one CDP RTT vs registering each script separately — the registered
+/// payload still runs before any user / framework script on every new
+/// document, preserving the "observer in place before initial paint /
+/// hydration" guarantee.
+///
+/// Safe to concatenate: every setup block is a self-contained IIFE
+/// terminated with `})();`, so two IIFEs joined directly parse as two
+/// independent statements with no scope cross-talk. All blocks also include
+/// idempotency guards (`if (window.__xxx_initialized) return;`) so even
+/// double-injection from buggy callers wouldn't double-instrument.
+///
+/// Returns `Ok(())` without any CDP call when both flags are `false` —
+/// callers don't need to pre-check.
+pub async fn apply_observers_setup(
+    page: &Page,
+    web_vitals: bool,
+    dom_mutations: bool,
+) -> Result<(), Error> {
+    if !web_vitals && !dom_mutations {
+        return Ok(());
+    }
+    // Borrow `&'static str` directly when only one is requested; pay the
+    // String allocation only for the merge case.
+    let combined: std::borrow::Cow<'static, str> = match (web_vitals, dom_mutations) {
+        (true, true) => format!("{WEB_VITALS_SETUP_JS}{DOM_MUTATIONS_SETUP_JS}").into(),
+        (true, false) => WEB_VITALS_SETUP_JS.into(),
+        (false, true) => DOM_MUTATIONS_SETUP_JS.into(),
+        (false, false) => unreachable!(), // handled above
+    };
     page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
-        WEB_VITALS_SETUP_JS,
+        combined.into_owned(),
     ))
     .await?;
+    Ok(())
+}
+
+/// Enable the CDP `Performance` domain pre-navigation, **only** when the
+/// request actually wants metrics. CDP requires the domain to be enabled
+/// before `Performance.getMetrics` will return a payload (otherwise it
+/// errors with "Performance domain is not enabled"). Hoisting the enable
+/// into the parallel apply stage saves a serial CDP RTT later in the
+/// format stage — `collect_page_metrics` then only needs the single
+/// `getMetrics` call.
+///
+/// Skipped entirely when `enabled=false` so feature-off requests pay
+/// nothing. Counters (`ScriptDuration`, `LayoutDuration`, etc.) are
+/// tracked by Chrome regardless of domain enable state, so enabling
+/// early doesn't add page overhead — it only unlocks the read endpoint.
+pub async fn apply_performance_enable(page: &Page, enabled: bool) -> Result<(), Error> {
+    if !enabled {
+        return Ok(());
+    }
+    page.execute(PerformanceEnableParams::default()).await?;
     Ok(())
 }
 
@@ -1152,17 +1205,6 @@ const DOM_MUTATIONS_READ_JS: &str = r#"
   };
 })()
 "#;
-
-/// Install the DOM mutation collector. Must run pre-navigation so the
-/// observer is in place before any user script (including framework
-/// bootstrap) touches the DOM.
-pub async fn apply_dom_mutations_setup(page: &Page) -> Result<(), Error> {
-    page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
-        DOM_MUTATIONS_SETUP_JS,
-    ))
-    .await?;
-    Ok(())
-}
 
 /// Read mutation accumulator and project the raw JS object into our typed
 /// `DomMutations` (sorted, trimmed top-N).
@@ -2057,6 +2099,13 @@ pub struct WebPageResource {
     /// `SummaryRequest.initiators = true` (requires subscribing to
     /// `Network.requestWillBeSent`).
     pub initiator: Option<RequestInitiator>,
+    /// Internal cache of `url::Url::parse(&url)` populated once when the
+    /// response event first arrives. Lets downstream consumers (TLS
+    /// extraction, `build_resource_summary`) read `host_str()` without
+    /// re-parsing. Skipped during serialisation — the canonical wire
+    /// form is the original `url` string above.
+    #[serde(skip)]
+    pub parsed_url: Option<url::Url>,
 }
 
 /// Simplified initiator: who/what triggered the request. Stack trace
@@ -2191,9 +2240,9 @@ pub async fn collect_summary(
         tokio::select! {
             _ = &mut sleep => {
                 tracing::debug!(
-                    "collect_summary stopping (timeout={}ms idle={:?})",
-                    timeout.as_millis(),
-                    idle_at.is_some(),
+                    timeout_ms = timeout.as_millis() as u64,
+                    idle = idle_at.is_some(),
+                    "collect_summary stopping",
                 );
                 break;
             }
@@ -2225,10 +2274,10 @@ pub async fn collect_summary(
                     }
                     let matched = pending_patterns.swap_remove(pos);
                     tracing::debug!(
-                        "wait_for_request matched {} ({}/{} remaining)",
-                        matched,
-                        pending_patterns.len(),
-                        total_patterns,
+                        pattern = matched,
+                        remaining = pending_patterns.len(),
+                        total = total_patterns,
+                        "wait_for_request matched",
                     );
                 }
 
@@ -2237,6 +2286,11 @@ pub async fn collect_summary(
                     request_id: id.clone(),
                     ..Default::default()
                 });
+                // Parse URL once and cache on the entry. Both TLS extract
+                // (below) and `build_resource_summary` (server-side derive)
+                // need `host_str()`; the cache eliminates a second parse
+                // per HTTPS resource. Hot-path cost: ~5-20μs per resource.
+                entry.parsed_url = url::Url::parse(&url).ok();
                 entry.url = url;
                 entry.status = status as u32;
                 entry.mime_type = ev.response.mime_type.clone();
@@ -2263,8 +2317,7 @@ pub async fn collect_summary(
                 // exposed via the singular `tls_info` field. Carries the
                 // browser-resolved remote IP — useful for hijack/MITM audit.
                 if let Some(sd) = ev.response.security_details.as_ref()
-                    && let Ok(parsed) = url::Url::parse(&entry.url)
-                    && let Some(host) = parsed.host_str()
+                    && let Some(host) = entry.parsed_url.as_ref().and_then(|u| u.host_str())
                 {
                     let host = host.to_string();
                     let remote_ip = ev.response.remote_ip_address.clone();
@@ -3248,43 +3301,66 @@ pub async fn capture(
     let page = browser.new_page(target_params).await?;
 
     // Stage 1: apply — all pre-navigation overrides + cookies + network rules.
+    //
+    // All 15 setters are **independent** (different CDP domains, no shared
+    // state) and **idempotent within a fresh page**. We `try_join!` them so
+    // chromiumoxide pipelines the CDP commands over the single underlying
+    // WebSocket instead of paying one RTT per call serially. Total latency
+    // for this stage drops from `sum(per-call RTT)` (~30-50ms with most
+    // overrides set) to `max(per-call RTT)` (~5-10ms).
+    //
+    // Conditional setters (`cookies` / `disable_cache` / `web_vitals` /
+    // `dom_mutations`) are wrapped in async blocks so they no-op when the
+    // request didn't ask for them — same "skip CDP call when unused"
+    // semantics as the original sequential version, just concurrent.
+    //
+    // `apply_block_resource_types` returns an `Option<oneshot::Sender<()>>`
+    // RAII guard for the spawned Fetch drain task; it's captured by name
+    // in the destructure pattern so its drop point stays at end of scope.
+    // All `addScriptToEvaluateOnNewDocument` calls in this join still
+    // complete **before** `page.goto()` in stage 2 starts, preserving the
+    // "observer in place before initial render" guarantee.
     let t_apply = Instant::now();
-    apply_viewport(&page, req.width, req.height, req.device_scale_factor).await?;
-    apply_touch_emulation(&page, req.touch).await?;
-    apply_user_agent(
-        &page,
-        req.user_agent.as_deref(),
-        req.accept_language.as_deref(),
-        default_user_agent,
-    )
-    .await?;
-    apply_extra_headers(&page, &req.headers).await?;
-    apply_timezone(&page, req.timezone.as_deref()).await?;
-    apply_locale(&page, req.locale.as_deref()).await?;
-    apply_geolocation(&page, req.geolocation.as_ref()).await?;
-
-    if !req.cookies.is_empty() {
-        set_cookies(&page, &req.cookies, &req.url).await?;
-    }
-    if req.disable_cache {
-        set_cache_disabled(&page, true).await?;
-    }
-    apply_blocked_urls(&page, &req.block_urls).await?;
-    // Held until `capture` returns. Dropping the Sender wakes the spawned
-    // Fetch drain task so it exits cleanly when the page is gone.
-    let _resource_block_guard =
-        apply_block_resource_types(&page, &req.block_resource_types).await?;
-    apply_disable_javascript(&page, req.disable_javascript).await?;
-    apply_cpu_throttle(&page, req.cpu_throttle).await?;
-    if req.web_vitals {
-        apply_web_vitals_setup(&page).await?;
-    }
-    if req.dom_mutations {
-        // Must install before navigation so the observer catches initial
-        // hydration / SSR mount / framework bootstrap — the most
-        // mutation-heavy phase.
-        apply_dom_mutations_setup(&page).await?;
-    }
+    let (_, _, _, _, _, _, _, _, _, _, _resource_block_guard, _, _, _, _) = tokio::try_join!(
+        apply_viewport(&page, req.width, req.height, req.device_scale_factor),
+        apply_touch_emulation(&page, req.touch),
+        apply_user_agent(
+            &page,
+            req.user_agent.as_deref(),
+            req.accept_language.as_deref(),
+            default_user_agent,
+        ),
+        apply_extra_headers(&page, &req.headers),
+        apply_timezone(&page, req.timezone.as_deref()),
+        apply_locale(&page, req.locale.as_deref()),
+        apply_geolocation(&page, req.geolocation.as_ref()),
+        async {
+            if !req.cookies.is_empty() {
+                set_cookies(&page, &req.cookies, &req.url).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if req.disable_cache {
+                set_cache_disabled(&page, true).await
+            } else {
+                Ok(())
+            }
+        },
+        apply_blocked_urls(&page, &req.block_urls),
+        apply_block_resource_types(&page, &req.block_resource_types),
+        apply_disable_javascript(&page, req.disable_javascript),
+        apply_cpu_throttle(&page, req.cpu_throttle),
+        // web_vitals + dom_mutations setup scripts merged into ONE
+        // addScriptToEvaluateOnNewDocument call — saves a CDP RTT when
+        // both are enabled. No-op if neither flag is set.
+        apply_observers_setup(&page, req.web_vitals, req.dom_mutations),
+        // Performance domain enable hoisted pre-navigation when metrics
+        // requested — lets the later `collect_page_metrics` skip the
+        // domain-enable RTT (saves ~3-5ms in the format stage).
+        apply_performance_enable(&page, req.metrics),
+    )?;
     tracing::debug!(
         stage = "apply",
         duration_ms = t_apply.elapsed().as_millis() as u64
@@ -3330,126 +3406,209 @@ pub async fn capture(
     );
 
     // Stage 4: format — extract data + optional PDF / HAR / DOM snapshot.
+    //
+    // Two-phase design:
+    //   Phase A — concurrent CDP / JS reads (all read-only of page state).
+    //     Each arm is independent: data extraction, PDF print, DOM
+    //     snapshot, and every observer-accumulator drain operate on
+    //     different DOM subtrees or `window.*` globals. chromiumoxide
+    //     pipelines the CDP commands over the single underlying socket
+    //     so total latency drops from sum-of-RTTs (~50-80ms when most
+    //     features on) to max-of-RTTs (~10-15ms). For AI-comparison
+    //     mode (7+ features at once) this is the largest single-stage
+    //     win in the request.
+    //   Phase B — server-side derives + assignment.
+    //     `enrich_image_sizing`, `build_har`, `build_resource_summary`
+    //     all consume `stat.resources` (collected in stage 2). They are
+    //     pure functions of already-collected state, no extra IO.
+    //
+    // The user `script` (stage 3) already ran and may have mutated the
+    // DOM, so all reads here see the post-script DOM — including the
+    // re-extracted `stat.data`.
     let t_format = Instant::now();
-
-    // Format dispatch for `stat.data`, scoped to capture_element if provided.
-    // Always populates from a live read here (the optional script above may
-    // have changed the DOM since collect_summary).
     let capture_sel = req.capture_element.as_deref();
-    match req.data_format {
-        DataFormat::Html => {
-            stat.data = if let Some(sel) = capture_sel {
-                capture_property(&page, sel, "outerHTML", req.timeout).await?
+
+    // Phase A — parallel reads. Each arm returns its own `Result<T, Error>`.
+    // Conditional features no-op (return `None`) when not requested,
+    // preserving the "skip the CDP call entirely" optimisation.
+    let (
+        data,
+        pdf_data,
+        dom_snapshot,
+        web_vitals,
+        dom_mutations,
+        metrics,
+        metadata,
+        render_blocking,
+        service_worker,
+        image_sizing,
+    ) = tokio::try_join!(
+        // data — html / text / markdown extraction, scoped to capture_element.
+        async {
+            match req.data_format {
+                DataFormat::Html => {
+                    if let Some(sel) = capture_sel {
+                        capture_property(&page, sel, "outerHTML", req.timeout).await
+                    } else {
+                        page.content().await.map_err(Error::from)
+                    }
+                }
+                DataFormat::Text => extract_text(&page, capture_sel, req.timeout).await,
+                DataFormat::Markdown => {
+                    let source = if req.normalize_custom_elements {
+                        normalize_dom(&page, capture_sel, req.timeout).await?
+                    } else if let Some(sel) = capture_sel {
+                        capture_property(&page, sel, "outerHTML", req.timeout).await?
+                    } else {
+                        page.content().await?
+                    };
+                    let converter = HtmlToMarkdown::builder()
+                        .skip_tags(vec![
+                            "img", "script", "style", "svg", "iframe", "noscript",
+                        ])
+                        .build();
+                    converter
+                        .convert(&source)
+                        .map_err(|e| Error::InvalidInput(format!("markdown convert: {e}")))
+                }
+            }
+        },
+        // PDF — `Page.printToPDF`. Independent of DOM reads.
+        async {
+            if req.pdf {
+                let resp = page.execute(PrintToPdfParams::default()).await?;
+                Ok(Some(Pdf {
+                    data: resp.result.data.clone().into(),
+                    mime_type: "application/pdf".to_string(),
+                }))
             } else {
-                page.content().await?
-            };
-        }
-        DataFormat::Text => {
-            stat.data = extract_text(&page, capture_sel, req.timeout).await?;
-        }
-        DataFormat::Markdown => {
-            let source = if req.normalize_custom_elements {
-                normalize_dom(&page, capture_sel, req.timeout).await?
-            } else if let Some(sel) = capture_sel {
-                capture_property(&page, sel, "outerHTML", req.timeout).await?
+                Ok(None)
+            }
+        },
+        // DOM snapshot — heavy CDP call but pure read.
+        async {
+            if req.save_dom_snapshot {
+                // Small useful default set of computed styles; expand if
+                // downstream training needs more (font-weight, line-height).
+                let params = CaptureSnapshotParams::builder()
+                    .computed_styles(vec![
+                        "display".to_string(),
+                        "position".to_string(),
+                        "color".to_string(),
+                        "background-color".to_string(),
+                        "font-size".to_string(),
+                        "visibility".to_string(),
+                    ])
+                    .include_dom_rects(true)
+                    .build()
+                    .map_err(|e| Error::InvalidInput(format!("snapshot params: {e}")))?;
+                let resp = page.execute(params).await?;
+                Ok(Some(
+                    serde_json::to_value(&resp.result)
+                        .map_err(|e| Error::Cdp(format!("dom snapshot serialize: {e}")))?,
+                ))
             } else {
-                page.content().await?
-            };
-            let converter = HtmlToMarkdown::builder()
-                .skip_tags(vec!["img", "script", "style", "svg", "iframe", "noscript"])
-                .build();
-            stat.data = converter
-                .convert(&source)
-                .map_err(|e| Error::InvalidInput(format!("markdown convert: {e}")))?;
-        }
-    }
+                Ok(None)
+            }
+        },
+        // Web Vitals — drain the pre-navigation observer accumulator. By
+        // now observers have had stages 2 + 3 to fill up. Inline decode
+        // peels off the raw `loaf_entries` (private to this layer) before
+        // deserialising into the public `WebVitals` shape.
+        async {
+            if req.web_vitals {
+                let eval = page.evaluate(WEB_VITALS_READ_JS).await?;
+                let mut value: serde_json::Value = eval
+                    .into_value()
+                    .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
+                let loaf_raw: Vec<LoafRawEntry> = value
+                    .get_mut("loaf_entries")
+                    .and_then(|v| serde_json::from_value(v.take()).ok())
+                    .unwrap_or_default();
+                let mut vitals: WebVitals = serde_json::from_value(value)
+                    .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
+                aggregate_cls_sources(&mut vitals);
+                aggregate_loaf(&mut vitals, &loaf_raw);
+                Ok(Some(vitals))
+            } else {
+                Ok(None)
+            }
+        },
+        // DOM mutations — drain the MutationObserver counters.
+        async {
+            if req.dom_mutations {
+                collect_dom_mutations(&page).await
+            } else {
+                Ok(None)
+            }
+        },
+        // Page metrics — CDP `Performance.getMetrics`.
+        async {
+            if req.metrics {
+                collect_page_metrics(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        // Page metadata — `<head>` walker JS.
+        async {
+            if req.metadata {
+                collect_page_metadata(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        // Render-blocking head resources — `<head>` scan JS.
+        async {
+            if req.render_blocking {
+                collect_render_blocking(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        // Service Worker registration state — `navigator.serviceWorker` read.
+        async {
+            if req.service_worker {
+                collect_service_worker(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        // Image sizing raw — browser-side collection only. The follow-up
+        // `enrich_image_sizing` (joins with stat.resources) runs in
+        // Phase B because it needs the server-collected resource list.
+        async {
+            if req.image_sizing {
+                collect_image_sizing(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+    )?;
 
-    if req.pdf {
-        let resp = page.execute(PrintToPdfParams::default()).await?;
-        stat.pdf = Some(Pdf {
-            data: resp.result.data.clone().into(),
-            mime_type: "application/pdf".to_string(),
-        });
-    }
-
-    if req.har {
-        stat.har = Some(build_har(&stat, &req.url));
-    }
-
-    if req.save_dom_snapshot {
-        // Small useful default set of computed styles; expand if downstream
-        // training needs more (font-weight, line-height, etc.).
-        let params = CaptureSnapshotParams::builder()
-            .computed_styles(vec![
-                "display".to_string(),
-                "position".to_string(),
-                "color".to_string(),
-                "background-color".to_string(),
-                "font-size".to_string(),
-                "visibility".to_string(),
-            ])
-            .include_dom_rects(true)
-            .build()
-            .map_err(|e| Error::InvalidInput(format!("snapshot params: {e}")))?;
-        let resp = page.execute(params).await?;
-        stat.dom_snapshot = Some(
-            serde_json::to_value(&resp.result)
-                .map_err(|e| Error::Cdp(format!("dom snapshot serialize: {e}")))?,
-        );
-    }
-
-    if req.web_vitals {
-        // Read the accumulator the pre-navigation observer populated. Safe
-        // to read here — observers have had `collect` + `capture` stages
-        // worth of time to accumulate entries.
-        let eval = page.evaluate(WEB_VITALS_READ_JS).await?;
-        // The JS payload carries `loaf_entries` (raw per-frame breakdown)
-        // that isn't part of the public `WebVitals` shape. Pull it out
-        // before deserialising into `WebVitals`, then feed the raw into
-        // server-side `aggregate_loaf` to compute top offenders.
-        let mut value: serde_json::Value = eval
-            .into_value()
-            .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
-        let loaf_raw: Vec<LoafRawEntry> = value
-            .get_mut("loaf_entries")
-            .and_then(|v| serde_json::from_value(v.take()).ok())
-            .unwrap_or_default();
-        let mut vitals: WebVitals = serde_json::from_value(value)
-            .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
-        aggregate_cls_sources(&mut vitals);
-        aggregate_loaf(&mut vitals, &loaf_raw);
-        stat.web_vitals = Some(vitals);
-    }
-
-    if req.dom_mutations {
-        // Drain the MutationObserver accumulator. Read as late as possible
-        // in capture so the observation window covers the full render.
-        stat.dom_mutations = collect_dom_mutations(&page).await?;
-    }
-
-    if req.metrics {
-        stat.metrics = Some(collect_page_metrics(&page).await?);
-    }
-
-    if req.metadata {
-        stat.metadata = Some(collect_page_metadata(&page).await?);
-    }
-
-    if req.render_blocking {
-        stat.render_blocking_resources = Some(collect_render_blocking(&page).await?);
-    }
-
-    if req.service_worker {
-        stat.service_worker = Some(collect_service_worker(&page).await?);
-    }
-
-    if req.image_sizing {
-        let mut imgs = collect_image_sizing(&page).await?;
+    // Phase B — assignment + pure server-side derives. All operate on
+    // already-collected `stat` state; no extra browser IO. Ordered so
+    // `enrich_image_sizing` / `build_har` / `build_resource_summary`
+    // all see the fully populated `stat.resources` before any clearing.
+    stat.data = data;
+    stat.pdf = pdf_data;
+    stat.dom_snapshot = dom_snapshot;
+    stat.web_vitals = web_vitals;
+    stat.dom_mutations = dom_mutations;
+    stat.metrics = metrics;
+    stat.metadata = metadata;
+    stat.render_blocking_resources = render_blocking;
+    stat.service_worker = service_worker;
+    if let Some(mut imgs) = image_sizing {
         // Server-side enrichment: join transferred_bytes from resources by
         // URL (currentSrc is the actual fetched URL), compute waste_ratio,
         // then sort worst-waste-first so the top of the list is actionable.
         enrich_image_sizing(&mut imgs, &stat.resources);
         stat.image_sizing = Some(imgs);
+    }
+
+    if req.har {
+        stat.har = Some(build_har(&stat, &req.url));
     }
 
     // Always compute — free derive from already-collected `resources`.

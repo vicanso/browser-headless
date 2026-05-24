@@ -84,14 +84,14 @@ fn main() {
 async fn run() {
     let (browser_inst, default_ua, disconnect_rx) =
         browser::launch().await.expect("failed to launch browser");
-    tracing::info!("browser UA: {}", default_ua);
+    tracing::info!(user_agent = %default_ua, "browser launched");
 
     let max_pages = std::env::var("BROWSER_HEADLESS_MAX_PAGES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(8)
         .max(1);
-    tracing::info!("concurrency limit: {max_pages} pages");
+    tracing::info!(max_pages, "concurrency limit");
 
     let allow_private_ips = std::env::var("BROWSER_HEADLESS_ALLOW_PRIVATE_IPS")
         .ok()
@@ -185,7 +185,7 @@ async fn supervise_browser(
                     break new_rx;
                 }
                 Err(e) => {
-                    tracing::error!("browser respawn failed: {e}; retrying in {:?}", backoff);
+                    tracing::error!(error = %e, retry_in = ?backoff, "browser respawn failed");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
