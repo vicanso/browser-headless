@@ -17,15 +17,18 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::network::{
     BlockPattern, Cookie as CdpCookie, CookieParam, EnableParams as NetworkEnableParams,
-    ErrorReason, EventLoadingFinished, EventResponseReceived, GetCookiesParams, Headers,
-    ResourceTiming as CdpResourceTiming, ResourceType, SetBlockedUrLsParams,
-    SetCacheDisabledParams, SetCookiesParams, SetExtraHttpHeadersParams,
-    SetUserAgentOverrideParams,
+    ErrorReason, EventLoadingFinished, EventRequestWillBeSent, EventResponseReceived,
+    GetCookiesParams, Headers, Initiator as CdpInitiator, ResourceTiming as CdpResourceTiming,
+    ResourceType, SetBlockedUrLsParams, SetCacheDisabledParams, SetCookiesParams,
+    SetExtraHttpHeadersParams, SetUserAgentOverrideParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotParams,
     EnableParams as PageEnableParams, EventLifecycleEvent, PrintToPdfParams,
     SetLifecycleEventsEnabledParams,
+};
+use chromiumoxide::cdp::browser_protocol::performance::{
+    EnableParams as PerformanceEnableParams, GetMetricsParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams, DisposeBrowserContextParams,
@@ -34,7 +37,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
     EnableParams as RuntimeEnableParams, EventConsoleApiCalled, EventExceptionThrown,
 };
 use chromiumoxide::{Browser, BrowserConfig};
-use futures::StreamExt;
+use futures::stream::{self, BoxStream, StreamExt};
 use htmd::HtmlToMarkdown;
 use serde::{Deserialize, Serialize};
 
@@ -295,6 +298,323 @@ pub async fn apply_geolocation(page: &Page, geo: Option<&Geolocation>) -> Result
     Ok(())
 }
 
+/// JS that walks `document.head` and projects the standard SEO / social /
+/// rendering metadata into a flat JSON object matching `PageMetadata`.
+const PAGE_METADATA_JS: &str = r#"
+(function() {
+  function meta(sel) {
+    const el = document.head.querySelector(sel);
+    return el ? (el.getAttribute('content') || '').trim() || null : null;
+  }
+  function link(rel) {
+    const el = document.head.querySelector(`link[rel="${rel}"]`);
+    return el ? (el.getAttribute('href') || '').trim() || null : null;
+  }
+  const og = {};
+  document.head.querySelectorAll('meta[property^="og:"]').forEach((el) => {
+    const k = (el.getAttribute('property') || '').slice(3);
+    const v = (el.getAttribute('content') || '').trim();
+    if (k && v) og[k] = v;
+  });
+  const twitter = {};
+  document.head.querySelectorAll('meta[name^="twitter:"]').forEach((el) => {
+    const k = (el.getAttribute('name') || '').slice(8);
+    const v = (el.getAttribute('content') || '').trim();
+    if (k && v) twitter[k] = v;
+  });
+  const charsetEl = document.head.querySelector('meta[charset]');
+  return {
+    title: document.title || '',
+    description: meta('meta[name="description"]'),
+    canonical: link('canonical'),
+    robots: meta('meta[name="robots"]'),
+    lang: document.documentElement.lang || null,
+    viewport: meta('meta[name="viewport"]'),
+    charset: charsetEl ? charsetEl.getAttribute('charset') : null,
+    theme_color: meta('meta[name="theme-color"]'),
+    og: og,
+    twitter: twitter,
+  };
+})()
+"#;
+
+pub async fn collect_page_metadata(page: &Page) -> Result<PageMetadata, Error> {
+    let eval = page.evaluate(PAGE_METADATA_JS).await?;
+    eval.into_value()
+        .map_err(|e| Error::Cdp(format!("metadata decode: {e}")))
+}
+
+/// JS that queries the page's Service Worker registration.
+const SERVICE_WORKER_JS: &str = r#"
+(async () => {
+  if (!('serviceWorker' in navigator)) {
+    return { controlled: false, scope: null, active_script: null, waiting: false, installing: false };
+  }
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    return {
+      controlled: !!navigator.serviceWorker.controller,
+      scope: reg ? reg.scope : null,
+      active_script: reg && reg.active ? reg.active.scriptURL : null,
+      waiting: reg ? !!reg.waiting : false,
+      installing: reg ? !!reg.installing : false,
+    };
+  } catch (e) {
+    return { controlled: false, scope: null, active_script: null, waiting: false, installing: false };
+  }
+})()
+"#;
+
+pub async fn collect_service_worker(page: &Page) -> Result<ServiceWorkerStatus, Error> {
+    let eval = page.evaluate(SERVICE_WORKER_JS).await?;
+    eval.into_value()
+        .map_err(|e| Error::Cdp(format!("service_worker decode: {e}")))
+}
+
+/// Extract the security-relevant headers from a response's header map.
+/// Returns None when no security headers are present.
+fn extract_security_headers(headers: &Headers) -> Option<HashMap<String, String>> {
+    let obj = headers.inner().as_object()?;
+    let mut out = HashMap::new();
+    for &name in SECURITY_HEADER_NAMES {
+        for (k, v) in obj {
+            if k.eq_ignore_ascii_case(name) {
+                if let Some(s) = v.as_str() {
+                    out.insert(name.to_string(), s.to_string());
+                }
+                break;
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Project chromiumoxide's `Initiator` into our compact `RequestInitiator`.
+/// Stack trace and column info are dropped.
+fn map_initiator(init: &CdpInitiator) -> RequestInitiator {
+    // Type debug-formats to PascalCase variant name; lowercase for stable
+    // comparison strings.
+    let t = format!("{:?}", init.r#type).to_lowercase();
+    RequestInitiator {
+        r#type: t,
+        url: init.url.clone(),
+        line_number: init.line_number.map(|n| n.max(0.0) as u32),
+    }
+}
+
+/// JS that scans `document.head` for render-blocking resources.
+/// Render-blocking criteria:
+/// - `<link rel="stylesheet">` without a non-matching media query
+/// - `<script>` without `async` / `defer` / `type="module"` (both external
+///   and inline)
+const RENDER_BLOCKING_JS: &str = r#"
+(function() {
+  const blockers = [];
+  for (const el of document.head.children) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'link') {
+      const rel = (el.rel || '').toLowerCase();
+      if (rel !== 'stylesheet' || el.disabled) continue;
+      const media = (el.media || 'all').toLowerCase();
+      // Conservative: only `print`-only or `not screen` queries don't block.
+      // Anything matching screen (default, 'all', 'screen', or screen+...) blocks.
+      const printOnly = media === 'print' || media.indexOf('print') === 0 && media.indexOf('screen') < 0;
+      if (printOnly) continue;
+      blockers.push({ tag: 'link', url: el.href || '', why: 'sync stylesheet' });
+    } else if (tag === 'script') {
+      if (el.async || el.defer || (el.type || '').toLowerCase() === 'module') continue;
+      if (el.src) {
+        blockers.push({ tag: 'script', url: el.src, why: 'no async/defer' });
+      } else if ((el.textContent || '').trim()) {
+        blockers.push({ tag: 'script', url: '(inline)', why: 'inline blocking script' });
+      }
+    }
+  }
+  return blockers;
+})()
+"#;
+
+pub async fn collect_render_blocking(page: &Page) -> Result<Vec<RenderBlocker>, Error> {
+    let eval = page.evaluate(RENDER_BLOCKING_JS).await?;
+    eval.into_value()
+        .map_err(|e| Error::Cdp(format!("render_blocking decode: {e}")))
+}
+
+/// Group `cls_entries.sources` by element identity (selector) and rank by
+/// total contributed shift. Each shift entry's `value` is split equally
+/// across its source elements — CDP doesn't report per-source impact, and
+/// equal split keeps fractions adding up to ~100% of total CLS for
+/// intuitive reading.
+fn aggregate_cls_sources(vitals: &mut WebVitals) {
+    use std::collections::HashMap;
+    let mut by_selector: HashMap<String, (f64, u32)> = HashMap::new();
+
+    for entry in &vitals.cls_entries {
+        if entry.sources.is_empty() {
+            continue;
+        }
+        let per_source = entry.value / entry.sources.len() as f64;
+        for src in &entry.sources {
+            let selector = format_cls_selector(src);
+            let agg = by_selector.entry(selector).or_insert((0.0, 0));
+            agg.0 += per_source;
+            agg.1 += 1;
+        }
+    }
+
+    // Use total CLS as denominator; fall back to small epsilon to avoid /0.
+    let total_cls = if vitals.cls > 0.0 { vitals.cls } else { 1.0 };
+    let mut sources: Vec<ClsTopSource> = by_selector
+        .into_iter()
+        .map(|(selector, (total_shift, shift_count))| ClsTopSource {
+            selector,
+            total_shift,
+            fraction: total_shift / total_cls,
+            shift_count,
+        })
+        .collect();
+    sources.sort_by(|a, b| {
+        b.total_shift
+            .partial_cmp(&a.total_shift)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    vitals.cls_top_sources = sources;
+}
+
+fn format_cls_selector(src: &ClsSourceElement) -> String {
+    if !src.id.is_empty() {
+        format!("{}#{}", src.tag, src.id)
+    } else if !src.class.is_empty() {
+        // Use first class token for selector uniqueness; full class string
+        // is preserved in raw ClsEntry.sources for detailed inspection.
+        let first = src.class.split_whitespace().next().unwrap_or("");
+        format!("{}.{}", src.tag, first)
+    } else {
+        src.tag.clone()
+    }
+}
+
+/// Aggregate `resources` into comparable scalars. Pure derive — no browser
+/// interaction. MIME mapped to a small bucket set for stable bucket names
+/// across deploys.
+fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> ResourceSummary {
+    let target_host = url::Url::parse(target_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+
+    let mut summary = ResourceSummary::default();
+    let mut largest: Option<(String, u64)> = None;
+    let mut cache_hits: u32 = 0;
+
+    for r in resources {
+        let bucket = mime_bucket(&r.mime_type);
+        *summary.bytes_by_type.entry(bucket.to_string()).or_insert(0) += r.content_size;
+        *summary.count_by_type.entry(bucket.to_string()).or_insert(0) += 1;
+
+        let status_bucket = match r.status {
+            100..=199 => "1xx",
+            200..=299 => "2xx",
+            300..=399 => "3xx",
+            400..=499 => "4xx",
+            500..=599 => "5xx",
+            _ => "other",
+        };
+        *summary
+            .status_distribution
+            .entry(status_bucket.to_string())
+            .or_insert(0) += 1;
+
+        if r.from_cache {
+            cache_hits += 1;
+            summary.cached_bytes += r.content_size;
+        }
+
+        // Third-party = different host from the target URL.
+        if !target_host.is_empty()
+            && let Ok(parsed) = url::Url::parse(&r.url)
+            && let Some(h) = parsed.host_str()
+            && h != target_host
+        {
+            summary.third_party_bytes += r.content_size;
+        }
+
+        match largest.as_ref() {
+            None => largest = Some((r.url.clone(), r.content_size)),
+            Some((_, sz)) if r.content_size > *sz => {
+                largest = Some((r.url.clone(), r.content_size))
+            }
+            _ => {}
+        }
+    }
+
+    if !resources.is_empty() {
+        summary.cache_hit_ratio = cache_hits as f64 / resources.len() as f64;
+    }
+    summary.largest_resource = largest;
+    summary
+}
+
+/// Map a MIME type string to a short stable bucket name. Unknown / empty
+/// MIME maps to "other".
+fn mime_bucket(mime: &str) -> &'static str {
+    let m = mime.to_ascii_lowercase();
+    if m.starts_with("image/") {
+        "image"
+    } else if m.starts_with("video/") || m.starts_with("audio/") {
+        "media"
+    } else if m.starts_with("font/")
+        || m.contains("woff")
+        || m.contains("opentype")
+        || m.contains("truetype")
+    {
+        "font"
+    } else if m.contains("javascript") || m.contains("ecmascript") {
+        "javascript"
+    } else if m.contains("css") {
+        "css"
+    } else if m.contains("html") {
+        "html"
+    } else if m.contains("xml") {
+        "xml"
+    } else if m.contains("json") {
+        "json"
+    } else {
+        "other"
+    }
+}
+
+/// Read CDP `Performance.getMetrics` and project the well-known counters
+/// into `PageMetrics`. Memory + DOM counts are sourced directly; CPU
+/// durations are converted from CDP seconds to ms. Unknown metric names
+/// are ignored.
+pub async fn collect_page_metrics(page: &Page) -> Result<PageMetrics, Error> {
+    page.execute(PerformanceEnableParams::default()).await?;
+    let resp = page.execute(GetMetricsParams::default()).await?;
+
+    let mut m = PageMetrics::default();
+    for metric in &resp.result.metrics {
+        let v = metric.value;
+        match metric.name.as_str() {
+            "JSHeapUsedSize" => m.js_heap_used = v.max(0.0) as u64,
+            "JSHeapTotalSize" => m.js_heap_total = v.max(0.0) as u64,
+            "Documents" => m.documents = v.max(0.0) as u32,
+            "Frames" => m.frames = v.max(0.0) as u32,
+            "Nodes" => m.nodes = v.max(0.0) as u32,
+            "JSEventListeners" => m.js_event_listeners = v.max(0.0) as u32,
+            // CDP returns seconds; convert to ms for consistency with the
+            // rest of the codebase (timeout_ms, settle_ms, etc.).
+            "ScriptDuration" => m.script_duration_ms = v.max(0.0) * 1000.0,
+            "LayoutDuration" => m.layout_duration_ms = v.max(0.0) * 1000.0,
+            "RecalcStyleDuration" => m.recalc_style_duration_ms = v.max(0.0) * 1000.0,
+            "TaskDuration" => m.task_duration_ms = v.max(0.0) * 1000.0,
+            _ => {}
+        }
+    }
+    Ok(m)
+}
+
 /// Setup script registered via `Page.addScriptToEvaluateOnNewDocument` so
 /// it runs **before** any page script on the next navigation. Installs
 /// three `PerformanceObserver`s into `window.__web_vitals`:
@@ -306,18 +626,61 @@ const WEB_VITALS_SETUP_JS: &str = r#"
 (function() {
   if (window.__web_vitals_initialized) return;
   window.__web_vitals_initialized = true;
-  window.__web_vitals = { lcp: 0, cls: 0, tbt: 0, ttfb: 0, long_tasks: 0 };
+  window.__web_vitals = {
+    lcp: 0, cls: 0, tbt: 0, ttfb: 0, long_tasks: 0,
+    lcp_element: null,
+    cls_entries: [],
+  };
+  const MAX_CLS_ENTRIES = 50;
+  function describeNode(n) {
+    if (!n || n.nodeType !== 1) return null;
+    return {
+      tag: (n.tagName || '').toLowerCase(),
+      id: n.id || '',
+      class: typeof n.className === 'string' ? n.className : '',
+    };
+  }
   try {
     new PerformanceObserver((list) => {
       for (const e of list.getEntries()) {
-        if (e.startTime > window.__web_vitals.lcp) window.__web_vitals.lcp = e.startTime;
+        // LCP can update multiple times (each new larger element wins);
+        // always overwrite with the latest.
+        if (e.startTime >= window.__web_vitals.lcp) {
+          window.__web_vitals.lcp = e.startTime;
+          const node = e.element;
+          if (node && node.nodeType === 1) {
+            const desc = describeNode(node);
+            // Image-like: prefer currentSrc, fall back to src attr.
+            const isImg = desc.tag === 'img' || desc.tag === 'video';
+            const url = isImg ? (node.currentSrc || node.src || null) : null;
+            // Text-like: snapshot first 120 chars.
+            const text = !isImg
+              ? (node.textContent || '').trim().slice(0, 120) || null
+              : null;
+            window.__web_vitals.lcp_element = {
+              tag: desc.tag, id: desc.id, class: desc.class,
+              url: url, text_preview: text,
+            };
+          }
+        }
       }
     }).observe({ type: 'largest-contentful-paint', buffered: true });
   } catch (e) {}
   try {
     new PerformanceObserver((list) => {
       for (const e of list.getEntries()) {
-        if (!e.hadRecentInput) window.__web_vitals.cls += e.value;
+        if (e.hadRecentInput) continue;
+        window.__web_vitals.cls += e.value;
+        if (window.__web_vitals.cls_entries.length < MAX_CLS_ENTRIES) {
+          const sources = (e.sources || [])
+            .map((s) => describeNode(s.node))
+            .filter((x) => x !== null);
+          window.__web_vitals.cls_entries.push({
+            time_ms: e.startTime,
+            value: e.value,
+            sources: sources,
+          });
+        }
       }
     }).observe({ type: 'layout-shift', buffered: true });
   } catch (e) {}
@@ -696,6 +1059,145 @@ pub struct WebPageStat {
     /// Core Web Vitals (LCP / CLS / TBT / TTFB) + long-task count.
     /// Populated only when `SummaryRequest.web_vitals = true`.
     pub web_vitals: Option<WebVitals>,
+    /// V8 heap + DOM counters + CPU time breakdown from CDP
+    /// `Performance.getMetrics`. Populated only when
+    /// `SummaryRequest.metrics = true`.
+    pub metrics: Option<PageMetrics>,
+    /// Aggregated stats derived server-side from `resources`. Always
+    /// populated (free to compute — no extra CDP calls). Gives AI
+    /// comparison-friendly scalars: bytes by type, count by type, status
+    /// distribution, cache hit ratio, etc.
+    pub resource_summary: ResourceSummary,
+    /// Page metadata (title / meta / OG / canonical / robots / ...).
+    /// Populated only when `SummaryRequest.metadata = true`. SEO and
+    /// correctness regression signal.
+    pub metadata: Option<PageMetadata>,
+    /// Resources in `<head>` that block the initial render: sync
+    /// stylesheets and sync (non-async/defer/module) scripts. Populated
+    /// only when `SummaryRequest.render_blocking = true`.
+    pub render_blocking_resources: Option<Vec<RenderBlocker>>,
+    /// Security-related response headers from the main document
+    /// (last-seen Document-type response). Filtered to a fixed set
+    /// (CSP, HSTS, X-Frame-Options, Referrer-Policy, etc.). Always
+    /// populated when at least one Document response was observed.
+    pub security_headers: Option<HashMap<String, String>>,
+    /// Service Worker / PWA registration state. Populated only when
+    /// `SummaryRequest.service_worker = true`.
+    pub service_worker: Option<ServiceWorkerStatus>,
+}
+
+/// Standard set of security-relevant response headers we extract from the
+/// main document. Names are matched case-insensitively; output preserves
+/// canonical capitalisation from this list.
+const SECURITY_HEADER_NAMES: &[&str] = &[
+    "Content-Security-Policy",
+    "Content-Security-Policy-Report-Only",
+    "Strict-Transport-Security",
+    "X-Frame-Options",
+    "X-Content-Type-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+    "Cross-Origin-Embedder-Policy",
+    "Cross-Origin-Opener-Policy",
+    "Cross-Origin-Resource-Policy",
+    "X-XSS-Protection",
+];
+
+/// Snapshot of the page's Service Worker registration. `None` for the
+/// whole struct means navigator.serviceWorker isn't available (rare); the
+/// individual fields go to None / false when no registration exists.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceWorkerStatus {
+    /// True if a SW currently controls this page (`navigator.serviceWorker.controller`).
+    pub controlled: bool,
+    /// Registration scope URL.
+    pub scope: Option<String>,
+    /// Script URL of the active SW.
+    pub active_script: Option<String>,
+    /// True if a waiting SW exists (update pending activation).
+    pub waiting: bool,
+    /// True if an installing SW exists.
+    pub installing: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RenderBlocker {
+    /// `script` or `link`.
+    pub tag: String,
+    /// `href` (link) or `src` (script). `"(inline)"` for inline scripts.
+    pub url: String,
+    /// Short human-readable reason: `"sync stylesheet"`, `"no async/defer"`,
+    /// `"inline blocking script"`.
+    pub why: String,
+}
+
+/// Comparison-friendly aggregates over `resources`. All counts/bytes are
+/// derived server-side; no extra browser interaction.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ResourceSummary {
+    /// Total content bytes grouped by top-level MIME type (e.g. "image",
+    /// "javascript", "css", "font", "json", "html", "other").
+    pub bytes_by_type: HashMap<String, u64>,
+    /// Resource counts by the same MIME buckets as `bytes_by_type`.
+    pub count_by_type: HashMap<String, u32>,
+    /// Counts by HTTP status class: `"2xx"`, `"3xx"`, `"4xx"`, `"5xx"`, `"other"`.
+    pub status_distribution: HashMap<String, u32>,
+    /// Fraction of resources served from cache (0.0 .. 1.0).
+    pub cache_hit_ratio: f64,
+    /// Total content bytes that came from cache.
+    pub cached_bytes: u64,
+    /// Total content bytes from hosts other than the target URL's host.
+    pub third_party_bytes: u64,
+    /// `(url, bytes)` of the single largest resource — quick "what dominates"
+    /// answer. None when `resources` is empty.
+    pub largest_resource: Option<(String, u64)>,
+}
+
+/// Page-level metadata extracted from `<head>`. Comparison signals for SEO
+/// and correctness regressions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PageMetadata {
+    pub title: String,
+    pub description: Option<String>,
+    pub canonical: Option<String>,
+    pub robots: Option<String>,
+    pub lang: Option<String>,
+    pub viewport: Option<String>,
+    pub charset: Option<String>,
+    pub theme_color: Option<String>,
+    /// All `<meta property="og:*">` tags keyed by the substring after `og:`.
+    pub og: HashMap<String, String>,
+    /// All `<meta name="twitter:*">` tags keyed by the substring after `twitter:`.
+    pub twitter: HashMap<String, String>,
+}
+
+/// Per-page snapshot from `Performance.getMetrics` — memory, DOM counters,
+/// and CPU time breakdown. The CPU durations (ms) are cumulative since
+/// page start and are gold for regression detection: e.g. "LCP unchanged
+/// but `script_duration_ms` jumped 30% across deploys" → JS regression.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PageMetrics {
+    /// V8 heap currently in use, bytes.
+    pub js_heap_used: u64,
+    /// V8 heap allocated capacity, bytes.
+    pub js_heap_total: u64,
+    /// Number of HTML Document objects.
+    pub documents: u32,
+    /// Number of Frame objects (main + iframes).
+    pub frames: u32,
+    /// Total live DOM node count.
+    pub nodes: u32,
+    /// Registered JS event listeners across the page.
+    pub js_event_listeners: u32,
+    /// Cumulative JS execution time (ms).
+    pub script_duration_ms: f64,
+    /// Cumulative layout time (ms).
+    pub layout_duration_ms: f64,
+    /// Cumulative style recalculation time (ms).
+    pub recalc_style_duration_ms: f64,
+    /// Cumulative time spent on tasks the renderer ran (ms) — superset of
+    /// the above per-phase durations.
+    pub task_duration_ms: f64,
 }
 
 /// Subset of Web Vitals collectible in a headless environment. Skips FID
@@ -713,6 +1215,62 @@ pub struct WebVitals {
     pub ttfb: f64,
     /// Number of long tasks (>50ms) observed.
     pub long_tasks: u32,
+    /// The element that triggered LCP (image, text block, etc.).
+    /// Knowing the element makes "why LCP changed" attributable.
+    pub lcp_element: Option<LcpElement>,
+    /// Layout-shift entries with their contributing source elements.
+    /// Capped at 50 entries client-side to bound memory.
+    pub cls_entries: Vec<ClsEntry>,
+    /// Pre-aggregated top CLS offenders: which elements contributed the
+    /// most layout shift, ranked desc by `total_shift`. Server-side
+    /// derived from `cls_entries`. Use this for "find the worst offender"
+    /// without iterating raw entries.
+    #[serde(default)]
+    pub cls_top_sources: Vec<ClsTopSource>,
+}
+
+/// One aggregated CLS offender: a single element identity (tag + id /
+/// class) and its total shift contribution across all observed shifts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClsTopSource {
+    /// Best-effort CSS selector — `tag#id`, `tag.firstClass`, or just `tag`.
+    pub selector: String,
+    /// Sum of shift contributions attributed to this element.
+    pub total_shift: f64,
+    /// `total_shift` as a fraction of total CLS (0.0 .. ~1.0).
+    pub fraction: f64,
+    /// Number of distinct shift entries this element appeared in.
+    pub shift_count: u32,
+}
+
+/// Identifying details of the element that triggered Largest Contentful Paint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LcpElement {
+    pub tag: String,
+    pub id: String,
+    pub class: String,
+    /// For `<img>` / `<video poster>`: the resource URL. None otherwise.
+    pub url: Option<String>,
+    /// For text elements: first 120 chars of `textContent`. None for non-text.
+    pub text_preview: Option<String>,
+}
+
+/// One layout-shift entry — when it happened and which elements moved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClsEntry {
+    /// Time of the shift, ms from navigation start.
+    pub time_ms: f64,
+    /// Contribution to total CLS.
+    pub value: f64,
+    /// Elements involved in the shift.
+    pub sources: Vec<ClsSourceElement>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClsSourceElement {
+    pub tag: String,
+    pub id: String,
+    pub class: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -757,6 +1315,22 @@ pub struct WebPageResource {
     /// cache. Cache hits typically have `content_size = 0` and many `timing`
     /// fields = -1 (skipped phases).
     pub from_cache: bool,
+    /// What triggered this request. Populated only when
+    /// `SummaryRequest.initiators = true` (requires subscribing to
+    /// `Network.requestWillBeSent`).
+    pub initiator: Option<RequestInitiator>,
+}
+
+/// Simplified initiator: who/what triggered the request. Stack trace
+/// omitted for compactness.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestInitiator {
+    /// `"parser"` / `"script"` / `"preload"` / `"SignedExchange"` / `"other"`.
+    pub r#type: String,
+    /// Script URL or parser source URL.
+    pub url: Option<String>,
+    /// Line number in the source (1-based).
+    pub line_number: Option<u32>,
 }
 
 #[allow(dead_code)]
@@ -800,6 +1374,7 @@ pub async fn collect_summary(
     timeout: Duration,
     capture_screenshot: bool,
     wait_for_request: &[String],
+    capture_initiators: bool,
 ) -> Result<WebPageStat, Error> {
     page.execute(NetworkEnableParams::default()).await?;
     page.execute(PageEnableParams::default()).await?;
@@ -812,12 +1387,22 @@ pub async fn collect_summary(
     let mut lifecycle_stream = page.event_listener::<EventLifecycleEvent>().await?;
     let mut exception_stream = page.event_listener::<EventExceptionThrown>().await?;
     let mut console_stream = page.event_listener::<EventConsoleApiCalled>().await?;
+    // Only subscribe when initiators are requested. When disabled, swap in
+    // `stream::pending()` so the `select!` arm is still well-typed but
+    // never wakes — zero runtime cost.
+    let mut request_stream: BoxStream<'static, std::sync::Arc<EventRequestWillBeSent>> =
+        if capture_initiators {
+            Box::pin(page.event_listener::<EventRequestWillBeSent>().await?)
+        } else {
+            Box::pin(stream::pending())
+        };
 
     page.goto(url).await?;
 
     let mut resources: HashMap<String, WebPageResource> = HashMap::new();
     let mut exceptions: Vec<String> = Vec::new();
     let mut console_messages: Vec<String> = Vec::new();
+    let mut security_headers: Option<HashMap<String, String>> = None;
     let mut init_ts: Option<f64> = None;
     let mut fcp_ts: Option<f64> = None;
     let mut dcl_ts: Option<f64> = None;
@@ -911,6 +1496,14 @@ pub async fn collect_summary(
                 entry.from_cache = ev.response.from_disk_cache.unwrap_or(false)
                     || ev.response.from_service_worker.unwrap_or(false)
                     || ev.response.from_prefetch_cache.unwrap_or(false);
+
+                // Pluck security headers from the main document response.
+                // Last Document-type response wins (handles redirects).
+                if matches!(ev.r#type, ResourceType::Document)
+                    && let Some(headers) = extract_security_headers(&ev.response.headers)
+                {
+                    security_headers = Some(headers);
+                }
             }
             Some(ev) = loading_finished_stream.next() => {
                 let id = ev.request_id.inner().clone();
@@ -925,6 +1518,18 @@ pub async fn collect_summary(
             }
             Some(ev) = console_stream.next() => {
                 console_messages.push(format_console(&ev));
+            }
+            Some(ev) = request_stream.next() => {
+                let id = ev.request_id.inner().clone();
+                let mapped = map_initiator(&ev.initiator);
+                // Attach to the matching resource entry. Create a stub if
+                // the response hasn't been seen yet — response_stream arm
+                // will fill the rest of the fields later.
+                let entry = resources.entry(id.clone()).or_insert_with(|| WebPageResource {
+                    request_id: id.clone(),
+                    ..Default::default()
+                });
+                entry.initiator = Some(mapped);
             }
             else => break,
         }
@@ -976,6 +1581,12 @@ pub async fn collect_summary(
         har: None,
         dom_snapshot: None,
         web_vitals: None,
+        metrics: None,
+        resource_summary: ResourceSummary::default(),
+        metadata: None,
+        render_blocking_resources: None,
+        security_headers,
+        service_worker: None,
     })
 }
 
@@ -1091,6 +1702,211 @@ impl WebPageStat {
                 "- LCP **{:.0}ms** · CLS **{:.3}** · TBT **{:.0}ms** · TTFB **{:.0}ms** · long tasks **{}**",
                 v.lcp, v.cls, v.tbt, v.ttfb, v.long_tasks
             );
+            if let Some(el) = &v.lcp_element {
+                let mut desc = format!("`<{}", el.tag);
+                if !el.id.is_empty() {
+                    desc.push_str(&format!(" id=\"{}\"", el.id));
+                }
+                if !el.class.is_empty() {
+                    desc.push_str(&format!(" class=\"{}\"", el.class));
+                }
+                desc.push_str(">`");
+                if let Some(u) = &el.url {
+                    desc.push_str(&format!(" — `{u}`"));
+                } else if let Some(t) = &el.text_preview {
+                    desc.push_str(&format!(" — \"{t}\""));
+                }
+                let _ = writeln!(s, "- LCP element: {desc}");
+            }
+            if !v.cls_top_sources.is_empty() {
+                let _ = writeln!(s, "- Top CLS offenders:");
+                for (i, src) in v.cls_top_sources.iter().take(3).enumerate() {
+                    let _ = writeln!(
+                        s,
+                        "  {}. **{}** — {:.3} ({:.0}%) across {} shift{}",
+                        i + 1,
+                        src.selector,
+                        src.total_shift,
+                        src.fraction * 100.0,
+                        src.shift_count,
+                        if src.shift_count == 1 { "" } else { "s" }
+                    );
+                }
+                if v.cls_top_sources.len() > 3 {
+                    let _ = writeln!(
+                        s,
+                        "  …and {} more (see `cls_top_sources` / `cls_entries` in JSON).",
+                        v.cls_top_sources.len() - 3
+                    );
+                }
+            }
+            let _ = writeln!(s);
+        }
+
+        if !self.resource_summary.bytes_by_type.is_empty() {
+            let rs = &self.resource_summary;
+            let _ = writeln!(s, "## Resource Summary");
+            let _ = writeln!(s);
+            // Sort by bytes desc for stable readable output.
+            let mut by_type: Vec<(&String, &u64)> = rs.bytes_by_type.iter().collect();
+            by_type.sort_by(|a, b| b.1.cmp(a.1));
+            let type_line = by_type
+                .iter()
+                .map(|(k, v)| {
+                    let n = rs.count_by_type.get(*k).copied().unwrap_or(0);
+                    format!("{} {} ({})", k, format_bytes(**v), n)
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let _ = writeln!(s, "- By type: {type_line}");
+            let mut status: Vec<(&String, &u32)> = rs.status_distribution.iter().collect();
+            status.sort_by_key(|x| x.0.clone());
+            let status_line = status
+                .iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let _ = writeln!(s, "- Status: {status_line}");
+            let _ = writeln!(
+                s,
+                "- Cache hit ratio **{:.0}%** (saved {})",
+                rs.cache_hit_ratio * 100.0,
+                format_bytes(rs.cached_bytes)
+            );
+            let _ = writeln!(
+                s,
+                "- Third-party bytes: **{}**",
+                format_bytes(rs.third_party_bytes)
+            );
+            if let Some((url, sz)) = &rs.largest_resource {
+                let _ = writeln!(s, "- Largest: `{url}` ({})", format_bytes(*sz));
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(sh) = &self.security_headers {
+            let _ = writeln!(s, "## Security Headers ({})", sh.len());
+            let _ = writeln!(s);
+            let mut items: Vec<(&String, &String)> = sh.iter().collect();
+            items.sort_by_key(|(k, _)| k.as_str());
+            for (k, v) in items {
+                // Truncate very long CSP values for readability.
+                let val = if v.len() > 200 {
+                    format!("{}…", &v[..200])
+                } else {
+                    v.clone()
+                };
+                let _ = writeln!(s, "- `{k}`: {val}");
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(sw) = &self.service_worker {
+            let _ = writeln!(s, "## Service Worker");
+            let _ = writeln!(s);
+            let _ = writeln!(s, "- Controlled: **{}**", sw.controlled);
+            if let Some(scope) = &sw.scope {
+                let _ = writeln!(s, "- Scope: `{scope}`");
+            }
+            if let Some(script) = &sw.active_script {
+                let _ = writeln!(s, "- Active script: `{script}`");
+            }
+            if sw.waiting {
+                let _ = writeln!(s, "- Update **waiting** for activation");
+            }
+            if sw.installing {
+                let _ = writeln!(s, "- A SW is **installing**");
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(rb) = &self.render_blocking_resources {
+            let _ = writeln!(s, "## Render-Blocking Resources ({})", rb.len());
+            let _ = writeln!(s);
+            if rb.is_empty() {
+                let _ = writeln!(s, "- None detected.");
+            } else {
+                for r in rb.iter().take(10) {
+                    let _ = writeln!(s, "- `<{}>` `{}` — {}", r.tag, r.url, r.why);
+                }
+                if rb.len() > 10 {
+                    let _ = writeln!(s, "- …and {} more.", rb.len() - 10);
+                }
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(md) = &self.metadata {
+            let _ = writeln!(s, "## Page Metadata");
+            let _ = writeln!(s);
+            let _ = writeln!(s, "- Title: **{}**", md.title);
+            if let Some(d) = &md.description {
+                let _ = writeln!(s, "- Description: {d}");
+            }
+            if let Some(c) = &md.canonical {
+                let _ = writeln!(s, "- Canonical: `{c}`");
+            }
+            if let Some(r) = &md.robots {
+                let _ = writeln!(s, "- Robots: `{r}`");
+            }
+            if let Some(l) = &md.lang {
+                let _ = writeln!(s, "- Lang: `{l}`");
+            }
+            if let Some(v) = &md.viewport {
+                let _ = writeln!(s, "- Viewport: `{v}`");
+            }
+            if let Some(ch) = &md.charset {
+                let _ = writeln!(s, "- Charset: `{ch}`");
+            }
+            if let Some(tc) = &md.theme_color {
+                let _ = writeln!(s, "- Theme color: `{tc}`");
+            }
+            if !md.og.is_empty() {
+                let _ = writeln!(s, "- Open Graph ({} tags):", md.og.len());
+                let mut og: Vec<(&String, &String)> = md.og.iter().collect();
+                og.sort_by_key(|x| x.0.clone());
+                for (k, v) in og.iter().take(8) {
+                    let _ = writeln!(s, "  - `og:{k}` = {v}");
+                }
+                if md.og.len() > 8 {
+                    let _ = writeln!(s, "  - …and {} more.", md.og.len() - 8);
+                }
+            }
+            if !md.twitter.is_empty() {
+                let _ = writeln!(s, "- Twitter ({} tags):", md.twitter.len());
+                let mut tw: Vec<(&String, &String)> = md.twitter.iter().collect();
+                tw.sort_by_key(|x| x.0.clone());
+                for (k, v) in tw.iter().take(8) {
+                    let _ = writeln!(s, "  - `twitter:{k}` = {v}");
+                }
+                if md.twitter.len() > 8 {
+                    let _ = writeln!(s, "  - …and {} more.", md.twitter.len() - 8);
+                }
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(m) = &self.metrics {
+            let _ = writeln!(s, "## Page Metrics");
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- JS heap **{} / {}** · nodes **{}** · frames **{}** · documents **{}** · event listeners **{}**",
+                format_bytes(m.js_heap_used),
+                format_bytes(m.js_heap_total),
+                m.nodes,
+                m.frames,
+                m.documents,
+                m.js_event_listeners,
+            );
+            let _ = writeln!(
+                s,
+                "- CPU: script **{:.1}ms** · layout **{:.1}ms** · style **{:.1}ms** · total task **{:.1}ms**",
+                m.script_duration_ms,
+                m.layout_duration_ms,
+                m.recalc_style_duration_ms,
+                m.task_duration_ms,
+            );
             let _ = writeln!(s);
         }
 
@@ -1194,7 +2010,7 @@ fn format_bytes(n: u64) -> String {
 
 /// Format the `data` field is populated in. Owned by browser module so the
 /// HTTP layer doesn't have to know about htmd or DOM walkers.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DataFormat {
     #[default]
@@ -1279,6 +2095,23 @@ pub struct SummaryRequest {
     /// Installs `PerformanceObserver`s via `addScriptToEvaluateOnNewDocument`
     /// before navigation; reads accumulated values after `settle`.
     pub web_vitals: bool,
+    /// Capture V8 heap + DOM counters + CPU time breakdown via
+    /// `Performance.getMetrics` into `stat.metrics`. One CDP call,
+    /// negligible overhead.
+    pub metrics: bool,
+    /// Extract page metadata (title / meta / OG / canonical / robots / ...)
+    /// into `stat.metadata`. One extra `page.evaluate` call.
+    pub metadata: bool,
+    /// Identify render-blocking head resources (sync stylesheets, sync
+    /// scripts). One extra `page.evaluate` call. Output goes to
+    /// `stat.render_blocking_resources`.
+    pub render_blocking: bool,
+    /// Capture Service Worker registration state into
+    /// `stat.service_worker` via a `page.evaluate` call.
+    pub service_worker: bool,
+    /// Subscribe to `Network.requestWillBeSent` and attach `initiator`
+    /// info to each `resources[]` entry. Costs one extra event stream.
+    pub initiators: bool,
 }
 
 /// End-to-end browser-side orchestration for `/summary`:
@@ -1359,6 +2192,7 @@ pub async fn capture(
         req.timeout,
         req.screenshot,
         &req.wait_for_request,
+        req.initiators,
     )
     .await?;
     tracing::debug!(
@@ -1462,11 +2296,31 @@ pub async fn capture(
         // to read here — observers have had `collect` + `capture` stages
         // worth of time to accumulate entries.
         let eval = page.evaluate(WEB_VITALS_READ_JS).await?;
-        let vitals: WebVitals = eval
+        let mut vitals: WebVitals = eval
             .into_value()
             .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
+        aggregate_cls_sources(&mut vitals);
         stat.web_vitals = Some(vitals);
     }
+
+    if req.metrics {
+        stat.metrics = Some(collect_page_metrics(&page).await?);
+    }
+
+    if req.metadata {
+        stat.metadata = Some(collect_page_metadata(&page).await?);
+    }
+
+    if req.render_blocking {
+        stat.render_blocking_resources = Some(collect_render_blocking(&page).await?);
+    }
+
+    if req.service_worker {
+        stat.service_worker = Some(collect_service_worker(&page).await?);
+    }
+
+    // Always compute — free derive from already-collected `resources`.
+    stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
 
     tracing::debug!(
         stage = "format",

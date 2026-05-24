@@ -51,7 +51,7 @@ struct BrowserHandle {
 
 /// How the entire `/summary` response is delivered. Independent of
 /// `OutputFormat` which controls only the `data` field's representation.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum ResponseFormat {
     #[default]
@@ -336,6 +336,38 @@ struct SummaryQuery {
     #[serde(default)]
     web_vitals: bool,
 
+    /// Capture V8 heap + DOM counters + CPU time breakdown
+    /// (`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms`
+    /// / `task_duration_ms`) into `stat.metrics` via CDP
+    /// `Performance.getMetrics`. One extra CDP call, negligible overhead.
+    /// CPU durations are gold for regression detection — e.g. "LCP
+    /// unchanged but script_duration_ms jumped 30% across deploys".
+    #[serde(default)]
+    metrics: bool,
+
+    /// Extract page metadata (title / description / canonical / robots /
+    /// lang / viewport / charset / theme-color / OG / Twitter) into
+    /// `stat.metadata`. One extra `page.evaluate` call.
+    #[serde(default)]
+    metadata: bool,
+
+    /// Identify head-level render-blocking resources (sync stylesheets,
+    /// sync scripts without async/defer/module) into
+    /// `stat.render_blocking_resources`. One extra `page.evaluate` call.
+    #[serde(default)]
+    render_blocking: bool,
+
+    /// Capture Service Worker registration state into
+    /// `stat.service_worker` via a `page.evaluate` call.
+    #[serde(default)]
+    service_worker: bool,
+
+    /// Subscribe to `Network.requestWillBeSent` and attach an `initiator`
+    /// object (type / url / line_number) to each `stat.resources[]` entry.
+    /// Adds one event stream subscription for the request lifetime.
+    #[serde(default)]
+    initiators: bool,
+
     /// Optional client-supplied request ID for tracing/log correlation.
     /// If absent, falls back to the `X-Request-ID` header; if that's also
     /// missing, an auto-generated UUID v4 is used. Every tracing log
@@ -446,17 +478,60 @@ async fn summary(
     q: SummaryQuery,
     request_id: String,
 ) -> Result<Response, (StatusCode, String)> {
-    let span = tracing::info_span!("summary", request_id = %request_id);
+    let span = tracing::info_span!(
+        "summary",
+        request_id = %request_id,
+        url = %q.url,
+    );
+    // Snapshot request shape BEFORE moving `q` into `summary_inner` so the
+    // end-of-request log can dump them without holding onto the whole query.
+    let data_format = q.data_format;
+    let response_format = q.format;
+    let timeout_ms = q.timeout_ms;
+    let capture_element = q.capture_element.clone();
+    let wait_for_element = q.wait_for_element.clone();
+    let wait_for_request_count = q.wait_for_request.len();
+    let has_script = q.script.is_some();
+    let has_cookie = q.cookie.is_some();
+    let has_headers = !q.headers.is_empty();
+    let disable_javascript = q.disable_javascript;
+    let disable_cache = q.disable_cache;
+
     async move {
-        let request_started = Instant::now();
+        let started = Instant::now();
         let result = summary_inner(state, q).await;
-        let duration_ms = request_started.elapsed().as_millis() as u64;
+        let duration_ms = started.elapsed().as_millis() as u64;
         match &result {
-            Ok(_) => tracing::info!(duration_ms, "request complete"),
+            Ok(_) => tracing::info!(
+                duration_ms,
+                data_format = ?data_format,
+                response_format = ?response_format,
+                timeout_ms,
+                capture_element = ?capture_element.as_deref(),
+                wait_for_element = ?wait_for_element.as_deref(),
+                wait_for_request_count,
+                has_script,
+                has_cookie,
+                has_headers,
+                disable_javascript,
+                disable_cache,
+                "request complete"
+            ),
             Err((code, msg)) => tracing::warn!(
                 duration_ms,
                 status = code.as_u16(),
                 error = %msg,
+                data_format = ?data_format,
+                response_format = ?response_format,
+                timeout_ms,
+                capture_element = ?capture_element.as_deref(),
+                wait_for_element = ?wait_for_element.as_deref(),
+                wait_for_request_count,
+                has_script,
+                has_cookie,
+                has_headers,
+                disable_javascript,
+                disable_cache,
                 "request failed"
             ),
         }
@@ -526,6 +601,11 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         har: q.har,
         save_dom_snapshot: q.save_dom_snapshot,
         web_vitals: q.web_vitals,
+        metrics: q.metrics,
+        metadata: q.metadata,
+        render_blocking: q.render_blocking,
+        service_worker: q.service_worker,
+        initiators: q.initiators,
     };
 
     // Snapshot the current browser handle out from under the RwLock so the
