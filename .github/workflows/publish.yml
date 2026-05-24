@@ -1,0 +1,132 @@
+name: "publish"
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    branches: [main]
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: vicanso/browser-headless
+
+jobs:
+  build:
+    timeout-minutes: 3600
+    runs-on: ${{ matrix.platform.runs-on }}
+    strategy:
+      matrix:
+        platform:
+          - { arch: "linux/amd64", tag: "amd64", runs-on: "ubuntu-24.04" }
+          - { arch: "linux/arm64", tag: "arm64", runs-on: "ubuntu-24.04-arm" }
+    steps:
+      - name: Change Swap Space
+        run: |
+          swapon --show=NAME | tail -n 1
+          df -lh
+          if [ -d /usr/local/lib/android ]; then
+            du -sh /usr/local/lib/android
+            sudo rm -rf /usr/local/lib/android
+          fi
+          export SWAP_FILE=$(swapon --show=NAME | tail -n 1)
+          sudo swapoff $SWAP_FILE
+          sudo rm $SWAP_FILE
+          export SWAP_FILE=/swapfile
+          sudo fallocate -l 16G $SWAP_FILE
+          sudo chmod 600 $SWAP_FILE
+          sudo mkswap $SWAP_FILE
+          sudo swapon $SWAP_FILE
+      - name: Swap space report after modification
+        shell: bash
+        run: |
+          echo "Memory and swap:"
+          free -h
+          echo
+          swapon --show
+          df -lh
+          echo
+          arch
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      - name: Build and push by digest
+        id: docker_build
+        uses: docker/build-push-action@v6
+        env:
+          # Push by digest only: no per-arch (:amd64/:arm64) tag is created on
+          # Docker Hub. The `merge` job assembles the single versioned manifest.
+          IMAGE_OUTPUT: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform.arch }}
+          build-args: |
+            GIT_COMMIT_ID=${{ github.sha }}
+          outputs: ${{ env.IMAGE_OUTPUT }}
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.docker_build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform.tag }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+  merge:
+    runs-on: ubuntu-24.04
+    needs: [build] # wait for all arch builds to finish
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      # Tag push (v1.2.3): publish both versioned and :latest tags.
+      - name: Extract version from Git tag
+        if: github.ref_type == 'tag'
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+      - name: Create and push multi-arch manifest (release)
+        if: github.ref_type == 'tag'
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:${{ env.VERSION }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+      - name: Inspect release image
+        if: github.ref_type == 'tag'
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+
+      # Branch push (main): roll :latest only, no versioned tag.
+      - name: Create and push multi-arch manifest (latest)
+        if: github.ref_type == 'branch'
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+      - name: Inspect latest image
+        if: github.ref_type == 'branch'
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:latest
