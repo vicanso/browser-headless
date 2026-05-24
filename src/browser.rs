@@ -19,8 +19,9 @@ use chromiumoxide::cdp::browser_protocol::network::{
     BlockPattern, Cookie as CdpCookie, CookieParam, EnableParams as NetworkEnableParams,
     ErrorReason, EventLoadingFinished, EventRequestWillBeSent, EventResponseReceived,
     GetCookiesParams, Headers, Initiator as CdpInitiator, ResourceTiming as CdpResourceTiming,
-    ResourceType, SetBlockedUrLsParams, SetCacheDisabledParams, SetCookiesParams,
-    SetExtraHttpHeadersParams, SetUserAgentOverrideParams,
+    ResourceType, SecurityDetails as CdpSecurityDetails, SetBlockedUrLsParams,
+    SetCacheDisabledParams, SetCookiesParams, SetExtraHttpHeadersParams,
+    SetUserAgentOverrideParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotParams,
@@ -371,6 +372,71 @@ pub async fn collect_service_worker(page: &Page) -> Result<ServiceWorkerStatus, 
         .map_err(|e| Error::Cdp(format!("service_worker decode: {e}")))
 }
 
+/// Project CDP `SecurityDetails` into our compact `TlsInfo`. `days_remaining`
+/// is computed at capture time from wall clock; negative if expired.
+/// `host` identifies which origin the certificate was observed on.
+/// `remote_ip` / `remote_port` come from the same Network.responseReceived —
+/// the IP the browser actually connected to (already resolved, no extra DNS
+/// lookup needed on our side; safe from SSRF surface since it's observation).
+fn extract_tls_info(
+    sd: &CdpSecurityDetails,
+    host: String,
+    remote_ip: Option<String>,
+    remote_port: Option<u16>,
+) -> TlsInfo {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as f64)
+        .unwrap_or(0.0);
+    // CDP's valid_to is `TimeSinceEpoch` (seconds since unix epoch as f64).
+    let valid_to = *sd.valid_to.inner();
+    let valid_from = *sd.valid_from.inner();
+    let days_remaining = ((valid_to - now_secs) / 86400.0).floor() as i64;
+    TlsInfo {
+        host,
+        remote_ip,
+        remote_port,
+        protocol: sd.protocol.clone(),
+        cipher: sd.cipher.clone(),
+        key_exchange: if sd.key_exchange.is_empty() {
+            None
+        } else {
+            Some(sd.key_exchange.clone())
+        },
+        subject_name: sd.subject_name.clone(),
+        issuer: sd.issuer.clone(),
+        valid_from,
+        valid_to,
+        days_remaining,
+        san_list: sd.san_list.clone(),
+    }
+}
+
+/// Format the resolved remote IP suffix for a TLS section header.
+/// Returns `" → 198.51.100.42"` (port hidden if standard 443), or empty
+/// string when CDP didn't report an IP (cached responses, local schemes).
+fn format_remote_ip(tls: &TlsInfo) -> String {
+    match (&tls.remote_ip, tls.remote_port) {
+        (Some(ip), Some(443)) | (Some(ip), None) => format!(" → `{ip}`"),
+        (Some(ip), Some(p)) => format!(" → `{ip}:{p}`"),
+        (None, _) => String::new(),
+    }
+}
+
+/// Format certificate expiry as human-readable string with severity markers.
+/// Negative days = already expired. <30 days = warning. Used by markdown
+/// rendering for both the main-document section and the per-host table.
+fn format_tls_expiry(days_remaining: i64) -> String {
+    if days_remaining < 0 {
+        format!("**EXPIRED {} days ago**", -days_remaining)
+    } else if days_remaining < 30 {
+        format!("**expires in {days_remaining} days ⚠️**")
+    } else {
+        format!("expires in {days_remaining} days")
+    }
+}
+
 /// Extract the security-relevant headers from a response's header map.
 /// Returns None when no security headers are present.
 fn extract_security_headers(headers: &Headers) -> Option<HashMap<String, String>> {
@@ -387,6 +453,19 @@ fn extract_security_headers(headers: &Headers) -> Option<HashMap<String, String>
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Case-insensitive single-header lookup. Used for per-resource header
+/// extraction (e.g. `content-encoding`) where we want one value, not the
+/// curated security-headers map.
+fn lookup_header(headers: &Headers, name: &str) -> Option<String> {
+    let obj = headers.inner().as_object()?;
+    for (k, v) in obj {
+        if k.eq_ignore_ascii_case(name) {
+            return v.as_str().map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Project chromiumoxide's `Initiator` into our compact `RequestInitiator`.
@@ -438,6 +517,67 @@ pub async fn collect_render_blocking(page: &Page) -> Result<Vec<RenderBlocker>, 
     let eval = page.evaluate(RENDER_BLOCKING_JS).await?;
     eval.into_value()
         .map_err(|e| Error::Cdp(format!("render_blocking decode: {e}")))
+}
+
+/// Per-image sizing collector. Reads `naturalWidth/Height` (decoded pixel
+/// dimensions, populated by the browser as a side effect of decoding the
+/// image bytes — no extra IO on our side) and the laid-out display
+/// dimensions via `getBoundingClientRect()`. Both are already-computed
+/// browser state, so the cost is just a DOM walk — typically <2ms for 100
+/// images. `currentSrc` reflects the URL the browser actually picked from
+/// any `srcset`/`sizes` candidates.
+///
+/// Filters:
+/// - Skips `naturalWidth === 0 && !loading==='lazy'`: image failed to load.
+///   Lazy images outside viewport legitimately have 0×0 naturals and are
+///   kept with `loaded: false` so the caller can audit them separately.
+/// - `in_viewport` is computed against `innerWidth/Height` so the caller
+///   can distinguish above-the-fold waste (high-impact) from below-the-fold.
+const IMAGE_SIZING_JS: &str = r#"
+(function() {
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  // DPR reflects whatever the page is actually rendering at — including
+  // any device_scale_factor we set via Emulation.setDeviceMetricsOverride.
+  // Used server-side to compute the effective device-pixel display size
+  // (the number of pixels the browser actually needs to draw crisply),
+  // which is what natural dimensions should be compared against.
+  const dpr = window.devicePixelRatio || 1;
+  const out = [];
+  for (const img of document.images) {
+    const rect = img.getBoundingClientRect();
+    const nw = img.naturalWidth | 0;
+    const nh = img.naturalHeight | 0;
+    const loaded = nw > 0 && nh > 0;
+    const loading = img.loading || 'eager';
+    // Hidden images (display:none / visibility:hidden / zero size) are noise.
+    // Lazy images below the fold are legitimately not-yet-loaded; report
+    // them but mark loaded=false so they don't pollute "waste" metrics.
+    if (!loaded && loading !== 'lazy') continue;
+    const inViewport =
+      rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+    out.push({
+      url: img.currentSrc || img.src || '',
+      natural_width: nw,
+      natural_height: nh,
+      display_width: Math.round(rect.width),
+      display_height: Math.round(rect.height),
+      device_pixel_ratio: dpr,
+      loaded,
+      loading,
+      decoding: img.decoding || 'auto',
+      in_viewport: inViewport,
+      alt_missing: !img.alt,
+    });
+  }
+  return out;
+})()
+"#;
+
+pub async fn collect_image_sizing(page: &Page) -> Result<Vec<ImageSizing>, Error> {
+    let eval = page.evaluate(IMAGE_SIZING_JS).await?;
+    eval.into_value()
+        .map_err(|e| Error::Cdp(format!("image_sizing decode: {e}")))
 }
 
 /// Group `cls_entries.sources` by element identity (selector) and rank by
@@ -495,6 +635,123 @@ fn format_cls_selector(src: &ClsSourceElement) -> String {
     }
 }
 
+/// Aggregate raw LoAF entries into the `WebVitals` summary fields. Computes
+/// scalar totals (`loaf_count`, `loaf_total_blocking_duration`) and groups
+/// the per-script breakdowns across all frames by `source_url`, returning
+/// the top 5 offenders ranked by `total_duration_ms` desc.
+///
+/// `source_url` is the grouping key — same code from the same script will
+/// typically appear in many LoAF frames (e.g. a re-rendering callback),
+/// and grouping makes it visible. Empty source URLs (inline / eval /
+/// browser-internal) are kept as a single `""` bucket so they don't get
+/// blamed on every script equally.
+fn aggregate_loaf(vitals: &mut WebVitals, raw: &[LoafRawEntry]) {
+    use std::collections::HashMap;
+
+    vitals.loaf_count = raw.len() as u32;
+    vitals.loaf_total_blocking_duration = raw.iter().map(|e| e.blocking_duration).sum();
+
+    let mut by_source: HashMap<String, LoafOffender> = HashMap::new();
+    for entry in raw {
+        for s in &entry.scripts {
+            let agg = by_source
+                .entry(s.source_url.clone())
+                .or_insert_with(|| LoafOffender {
+                    source_url: s.source_url.clone(),
+                    source_function_name: s.source_function_name.clone(),
+                    invoker_type: s.invoker_type.clone(),
+                    ..Default::default()
+                });
+            agg.total_duration_ms += s.duration;
+            agg.total_forced_style_layout_ms += s.forced_style_and_layout_duration;
+            agg.invocation_count += 1;
+            // Refresh function_name with last-seen value (not aggregated —
+            // same source URL can host multiple functions; this gives at
+            // least one concrete callsite for the offender).
+            if !s.source_function_name.is_empty() {
+                agg.source_function_name = s.source_function_name.clone();
+            }
+        }
+    }
+
+    let mut offenders: Vec<LoafOffender> = by_source.into_values().collect();
+    offenders.sort_by(|a, b| {
+        b.total_duration_ms
+            .partial_cmp(&a.total_duration_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    offenders.truncate(5);
+    vitals.loaf_top_offenders = offenders;
+}
+
+/// Server-side enrichment for `image_sizing` entries: join `transferred_bytes`
+/// from the captured `resources` (matched by URL) and compute `waste_ratio`.
+/// Then sort worst-waste-first with unknown ratios trailing for a useful
+/// "top offenders" view.
+///
+/// **DPR-correct comparison**: on a 2x DPR screen, an `<img>` displayed at
+/// 400×300 CSS pixels actually needs 800×600 source pixels to render
+/// crisply, so the effective display area is `display × DPR`. A naive
+/// CSS-pixel-only comparison would flag a perfectly-sized 2x image as 75%
+/// waste. We multiply `display_*` by `device_pixel_ratio` before computing
+/// the ratio so the waste signal stays correct across DPR settings —
+/// including any `device_scale_factor` emulation the request applied.
+///
+/// `waste_ratio` is intentionally `None` (not 0) only when either source
+/// dimension is 0 (not loaded / lazy off-screen). When the image is
+/// already at-size or under-size we emit `Some(0.0)` so callers can still
+/// filter on it.
+fn enrich_image_sizing(images: &mut [ImageSizing], resources: &[WebPageResource]) {
+    // Build URL → content_size map once. Resources can repeat (redirects),
+    // last write wins which is fine — final response is what mattered.
+    let mut bytes_by_url: HashMap<&str, u64> = HashMap::with_capacity(resources.len());
+    for r in resources {
+        if r.content_size > 0 {
+            bytes_by_url.insert(r.url.as_str(), r.content_size);
+        }
+    }
+
+    for img in images.iter_mut() {
+        if !img.url.is_empty()
+            && let Some(b) = bytes_by_url.get(img.url.as_str())
+        {
+            img.transferred_bytes = Some(*b);
+        }
+        // Use floats throughout: integer math truncates the DPR scaling
+        // when display_* are small (e.g. 50×50 @ 2x = 10000 effective px
+        // but rounded int math could drift). Cap DPR ≥ 0.0 just to be
+        // defensive; modern Chromium always reports ≥ 1 unless emulating.
+        let dpr = if img.device_pixel_ratio > 0.0 {
+            img.device_pixel_ratio
+        } else {
+            1.0
+        };
+        let np = (img.natural_width as f64) * (img.natural_height as f64);
+        let effective_dw = img.display_width as f64 * dpr;
+        let effective_dh = img.display_height as f64 * dpr;
+        let dp = effective_dw * effective_dh;
+        img.waste_ratio = if np == 0.0 || dp == 0.0 {
+            None
+        } else if dp >= np {
+            // At-size or being upscaled (under-resolution) — not waste.
+            // Under-resolution is a separate visual-quality issue, not a
+            // bandwidth one; not flagged here.
+            Some(0.0)
+        } else {
+            // (natural - effective_display) / natural; clamp [0, 1].
+            let w = 1.0 - (dp / np);
+            Some(w.clamp(0.0, 1.0))
+        };
+    }
+
+    // Worst offenders first; unknown (None) waste sinks to the bottom.
+    images.sort_by(|a, b| {
+        let ar = a.waste_ratio.unwrap_or(-1.0);
+        let br = b.waste_ratio.unwrap_or(-1.0);
+        br.partial_cmp(&ar).unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 /// Aggregate `resources` into comparable scalars. Pure derive — no browser
 /// interaction. MIME mapped to a small bucket set for stable bucket names
 /// across deploys.
@@ -507,6 +764,7 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
     let mut summary = ResourceSummary::default();
     let mut largest: Option<(String, u64)> = None;
     let mut cache_hits: u32 = 0;
+    let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for r in resources {
         let bucket = mime_bucket(&r.mime_type);
@@ -529,15 +787,46 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
         if r.from_cache {
             cache_hits += 1;
             summary.cached_bytes += r.content_size;
+        } else {
+            // Real network responses only — cache hits never touched the
+            // wire so their `connection_reused` flag is meaningless.
+            if r.connection_reused {
+                summary.connections_reused += 1;
+            } else {
+                summary.connections_new += 1;
+            }
+            // Protocol distribution: skip cache (no real protocol) and
+            // normalise empty → "unknown" so missing values are visible
+            // rather than silently dropped.
+            let proto = if r.protocol.is_empty() {
+                "unknown".to_string()
+            } else {
+                r.protocol.to_lowercase()
+            };
+            *summary.protocol_distribution.entry(proto).or_insert(0) += 1;
+
+            // Compression audit: track compressed vs missed-opportunity
+            // for compressible text-y MIME types. Image / video / font /
+            // wasm are already compressed at the format level so the
+            // absence of Content-Encoding isn't a finding for them.
+            if r.content_encoding.is_some() {
+                summary.compressed_count += 1;
+            } else if is_text_compressible(&r.mime_type) {
+                summary.uncompressed_text_count += 1;
+                summary.uncompressed_text_bytes += r.content_size;
+            }
         }
 
         // Third-party = different host from the target URL.
-        if !target_host.is_empty()
-            && let Ok(parsed) = url::Url::parse(&r.url)
+        // Also collect unique hosts (DNS lookup approximation) — done
+        // here once per resource regardless of cache state.
+        if let Ok(parsed) = url::Url::parse(&r.url)
             && let Some(h) = parsed.host_str()
-            && h != target_host
         {
-            summary.third_party_bytes += r.content_size;
+            hosts.insert(h.to_string());
+            if !target_host.is_empty() && h != target_host {
+                summary.third_party_bytes += r.content_size;
+            }
         }
 
         match largest.as_ref() {
@@ -553,7 +842,23 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
         summary.cache_hit_ratio = cache_hits as f64 / resources.len() as f64;
     }
     summary.largest_resource = largest;
+    summary.unique_hosts = hosts.len() as u32;
     summary
+}
+
+/// Whether a MIME type benefits from text compression (gzip/br/zstd).
+/// Image/video/font/wasm are already compressed at the format level —
+/// double-compressing them wastes CPU. Used to flag "uses-text-compression"
+/// audit candidates.
+fn is_text_compressible(mime: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    m.starts_with("text/")
+        || m.contains("javascript")
+        || m.contains("ecmascript")
+        || m.contains("json")
+        || m.contains("xml")
+        || m.contains("svg")
+        || m.contains("html")
 }
 
 /// Map a MIME type string to a short stable bucket name. Unknown / empty
@@ -692,6 +997,58 @@ const WEB_VITALS_SETUP_JS: &str = r#"
       }
     }).observe({ type: 'longtask', buffered: true });
   } catch (e) {}
+  // INP (Interaction to Next Paint) — 2024 Core Web Vital, replaced FID.
+  // Only `event` entries with an `interactionId` count as user interactions
+  // (filters out passive events like scroll). In pure headless scraping
+  // this stays 0 since no user input fires; becomes meaningful when the
+  // request's `script` param simulates click()/dispatchEvent() etc.
+  window.__web_vitals.inp = 0;
+  window.__web_vitals.interaction_count = 0;
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        if (!e.interactionId) continue;
+        window.__web_vitals.interaction_count++;
+        if (e.duration > window.__web_vitals.inp) {
+          window.__web_vitals.inp = e.duration;
+        }
+      }
+    }).observe({ type: 'event', buffered: true, durationThreshold: 16 });
+  } catch (e) {}
+  // Long Animation Frames (LoAF) — Chrome 123+. More precise jank signal
+  // than `longtask`: per-frame breakdown of script / style / layout /
+  // paint with attributable script sources. Stored as a capped list;
+  // server side aggregates top offenders by source URL.
+  window.__web_vitals.loaf_entries = [];
+  const MAX_LOAF = 100;
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        if (window.__web_vitals.loaf_entries.length >= MAX_LOAF) break;
+        // Per-script breakdown: only meaningful scripts (skip <5ms noise),
+        // cap per frame to keep payload bounded.
+        const scripts = (e.scripts || [])
+          .filter((s) => s.duration > 5)
+          .slice(0, 5)
+          .map((s) => ({
+            invoker_type: s.invokerType || '',
+            source_url: s.sourceURL || '',
+            source_function_name: s.sourceFunctionName || '',
+            duration: s.duration,
+            forced_style_and_layout_duration:
+              s.forcedStyleAndLayoutDuration || 0,
+          }));
+        window.__web_vitals.loaf_entries.push({
+          start_time: e.startTime,
+          duration: e.duration,
+          blocking_duration: e.blockingDuration || 0,
+          render_start: e.renderStart || 0,
+          style_and_layout_start: e.styleAndLayoutStart || 0,
+          scripts: scripts,
+        });
+      }
+    }).observe({ type: 'long-animation-frame', buffered: true });
+  } catch (e) {}
 })();
 "#;
 
@@ -715,6 +1072,138 @@ pub async fn apply_web_vitals_setup(page: &Page) -> Result<(), Error> {
     ))
     .await?;
     Ok(())
+}
+
+/// DOM mutation hotspot collector. Installs a `MutationObserver` before any
+/// user script runs, so initial hydration / SSR ↔ CSR mount / framework
+/// reconciliation all get counted.
+///
+/// **Carefully tuned for low overhead:**
+/// - Only reads cached node properties (`nodeName`, `attributeName`) — never
+///   triggers layout (no `getBoundingClientRect`, no `offsetWidth`).
+/// - `characterData: false` — React/Vue text interpolation produces *huge*
+///   numbers of these (every `{name}` interpolation), drowning out signal.
+/// - Aggregates into two small maps (by tag + by attribute name) + scalar
+///   counters; never stores raw `MutationRecord` objects (avoids memory
+///   blow-up — a single batch can deliver thousands).
+/// - `attributeOldValue: false` keeps the browser from snapshotting old
+///   strings just so we can throw them away.
+///
+/// Typical cost: <5ms total observation overhead on a heavy SPA with 10k+
+/// mutations. The DOM mutations themselves were going to happen anyway —
+/// we just count them.
+const DOM_MUTATIONS_SETUP_JS: &str = r#"
+(function() {
+  if (window.__dom_mutations) return;
+  const start = performance.now();
+  const byTag = Object.create(null);
+  const byAttr = Object.create(null);
+  let added = 0, removed = 0, attrCount = 0;
+  const obs = new MutationObserver(records => {
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      if (r.type === 'childList') {
+        const t = r.target && r.target.nodeName ? r.target.nodeName.toLowerCase() : '?';
+        const a = r.addedNodes.length, rem = r.removedNodes.length;
+        added += a;
+        removed += rem;
+        byTag[t] = (byTag[t] || 0) + a + rem;
+      } else if (r.type === 'attributes') {
+        attrCount++;
+        const n = r.attributeName || '?';
+        byAttr[n] = (byAttr[n] || 0) + 1;
+      }
+    }
+  });
+  // observe(document, ...) is valid before <html> exists; observer is
+  // queued and starts firing once the document has any children.
+  obs.observe(document, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    characterData: false,
+    attributeOldValue: false,
+    characterDataOldValue: false,
+  });
+  window.__dom_mutations = {
+    start_ms: start,
+    by_tag: byTag,
+    by_attr: byAttr,
+    counts: () => ({ added, removed, attr: attrCount }),
+  };
+})();
+"#;
+
+/// Drain the mutation accumulator. Returns raw maps + counters; server-side
+/// code sorts and trims to top-N. Run as late as possible so observation
+/// covers the full render window.
+const DOM_MUTATIONS_READ_JS: &str = r#"
+(function() {
+  const m = window.__dom_mutations;
+  if (!m) return null;
+  const c = m.counts();
+  return {
+    total_added_nodes: c.added,
+    total_removed_nodes: c.removed,
+    total_attribute_changes: c.attr,
+    observation_window_ms: Math.round(performance.now() - m.start_ms),
+    by_tag: m.by_tag,
+    by_attr: m.by_attr,
+  };
+})()
+"#;
+
+/// Install the DOM mutation collector. Must run pre-navigation so the
+/// observer is in place before any user script (including framework
+/// bootstrap) touches the DOM.
+pub async fn apply_dom_mutations_setup(page: &Page) -> Result<(), Error> {
+    page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
+        DOM_MUTATIONS_SETUP_JS,
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Read mutation accumulator and project the raw JS object into our typed
+/// `DomMutations` (sorted, trimmed top-N).
+pub async fn collect_dom_mutations(page: &Page) -> Result<Option<DomMutations>, Error> {
+    let eval = page.evaluate(DOM_MUTATIONS_READ_JS).await?;
+    // Raw shape from JS: maps as Object<string, number>.
+    #[derive(Deserialize)]
+    struct Raw {
+        total_added_nodes: u64,
+        total_removed_nodes: u64,
+        total_attribute_changes: u64,
+        observation_window_ms: u64,
+        by_tag: HashMap<String, u64>,
+        by_attr: HashMap<String, u64>,
+    }
+    let raw: Option<Raw> = eval
+        .into_value()
+        .map_err(|e| Error::Cdp(format!("dom_mutations decode: {e}")))?;
+    Ok(raw.map(|r| {
+        let top_tags = top_n_counts(r.by_tag, 10);
+        let top_attrs = top_n_counts(r.by_attr, 10);
+        DomMutations {
+            total_added_nodes: r.total_added_nodes,
+            total_removed_nodes: r.total_removed_nodes,
+            total_attribute_changes: r.total_attribute_changes,
+            observation_window_ms: r.observation_window_ms,
+            top_tags_by_mutation_count: top_tags,
+            top_attributes_changed: top_attrs,
+        }
+    }))
+}
+
+/// Sort a `name → count` map by count desc (ties broken by name asc for
+/// stable output), take top `limit`. Used by both tag and attribute tables.
+fn top_n_counts(map: HashMap<String, u64>, limit: usize) -> Vec<MutationCount> {
+    let mut v: Vec<(String, u64)> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(limit);
+    v.into_iter()
+        .map(|(name, count)| MutationCount { name, count })
+        .collect()
 }
 
 /// Disable JS execution in the page. Subsequent navigations render only the
@@ -1030,6 +1519,11 @@ pub async fn normalize_dom(
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WebPageStat {
     pub total_size: u64,
+    /// Number of network resources observed during load. Always populated
+    /// (functional-validation signal) even when `resources` is opted out
+    /// of being serialised — preserves "page loaded N resources" without
+    /// shipping the detailed array.
+    pub resource_count: u64,
     pub fcp_time: u32,
     pub dcl_time: u32,
     pub load_time: u32,
@@ -1084,6 +1578,65 @@ pub struct WebPageStat {
     /// Service Worker / PWA registration state. Populated only when
     /// `SummaryRequest.service_worker = true`.
     pub service_worker: Option<ServiceWorkerStatus>,
+    /// TLS / certificate info of the main document. Populated when the
+    /// response actually used TLS (HTTPS) and CDP reported
+    /// `securityDetails`. `None` for HTTP, file://, or unsupported.
+    pub tls_info: Option<TlsInfo>,
+    /// Certificates for **all** HTTPS hosts encountered while loading the
+    /// page (main document + JS/CSS/font/image CDNs etc.), deduplicated by
+    /// host. Sorted by `days_remaining` ascending so soonest-to-expire
+    /// certificates appear first — useful for security/expiry audit across
+    /// third-party CDNs. Includes the main document's host as well.
+    pub tls_certificates: Vec<TlsInfo>,
+    /// Per-`<img>` sizing audit. Each entry compares decoded source
+    /// dimensions vs laid-out display dimensions, optionally joined with
+    /// the network resource's transferred byte count. Populated only when
+    /// `SummaryRequest.image_sizing = true`. Sorted by `waste_ratio` desc
+    /// (worst offenders first), with unknown ratios trailing.
+    pub image_sizing: Option<Vec<ImageSizing>>,
+    /// DOM mutation hotspot summary captured via pre-navigation
+    /// `MutationObserver`. Populated only when
+    /// `SummaryRequest.dom_mutations = true`. Useful for diagnosing
+    /// render thrash / over-eager reconciliation regressions.
+    pub dom_mutations: Option<DomMutations>,
+}
+
+/// TLS / certificate snapshot for a single host. `days_remaining` is
+/// derived at capture time from `valid_to` minus wall-clock `now`; negative
+/// when the cert is already expired.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsInfo {
+    /// Hostname this certificate was observed on (e.g. `cdn.example.com`).
+    /// Lets callers attribute a cert to its origin when multiple appear in
+    /// `tls_certificates`.
+    pub host: String,
+    /// Remote IP address the browser actually connected to for this host,
+    /// as reported by `Network.responseReceived.response.remoteIPAddress`.
+    /// Useful for diffing DNS/CDN routing across captures (cert says
+    /// `*.example.com` but resolves to an unexpected IP/region → MITM /
+    /// hijack signal). `None` for cached responses or local schemes.
+    pub remote_ip: Option<String>,
+    /// Remote port (almost always 443 for HTTPS, but recorded for
+    /// completeness). `None` when CDP didn't report it.
+    pub remote_port: Option<u16>,
+    /// TLS protocol version, e.g. `"TLS 1.3"`.
+    pub protocol: String,
+    /// Cipher suite name.
+    pub cipher: String,
+    /// Key-exchange algorithm (often empty in TLS 1.3 where it's negotiated).
+    pub key_exchange: Option<String>,
+    /// Subject CN of the leaf certificate.
+    pub subject_name: String,
+    /// Issuer CN (CA name).
+    pub issuer: String,
+    /// Cert "not before" — Unix epoch seconds.
+    pub valid_from: f64,
+    /// Cert "not after" — Unix epoch seconds.
+    pub valid_to: f64,
+    /// `(valid_to - now) / 86400`. Negative when expired.
+    pub days_remaining: i64,
+    /// Subject Alternative Names.
+    pub san_list: Vec<String>,
 }
 
 /// Standard set of security-relevant response headers we extract from the
@@ -1120,6 +1673,37 @@ pub struct ServiceWorkerStatus {
     pub installing: bool,
 }
 
+/// DOM mutation hotspot summary. Aggregates `MutationRecord` deltas observed
+/// from before-navigation install through end-of-capture. Counts are
+/// gross — `total_added_nodes + total_removed_nodes` over-counts churn
+/// (the same `<li>` re-rendered N times is 2N), but that's precisely the
+/// "render thrash" signal we want.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DomMutations {
+    /// Total `childList` additions across all observed mutations.
+    pub total_added_nodes: u64,
+    /// Total `childList` removals.
+    pub total_removed_nodes: u64,
+    /// Total `attributes` mutations (class/style/aria/etc.).
+    pub total_attribute_changes: u64,
+    /// Wall-clock time the observer was active, from setup → drain.
+    /// Lets callers normalise (mutations/second) for comparison.
+    pub observation_window_ms: u64,
+    /// Tags with the most mutation count (added+removed touching them as
+    /// the parent). Top 10. Helps identify "what kind of element churns".
+    pub top_tags_by_mutation_count: Vec<MutationCount>,
+    /// Attributes most frequently changed. Top 10. `class` and `style`
+    /// dominating signals heavy animation / state toggle churn.
+    pub top_attributes_changed: Vec<MutationCount>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MutationCount {
+    /// Tag name (lowercased) or attribute name.
+    pub name: String,
+    pub count: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RenderBlocker {
     /// `script` or `link`.
@@ -1129,6 +1713,50 @@ pub struct RenderBlocker {
     /// Short human-readable reason: `"sync stylesheet"`, `"no async/defer"`,
     /// `"inline blocking script"`.
     pub why: String,
+}
+
+/// Per-image sizing audit entry. Captured browser-side from already-decoded
+/// `HTMLImageElement` properties (no extra IO). Server-side post-processing
+/// correlates `url` with the network `resources` to fill `transferred_bytes`
+/// and compute `waste_ratio`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageSizing {
+    /// `img.currentSrc` (winning srcset/sizes candidate) — what the browser
+    /// actually fetched. Falls back to `img.src` if `currentSrc` is empty.
+    pub url: String,
+    /// Decoded source pixel width. `0` when the image failed/skipped load.
+    pub natural_width: u32,
+    pub natural_height: u32,
+    /// Laid-out CSS pixel size on the page (rounded from `getBoundingClientRect`).
+    pub display_width: u32,
+    pub display_height: u32,
+    /// `window.devicePixelRatio` at capture time. Reflects any
+    /// `device_scale_factor` emulation we applied. Used server-side to
+    /// scale `display_*` up to the actual device pixels the browser needs
+    /// before computing `waste_ratio` — a 2x DPR screen needs 2× the
+    /// natural pixels per CSS pixel to render crisply.
+    pub device_pixel_ratio: f64,
+    /// `false` only for lazy images outside the viewport (we still emit
+    /// them so callers can audit lazy coverage), or genuinely broken images.
+    pub loaded: bool,
+    /// `"eager"` (default) or `"lazy"`.
+    pub loading: String,
+    /// `"auto"`, `"async"`, or `"sync"`.
+    pub decoding: String,
+    /// True if any part of the image's box overlaps the initial viewport.
+    /// Above-the-fold waste matters more than below-the-fold.
+    pub in_viewport: bool,
+    /// True when `<img>` has no `alt` attribute — quick a11y signal.
+    pub alt_missing: bool,
+    /// Bytes actually downloaded for `url`, joined from the `resources` map
+    /// server-side. `None` when no matching resource entry exists (data:
+    /// URLs, cached without a fresh request, cross-context).
+    pub transferred_bytes: Option<u64>,
+    /// `1 - (display_pixels / natural_pixels)`, clamped to `[0, 1]`. Higher
+    /// = more wasted decoded pixels. `None` when either dimension is 0 or
+    /// the image is using device-pixel scaling that makes the ratio
+    /// misleading (DPR > 1 with reasonable oversize).
+    pub waste_ratio: Option<f64>,
 }
 
 /// Comparison-friendly aggregates over `resources`. All counts/bytes are
@@ -1151,6 +1779,32 @@ pub struct ResourceSummary {
     /// `(url, bytes)` of the single largest resource — quick "what dominates"
     /// answer. None when `resources` is empty.
     pub largest_resource: Option<(String, u64)>,
+    /// HTTP version distribution across non-cached responses. Keys are
+    /// normalised protocol strings (`"h2"`, `"h3"`, `"http/1.1"`,
+    /// `"unknown"` for missing). Surfaces incomplete HTTP/2|3 rollouts
+    /// at a glance.
+    pub protocol_distribution: HashMap<String, u32>,
+    /// Resources that shipped with a `Content-Encoding` header
+    /// (`gzip`/`br`/`deflate`/`zstd`).
+    pub compressed_count: u32,
+    /// Text-compressible resources (HTML/CSS/JS/JSON/SVG/XML) served
+    /// **without** a `Content-Encoding` header — missed-compression
+    /// candidates. Lighthouse "uses-text-compression" equivalent.
+    pub uncompressed_text_count: u32,
+    /// Wire bytes of those uncompressed text resources — the savings
+    /// opportunity if compression were enabled.
+    pub uncompressed_text_bytes: u64,
+    /// Real network responses (`from_cache=false`) that reused an
+    /// existing connection. High ratio = good HTTP/2 connection pooling.
+    pub connections_reused: u32,
+    /// Real network responses that opened a fresh TCP/TLS connection.
+    /// Each one paid the handshake cost. High count on a single-origin
+    /// site usually means HTTP/1.1 (no multiplexing) or DNS misconfig.
+    pub connections_new: u32,
+    /// Distinct hostnames across all observed resources. Approximates
+    /// DNS lookup count (one per unique host). Lower is better for
+    /// HTTP/2 connection coalescing.
+    pub unique_hosts: u32,
 }
 
 /// Page-level metadata extracted from `<head>`. Comparison signals for SEO
@@ -1227,6 +1881,82 @@ pub struct WebVitals {
     /// without iterating raw entries.
     #[serde(default)]
     pub cls_top_sources: Vec<ClsTopSource>,
+    /// **INP (Interaction to Next Paint)** — 2024 Core Web Vital, replaces
+    /// FID. Longest interaction duration in ms (event-start → next paint).
+    /// In pure headless scraping this is `0` because no user input occurs;
+    /// becomes meaningful when `script` triggers `.click()` / synthetic
+    /// events. `interaction_count` tells you whether the value is
+    /// meaningful — `0` interactions means `inp` is just a default zero,
+    /// not "instant response".
+    #[serde(default)]
+    pub inp: f64,
+    /// Number of interaction events observed (events with `interactionId`).
+    /// `0` is normal for non-interactive scrapes — treat `inp` as N/A then.
+    #[serde(default)]
+    pub interaction_count: u32,
+    /// **Long Animation Frames** (Chrome 123+). Total LoAF entries observed
+    /// during the page render. Each LoAF is a frame that took >50ms to
+    /// produce — a more precise jank signal than `long_tasks` because it
+    /// covers the *entire* frame (script + style + layout + paint), not
+    /// just the script portion.
+    #[serde(default)]
+    pub loaf_count: u32,
+    /// Sum of `blockingDuration` across all observed LoAF entries.
+    /// Analogous to TBT but covers the full rendering pipeline, not just
+    /// long tasks. Higher = worse responsiveness during render.
+    #[serde(default)]
+    pub loaf_total_blocking_duration: f64,
+    /// Server-side aggregated top offending scripts across all LoAF
+    /// entries (grouped by `source_url`, ranked desc by `total_duration_ms`).
+    /// Up to 5 entries. Empty when no LoAF observed or no attributable
+    /// scripts (LoAF API unsupported on older Chromium).
+    #[serde(default)]
+    pub loaf_top_offenders: Vec<LoafOffender>,
+}
+
+/// Per-script contribution aggregated across all observed LoAF entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoafOffender {
+    /// Script URL the slow code came from. May be empty for inline /
+    /// `eval` / browser-internal callbacks.
+    pub source_url: String,
+    /// Last-seen function name for this source. Sampled, not aggregated.
+    pub source_function_name: String,
+    /// `"script"`, `"user-callback"`, `"event-listener"`, etc.
+    pub invoker_type: String,
+    /// Sum of `duration` across all invocations attributed to `source_url`.
+    pub total_duration_ms: f64,
+    /// Sum of `forcedStyleAndLayoutDuration` — synchronous layout / style
+    /// recalc this script forced. Non-zero indicates layout thrashing.
+    pub total_forced_style_layout_ms: f64,
+    /// Number of LoAF entries this script appeared in.
+    pub invocation_count: u32,
+}
+
+/// Raw LoAF entry as collected browser-side. Internal — only used to
+/// receive the JSON before server-side aggregation; not in `WebVitals`
+/// output (we expose the aggregated `loaf_top_offenders` + scalars).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LoafRawEntry {
+    #[allow(dead_code)]
+    start_time: f64,
+    #[allow(dead_code)]
+    duration: f64,
+    blocking_duration: f64,
+    #[allow(dead_code)]
+    render_start: f64,
+    #[allow(dead_code)]
+    style_and_layout_start: f64,
+    scripts: Vec<LoafRawScript>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LoafRawScript {
+    invoker_type: String,
+    source_url: String,
+    source_function_name: String,
+    duration: f64,
+    forced_style_and_layout_duration: f64,
 }
 
 /// One aggregated CLS offender: a single element identity (tag + id /
@@ -1311,6 +2041,14 @@ pub struct WebPageResource {
     pub timing: Option<ResourceTiming>,
     pub mime_type: String,
     pub connection_reused: bool,
+    /// HTTP version negotiated by the browser for this resource. Examples:
+    /// `"h2"`, `"h3"`, `"h3-29"`, `"http/1.1"`. Empty for cached responses
+    /// (no real wire transfer).
+    pub protocol: String,
+    /// `Content-Encoding` response header value if present
+    /// (`gzip` / `br` / `deflate` / `zstd`). `None` when the response
+    /// shipped uncompressed.
+    pub content_encoding: Option<String>,
     /// True if the response came from disk cache, service worker, or prefetch
     /// cache. Cache hits typically have `content_size = 0` and many `timing`
     /// fields = -1 (skipped phases).
@@ -1375,6 +2113,7 @@ pub async fn collect_summary(
     capture_screenshot: bool,
     wait_for_request: &[String],
     capture_initiators: bool,
+    capture_console: bool,
 ) -> Result<WebPageStat, Error> {
     page.execute(NetworkEnableParams::default()).await?;
     page.execute(PageEnableParams::default()).await?;
@@ -1386,10 +2125,16 @@ pub async fn collect_summary(
     let mut loading_finished_stream = page.event_listener::<EventLoadingFinished>().await?;
     let mut lifecycle_stream = page.event_listener::<EventLifecycleEvent>().await?;
     let mut exception_stream = page.event_listener::<EventExceptionThrown>().await?;
-    let mut console_stream = page.event_listener::<EventConsoleApiCalled>().await?;
-    // Only subscribe when initiators are requested. When disabled, swap in
-    // `stream::pending()` so the `select!` arm is still well-typed but
-    // never wakes — zero runtime cost.
+    // Console + initiators: subscribe only when requested. When disabled,
+    // swap in `stream::pending()` so the `select!` arm is still well-typed
+    // but never wakes — zero runtime cost and the page never even decodes
+    // console arg payloads we'd throw away.
+    let mut console_stream: BoxStream<'static, std::sync::Arc<EventConsoleApiCalled>> =
+        if capture_console {
+            Box::pin(page.event_listener::<EventConsoleApiCalled>().await?)
+        } else {
+            Box::pin(stream::pending())
+        };
     let mut request_stream: BoxStream<'static, std::sync::Arc<EventRequestWillBeSent>> =
         if capture_initiators {
             Box::pin(page.event_listener::<EventRequestWillBeSent>().await?)
@@ -1403,6 +2148,10 @@ pub async fn collect_summary(
     let mut exceptions: Vec<String> = Vec::new();
     let mut console_messages: Vec<String> = Vec::new();
     let mut security_headers: Option<HashMap<String, String>> = None;
+    let mut tls_info: Option<TlsInfo> = None;
+    // Per-host TLS dedup. Same host on the page almost always serves the
+    // same cert, so first sighting wins; subsequent sightings are skipped.
+    let mut tls_by_host: HashMap<String, TlsInfo> = HashMap::new();
     let mut init_ts: Option<f64> = None;
     let mut fcp_ts: Option<f64> = None;
     let mut dcl_ts: Option<f64> = None;
@@ -1496,13 +2245,45 @@ pub async fn collect_summary(
                 entry.from_cache = ev.response.from_disk_cache.unwrap_or(false)
                     || ev.response.from_service_worker.unwrap_or(false)
                     || ev.response.from_prefetch_cache.unwrap_or(false);
+                entry.protocol = ev.response.protocol.clone().unwrap_or_default();
+                entry.content_encoding = lookup_header(&ev.response.headers, "content-encoding");
 
                 // Pluck security headers from the main document response.
-                // Last Document-type response wins (handles redirects).
+                // Last Document-type response wins (handles redirects +
+                // final landing page).
                 if matches!(ev.r#type, ResourceType::Document)
                     && let Some(headers) = extract_security_headers(&ev.response.headers)
                 {
                     security_headers = Some(headers);
+                }
+
+                // TLS / cert: capture per host across **all** HTTPS resources
+                // (JS/CSS/fonts on CDNs often live on different domains with
+                // their own certs). Dedupe by host. Main-document cert also
+                // exposed via the singular `tls_info` field. Carries the
+                // browser-resolved remote IP — useful for hijack/MITM audit.
+                if let Some(sd) = ev.response.security_details.as_ref()
+                    && let Ok(parsed) = url::Url::parse(&entry.url)
+                    && let Some(host) = parsed.host_str()
+                {
+                    let host = host.to_string();
+                    let remote_ip = ev.response.remote_ip_address.clone();
+                    // CDP gives port as i64; clamp into u16 (real ports fit).
+                    let remote_port = ev
+                        .response
+                        .remote_port
+                        .and_then(|p| u16::try_from(p).ok());
+                    if matches!(ev.r#type, ResourceType::Document) {
+                        tls_info = Some(extract_tls_info(
+                            sd,
+                            host.clone(),
+                            remote_ip.clone(),
+                            remote_port,
+                        ));
+                    }
+                    tls_by_host
+                        .entry(host.clone())
+                        .or_insert_with(|| extract_tls_info(sd, host, remote_ip, remote_port));
                 }
             }
             Some(ev) = loading_finished_stream.next() => {
@@ -1565,9 +2346,11 @@ pub async fn collect_summary(
 
     let total_size: u64 = resources.values().map(|r| r.content_size).sum();
     let resources_vec: Vec<WebPageResource> = resources.into_values().collect();
+    let resource_count = resources_vec.len() as u64;
 
     Ok(WebPageStat {
         total_size,
+        resource_count,
         fcp_time: to_ms(fcp_ts),
         dcl_time: to_ms(dcl_ts),
         load_time: to_ms(load_ts),
@@ -1587,6 +2370,19 @@ pub async fn collect_summary(
         render_blocking_resources: None,
         security_headers,
         service_worker: None,
+        tls_info,
+        tls_certificates: {
+            let mut v: Vec<TlsInfo> = tls_by_host.into_values().collect();
+            // Soonest-to-expire first, ties broken by host for stable output.
+            v.sort_by(|a, b| {
+                a.days_remaining
+                    .cmp(&b.days_remaining)
+                    .then_with(|| a.host.cmp(&b.host))
+            });
+            v
+        },
+        image_sizing: None,
+        dom_mutations: None,
     })
 }
 
@@ -1622,7 +2418,7 @@ impl WebPageStat {
             self.fcp_time,
             self.dcl_time,
             format_bytes(self.total_size),
-            self.resources.len(),
+            self.resource_count,
         );
         let _ = writeln!(s);
 
@@ -1644,55 +2440,11 @@ impl WebPageStat {
             let _ = writeln!(s);
         }
 
-        if !self.cookies.is_empty() {
-            // Name + domain only — values may contain session tokens. Use the
-            // JSON response if you need the actual values.
-            let _ = writeln!(s, "## Cookies ({})", self.cookies.len());
-            let _ = writeln!(s);
-            for c in &self.cookies {
-                let _ = writeln!(s, "- `{}` on `{}`", c.name, c.domain);
-            }
-            let _ = writeln!(s);
-        }
-
-        if !self.resources.is_empty() {
-            let _ = writeln!(s, "## Resources ({})", self.resources.len());
-            let _ = writeln!(s);
-            for r in &self.resources {
-                let _ = writeln!(s, "- {}", describe_resource(r));
-            }
-            let _ = writeln!(s);
-        }
-
-        if self.screenshot.is_some() {
-            let _ = writeln!(s, "## Screenshot");
-            let _ = writeln!(s);
-            let _ = writeln!(s, "Base64 PNG captured (omitted from markdown body).");
-            let _ = writeln!(s);
-        }
-
-        if self.pdf.is_some() {
-            let _ = writeln!(s, "## PDF");
-            let _ = writeln!(s);
-            let _ = writeln!(s, "Base64 PDF captured (omitted from markdown body).");
-            let _ = writeln!(s);
-        }
-
-        if let Some(har) = &self.har {
-            let entries = har
-                .get("log")
-                .and_then(|l| l.get("entries"))
-                .and_then(|e| e.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            let _ = writeln!(s, "## HAR");
-            let _ = writeln!(s);
-            let _ = writeln!(
-                s,
-                "HAR 1.2 archive included ({entries} entries; omitted from markdown body)."
-            );
-            let _ = writeln!(s);
-        }
+        // ─── Overview block ─────────────────────────────────────────────
+        // High-level summaries first (perf, security, SEO), then the raw
+        // enumerations (resources, cookies), then binary attachments, then
+        // the page content itself. Lets a reader (human or LLM) judge the
+        // page from a few short sections before scrolling past long lists.
 
         if let Some(v) = &self.web_vitals {
             let _ = writeln!(s, "## Web Vitals");
@@ -1740,6 +2492,62 @@ impl WebPageStat {
                     );
                 }
             }
+            // INP — show only when there were actual interactions; otherwise
+            // the value is just the default 0 and would mislead readers.
+            if v.interaction_count > 0 {
+                let _ = writeln!(
+                    s,
+                    "- INP **{:.0}ms** across **{}** interaction{}",
+                    v.inp,
+                    v.interaction_count,
+                    if v.interaction_count == 1 { "" } else { "s" }
+                );
+            }
+            // LoAF — only render when something was observed (older
+            // Chromium without the API returns count=0).
+            if v.loaf_count > 0 {
+                let _ = writeln!(
+                    s,
+                    "- Long Animation Frames: **{}** (blocking **{:.0}ms** total)",
+                    v.loaf_count, v.loaf_total_blocking_duration,
+                );
+                if !v.loaf_top_offenders.is_empty() {
+                    let _ = writeln!(s, "- Top LoAF offenders:");
+                    for (i, o) in v.loaf_top_offenders.iter().take(3).enumerate() {
+                        let src = if o.source_url.is_empty() {
+                            "(inline / unknown)".to_string()
+                        } else if o.source_url.len() > 70 {
+                            format!("…{}", &o.source_url[o.source_url.len() - 67..])
+                        } else {
+                            o.source_url.clone()
+                        };
+                        let fn_note = if !o.source_function_name.is_empty() {
+                            format!(" `{}()`", o.source_function_name)
+                        } else {
+                            String::new()
+                        };
+                        let reflow_note = if o.total_forced_style_layout_ms > 5.0 {
+                            format!(
+                                " ⚠️ forced reflow **{:.0}ms**",
+                                o.total_forced_style_layout_ms
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let _ = writeln!(
+                            s,
+                            "  {}. `{}`{} — **{:.0}ms** over {} call{}{}",
+                            i + 1,
+                            src,
+                            fn_note,
+                            o.total_duration_ms,
+                            o.invocation_count,
+                            if o.invocation_count == 1 { "" } else { "s" },
+                            reflow_note,
+                        );
+                    }
+                }
+            }
             let _ = writeln!(s);
         }
 
@@ -1780,6 +2588,107 @@ impl WebPageStat {
             );
             if let Some((url, sz)) = &rs.largest_resource {
                 let _ = writeln!(s, "- Largest: `{url}` ({})", format_bytes(*sz));
+            }
+            // HTTP version distribution — sort by count desc so the
+            // dominant protocol leads.
+            if !rs.protocol_distribution.is_empty() {
+                let mut proto: Vec<(&String, &u32)> = rs.protocol_distribution.iter().collect();
+                proto.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                let line = proto
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let _ = writeln!(s, "- HTTP versions: {line}");
+            }
+            // Connection reuse + DNS approximation. Skip if no real
+            // network resources (everything cached).
+            let real_conns = rs.connections_reused + rs.connections_new;
+            if real_conns > 0 {
+                let reuse_pct = (rs.connections_reused as f64) * 100.0 / (real_conns as f64);
+                let _ = writeln!(
+                    s,
+                    "- Connections: **{}** reused · **{}** new (**{:.0}%** reuse) · **{}** unique hosts",
+                    rs.connections_reused, rs.connections_new, reuse_pct, rs.unique_hosts,
+                );
+            }
+            // Compression audit. Only render when there's either
+            // compression in use or a miss to flag.
+            if rs.compressed_count > 0 || rs.uncompressed_text_count > 0 {
+                let mut line = format!("- Compression: **{}** compressed", rs.compressed_count);
+                if rs.uncompressed_text_count > 0 {
+                    line.push_str(&format!(
+                        " · **{}** uncompressed text resources (**{}** could be compressed) ⚠️",
+                        rs.uncompressed_text_count,
+                        format_bytes(rs.uncompressed_text_bytes),
+                    ));
+                }
+                let _ = writeln!(s, "{line}");
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(tls) = &self.tls_info {
+            let _ = writeln!(s, "## TLS / Certificate (main document)");
+            let _ = writeln!(s);
+            let _ = writeln!(s, "- Host: `{}`{}", tls.host, format_remote_ip(tls));
+            let _ = writeln!(
+                s,
+                "- Protocol: **{}** · cipher: `{}`{}",
+                tls.protocol,
+                tls.cipher,
+                match &tls.key_exchange {
+                    Some(k) => format!(" · key exchange: `{k}`"),
+                    None => String::new(),
+                }
+            );
+            let _ = writeln!(s, "- Subject: `{}`", tls.subject_name);
+            let _ = writeln!(s, "- Issuer: `{}`", tls.issuer);
+            let _ = writeln!(s, "- Validity: {}", format_tls_expiry(tls.days_remaining));
+            if !tls.san_list.is_empty() {
+                let sans = tls
+                    .san_list
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    s,
+                    "- SANs ({}): {}{}",
+                    tls.san_list.len(),
+                    sans,
+                    if tls.san_list.len() > 8 { ", …" } else { "" }
+                );
+            }
+            let _ = writeln!(s);
+        }
+
+        if !self.tls_certificates.is_empty() {
+            let _ = writeln!(
+                s,
+                "## TLS Certificates by Host ({})",
+                self.tls_certificates.len()
+            );
+            let _ = writeln!(s);
+            let _ = writeln!(s, "| Host | IP | Protocol | Issuer | Validity |");
+            let _ = writeln!(s, "|---|---|---|---|---|");
+            for tls in &self.tls_certificates {
+                let ip_cell = match (&tls.remote_ip, tls.remote_port) {
+                    (Some(ip), Some(443)) => format!("`{ip}`"),
+                    (Some(ip), Some(p)) => format!("`{ip}:{p}`"),
+                    (Some(ip), None) => format!("`{ip}`"),
+                    (None, _) => String::from("—"),
+                };
+                let _ = writeln!(
+                    s,
+                    "| `{}` | {} | {} | {} | {} |",
+                    tls.host,
+                    ip_cell,
+                    tls.protocol,
+                    tls.issuer,
+                    format_tls_expiry(tls.days_remaining),
+                );
             }
             let _ = writeln!(s);
         }
@@ -1831,6 +2740,73 @@ impl WebPageStat {
                 }
                 if rb.len() > 10 {
                     let _ = writeln!(s, "- …and {} more.", rb.len() - 10);
+                }
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(imgs) = &self.image_sizing {
+            // Headline summary: counts + how many are wasteful enough to
+            // matter (>50% waste AND >50KB transferred, or in-viewport
+            // with any oversize). Empty list still rendered for "audited
+            // but clean" signal.
+            let total = imgs.len();
+            let loaded = imgs.iter().filter(|i| i.loaded).count();
+            let lazy_offscreen = imgs
+                .iter()
+                .filter(|i| i.loading == "lazy" && !i.in_viewport)
+                .count();
+            let alt_missing = imgs.iter().filter(|i| i.alt_missing).count();
+            let _ = writeln!(s, "## Image Sizing ({total})");
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- {loaded} loaded · {lazy_offscreen} lazy/off-screen · {alt_missing} without alt"
+            );
+            // Top offenders: significant waste OR meaningful bytes.
+            let top: Vec<&ImageSizing> = imgs
+                .iter()
+                .filter(|i| {
+                    i.loaded
+                        && i.waste_ratio.map(|w| w >= 0.4).unwrap_or(false)
+                        && i.transferred_bytes.map(|b| b >= 20_000).unwrap_or(true)
+                })
+                .take(10)
+                .collect();
+            if top.is_empty() {
+                let _ = writeln!(s, "- No significantly oversized images detected.");
+            } else {
+                let _ = writeln!(s);
+                let _ = writeln!(s, "| URL | Natural | Display | Waste | Bytes | Viewport |");
+                let _ = writeln!(s, "|---|---|---|---|---|---|");
+                for i in &top {
+                    let waste = i
+                        .waste_ratio
+                        .map(|w| format!("{:.0}%", w * 100.0))
+                        .unwrap_or_else(|| "?".into());
+                    let bytes = i
+                        .transferred_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "?".into());
+                    let vp = if i.in_viewport { "**yes**" } else { "no" };
+                    // Trim long URLs to keep the table readable.
+                    let short_url = if i.url.len() > 60 {
+                        format!("…{}", &i.url[i.url.len() - 57..])
+                    } else {
+                        i.url.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "| `{}` | {}×{} | {}×{} | **{}** | {} | {} |",
+                        short_url,
+                        i.natural_width,
+                        i.natural_height,
+                        i.display_width,
+                        i.display_height,
+                        waste,
+                        bytes,
+                        vp,
+                    );
                 }
             }
             let _ = writeln!(s);
@@ -1906,6 +2882,101 @@ impl WebPageStat {
                 m.layout_duration_ms,
                 m.recalc_style_duration_ms,
                 m.task_duration_ms,
+            );
+            let _ = writeln!(s);
+        }
+
+        if let Some(dm) = &self.dom_mutations {
+            let total = dm.total_added_nodes + dm.total_removed_nodes + dm.total_attribute_changes;
+            let rate = if dm.observation_window_ms > 0 {
+                (total as f64) * 1000.0 / (dm.observation_window_ms as f64)
+            } else {
+                0.0
+            };
+            let _ = writeln!(s, "## DOM Mutations");
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- Total **{total}** over {}ms (~**{:.0}/sec**) — added **{}** · removed **{}** · attribute **{}**",
+                dm.observation_window_ms,
+                rate,
+                dm.total_added_nodes,
+                dm.total_removed_nodes,
+                dm.total_attribute_changes,
+            );
+            if !dm.top_tags_by_mutation_count.is_empty() {
+                let line = dm
+                    .top_tags_by_mutation_count
+                    .iter()
+                    .take(5)
+                    .map(|c| format!("`<{}>` {}", c.name, c.count))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let _ = writeln!(s, "- Top tags: {line}");
+            }
+            if !dm.top_attributes_changed.is_empty() {
+                let line = dm
+                    .top_attributes_changed
+                    .iter()
+                    .take(5)
+                    .map(|c| format!("`{}` {}", c.name, c.count))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let _ = writeln!(s, "- Top attributes: {line}");
+            }
+            let _ = writeln!(s);
+        }
+
+        // ─── Details / raw enumerations ─────────────────────────────────
+
+        if !self.resources.is_empty() {
+            let _ = writeln!(s, "## Resources ({})", self.resources.len());
+            let _ = writeln!(s);
+            for r in &self.resources {
+                let _ = writeln!(s, "- {}", describe_resource(r));
+            }
+            let _ = writeln!(s);
+        }
+
+        if !self.cookies.is_empty() {
+            // Name + domain only — values may contain session tokens. Use the
+            // JSON response if you need the actual values.
+            let _ = writeln!(s, "## Cookies ({})", self.cookies.len());
+            let _ = writeln!(s);
+            for c in &self.cookies {
+                let _ = writeln!(s, "- `{}` on `{}`", c.name, c.domain);
+            }
+            let _ = writeln!(s);
+        }
+
+        // ─── Binary attachments ─────────────────────────────────────────
+
+        if self.screenshot.is_some() {
+            let _ = writeln!(s, "## Screenshot");
+            let _ = writeln!(s);
+            let _ = writeln!(s, "Base64 PNG captured (omitted from markdown body).");
+            let _ = writeln!(s);
+        }
+
+        if self.pdf.is_some() {
+            let _ = writeln!(s, "## PDF");
+            let _ = writeln!(s);
+            let _ = writeln!(s, "Base64 PDF captured (omitted from markdown body).");
+            let _ = writeln!(s);
+        }
+
+        if let Some(har) = &self.har {
+            let entries = har
+                .get("log")
+                .and_then(|l| l.get("entries"))
+                .and_then(|e| e.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let _ = writeln!(s, "## HAR");
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "HAR 1.2 archive included ({entries} entries; omitted from markdown body)."
             );
             let _ = writeln!(s);
         }
@@ -2112,6 +3183,35 @@ pub struct SummaryRequest {
     /// Subscribe to `Network.requestWillBeSent` and attach `initiator`
     /// info to each `resources[]` entry. Costs one extra event stream.
     pub initiators: bool,
+    /// Subscribe to `Runtime.consoleAPICalled` and collect formatted
+    /// `console.log/info/warn/error/debug` lines into
+    /// `stat.console_messages`. Default off — console output is noisy,
+    /// payloads can be large (objects get serialised), and most callers
+    /// don't read it. When false, the stream is never subscribed (zero
+    /// runtime cost).
+    pub console_messages: bool,
+    /// Audit per-`<img>` sizing: decoded vs display dimensions, lazy
+    /// status, viewport overlap, alt presence, and (server-side joined)
+    /// transferred bytes + waste ratio. Output: `stat.image_sizing`. One
+    /// extra `page.evaluate` call — reads already-decoded browser state,
+    /// no extra IO, <2ms for typical pages.
+    pub image_sizing: bool,
+    /// Install a pre-navigation `MutationObserver` and count DOM
+    /// mutations (childList adds/removes, attribute changes) during the
+    /// full page render. Output: `stat.dom_mutations`. Adds one
+    /// `addScriptToEvaluateOnNewDocument` (pre-nav) + one `evaluate`
+    /// (post-load) call. Typical overhead <5ms even on heavy SPAs.
+    pub dom_mutations: bool,
+    /// Include the full per-resource list (`stat.resources[]`) in the
+    /// response. Default `false` — the resources are always **collected**
+    /// internally (we need them for `resource_summary`, `total_size`,
+    /// `image_sizing.transferred_bytes`, and HAR), but the per-entry
+    /// array is dropped from the response unless explicitly requested.
+    /// Default behaviour: functional-validation (load summary +
+    /// `resource_summary` aggregates + scalar counts) without shipping
+    /// dozens of detailed entries. Enable for forensic / per-request
+    /// inspection.
+    pub resources: bool,
 }
 
 /// End-to-end browser-side orchestration for `/summary`:
@@ -2179,6 +3279,12 @@ pub async fn capture(
     if req.web_vitals {
         apply_web_vitals_setup(&page).await?;
     }
+    if req.dom_mutations {
+        // Must install before navigation so the observer catches initial
+        // hydration / SSR mount / framework bootstrap — the most
+        // mutation-heavy phase.
+        apply_dom_mutations_setup(&page).await?;
+    }
     tracing::debug!(
         stage = "apply",
         duration_ms = t_apply.elapsed().as_millis() as u64
@@ -2193,6 +3299,7 @@ pub async fn capture(
         req.screenshot,
         &req.wait_for_request,
         req.initiators,
+        req.console_messages,
     )
     .await?;
     tracing::debug!(
@@ -2296,11 +3403,28 @@ pub async fn capture(
         // to read here — observers have had `collect` + `capture` stages
         // worth of time to accumulate entries.
         let eval = page.evaluate(WEB_VITALS_READ_JS).await?;
-        let mut vitals: WebVitals = eval
+        // The JS payload carries `loaf_entries` (raw per-frame breakdown)
+        // that isn't part of the public `WebVitals` shape. Pull it out
+        // before deserialising into `WebVitals`, then feed the raw into
+        // server-side `aggregate_loaf` to compute top offenders.
+        let mut value: serde_json::Value = eval
             .into_value()
             .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
+        let loaf_raw: Vec<LoafRawEntry> = value
+            .get_mut("loaf_entries")
+            .and_then(|v| serde_json::from_value(v.take()).ok())
+            .unwrap_or_default();
+        let mut vitals: WebVitals = serde_json::from_value(value)
+            .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
         aggregate_cls_sources(&mut vitals);
+        aggregate_loaf(&mut vitals, &loaf_raw);
         stat.web_vitals = Some(vitals);
+    }
+
+    if req.dom_mutations {
+        // Drain the MutationObserver accumulator. Read as late as possible
+        // in capture so the observation window covers the full render.
+        stat.dom_mutations = collect_dom_mutations(&page).await?;
     }
 
     if req.metrics {
@@ -2319,8 +3443,26 @@ pub async fn capture(
         stat.service_worker = Some(collect_service_worker(&page).await?);
     }
 
+    if req.image_sizing {
+        let mut imgs = collect_image_sizing(&page).await?;
+        // Server-side enrichment: join transferred_bytes from resources by
+        // URL (currentSrc is the actual fetched URL), compute waste_ratio,
+        // then sort worst-waste-first so the top of the list is actionable.
+        enrich_image_sizing(&mut imgs, &stat.resources);
+        stat.image_sizing = Some(imgs);
+    }
+
     // Always compute — free derive from already-collected `resources`.
     stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
+
+    // Drop the detailed array unless explicitly requested. `resource_count`
+    // and `total_size` (scalars) plus `resource_summary` (aggregates) are
+    // preserved for functional-validation use. Must happen AFTER every
+    // downstream consumer (HAR build, image_sizing enrichment,
+    // resource_summary derive) has run.
+    if !req.resources {
+        stat.resources.clear();
+    }
 
     tracing::debug!(
         stage = "format",

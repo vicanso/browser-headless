@@ -368,6 +368,36 @@ struct SummaryQuery {
     #[serde(default)]
     initiators: bool,
 
+    /// Collect `console.log/info/warn/error/debug` output into
+    /// `stat.console_messages`. Default off — most pages produce noisy
+    /// console output (analytics, framework dev warnings, large object
+    /// dumps) that bloats the response without adding value. Enable when
+    /// debugging or doing console-driven audits.
+    #[serde(default)]
+    console_messages: bool,
+
+    /// Audit each `<img>`: decoded natural size vs laid-out display size,
+    /// lazy/eager loading, viewport overlap, missing alt, and
+    /// (server-side joined) transferred bytes + waste ratio. Output:
+    /// `stat.image_sizing`. One extra `page.evaluate` call — reads
+    /// already-decoded browser state, no extra IO.
+    #[serde(default)]
+    image_sizing: bool,
+
+    /// Install a pre-navigation `MutationObserver` to count DOM mutations
+    /// (additions, removals, attribute changes) during the full render
+    /// window. Output: `stat.dom_mutations`. Useful for diagnosing
+    /// render-thrash regressions in SPAs. Typical overhead <5ms.
+    #[serde(default)]
+    dom_mutations: bool,
+
+    /// Include the full per-resource list (`stat.resources[]`) in the
+    /// response. Default off — `resource_summary` aggregates + scalar
+    /// `total_size` / `resource_count` are still emitted for functional
+    /// validation. Enable only when you need per-request forensics.
+    #[serde(default)]
+    resources: bool,
+
     /// Optional client-supplied request ID for tracing/log correlation.
     /// If absent, falls back to the `X-Request-ID` header; if that's also
     /// missing, an auto-generated UUID v4 is used. Every tracing log
@@ -606,6 +636,10 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         render_blocking: q.render_blocking,
         service_worker: q.service_worker,
         initiators: q.initiators,
+        console_messages: q.console_messages,
+        image_sizing: q.image_sizing,
+        dom_mutations: q.dom_mutations,
+        resources: q.resources,
     };
 
     // Snapshot the current browser handle out from under the RwLock so the

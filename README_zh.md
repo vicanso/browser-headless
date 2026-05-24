@@ -27,16 +27,31 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   网络响应(`wait_for_request`，多个)、固定 `settle_ms` 延迟、`script`
   自定义 JS。
 - **完整快照** —— 每条资源的体积 / 状态 / 时间线 / mime / 缓存命中标记；
-  JS 异常和 console 消息；cookie jar 里的全部 cookie；可选 PNG 截图(base64)、
+  JS 异常；cookie jar 里的全部 cookie；可选 console 消息、PNG 截图(base64)、
   PDF (base64)、HAR 1.2 归档、CDP `DOMSnapshot`（带 layout / computed style
   的结构化快照）、**Core Web Vitals** 增强版（含 **LCP 元素身份** + 每次
-  shift 的 **CLS 源** + 服务端预聚合的 top offenders）、**Page Metrics**
+  shift 的 **CLS 源** + 服务端预聚合的 top offenders + **INP** 2024
+  Core Web Vital（取代 FID）+ **Long Animation Frames** Chrome 123+
+  的卡顿归因，按脚本源 URL 聚合 + forced reflow 标记）、**Page Metrics**
   （V8 heap + DOM 计数 + CPU 时间分解：script / layout / style / task
-  累计时长）、**render-blocking head 资源识别**、**HTTP 安全头摘要**
-  （CSP / HSTS / X-Frame-Options / ...）、**Service Worker 注册状态**、
-  per-resource **请求 initiator**（parser / script + 源 URL + 行号）、
-  服务端派生的 **资源汇总**（按 MIME bucket 的字节/数量、状态码分布、
-  缓存命中率、第三方字节、最大单资源）。
+  累计时长）、**render-blocking head 资源识别**、per-resource
+  **请求 initiator**（parser / script + 源 URL + 行号）、服务端派生的
+  **资源汇总**（按 MIME bucket 的字节/数量、状态码分布、缓存命中率、
+  第三方字节、最大单资源、**HTTP 版本分布** h1/h2/h3、**压缩审计**
+  含可压缩文本资源未压缩的字节数、**连接复用** vs 新建握手次数、
+  **唯一 host 数**（≈ DNS 查询次数））。
+- **安全审计** —— 主文档的 **HTTP 安全头摘要**（CSP / HSTS /
+  X-Frame-Options / ...）；落地页的 **TLS / 证书信息**（协议、cipher、
+  CA issuer、subject、SAN 列表、到期天数倒计时）以及浏览器实际连接的
+  **resolved remote IP / port**（DNS 解析 + 证书 pinning diff）；
+  **per-host TLS 证书清单** —— 覆盖所有 HTTPS 资源（CDN / 字体 /
+  统计），按最快到期排序，在第三方证书过期把页面打挂之前抓到；
+  **Service Worker 注册状态**。
+- **渲染诊断（按需启用）** —— 通过导航前注入的 `MutationObserver`
+  收集 **DOM 突变热点**，覆盖完整渲染期的 childList / 属性 mutation
+  并给出 top-N tag / attribute 分布 —— 用于诊断 SPA 渲染抖动回归。
+  **图片尺寸审计**：每个 `<img>` 的解码原始尺寸 vs 实际布局尺寸（已
+  考虑 DPR，retina 优化图不会误报），关联网络响应揭示首屏大图浪费。
 - **响应封装** —— `format=json` 返回完整结构化数据；`format=markdown`
   返回适合 LLM 的 markdown 文档。
 - **SSRF 防护** —— 拒绝非 http(s) 协议以及私有 / 回环 / 链路本地 / ULA /
@@ -124,7 +139,16 @@ curl -X POST http://localhost:3000/summary \
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |
 | `save_dom_snapshot` | bool | false | `DOMSnapshot.captureSnapshot` 写入 `stat.dom_snapshot`。 |
-| `web_vitals` | bool | false | 收集 Core Web Vitals（LCP / CLS / TBT / TTFB / 长任务计数）写入 `stat.web_vitals`，通过导航前安装的 `PerformanceObserver` 实现。 |
+| `web_vitals` | bool | false | 收集 Core Web Vitals（LCP / CLS / TBT / TTFB / 长任务计数）写入 `stat.web_vitals`，通过导航前安装的 `PerformanceObserver` 实现。同时记录 `lcp_element`（tag / id / class / url / text）、`cls_entries[]` + 服务端聚合的 `cls_top_sources[]`、**INP**（最大交互响应时长，2024 Core Web Vital；纯抓取场景为 `0`，`script` 模拟点击时变得有意义）以及 **Long Animation Frames**（Chrome 123+：`loaf_count` + `loaf_total_blocking_duration` + 服务端聚合的 `loaf_top_offenders[]`，按脚本源 URL 归因，标记 forced reflow —— 直接定位是哪个 JS 文件在卡顿）。 |
+| `metrics` | bool | false | V8 heap + DOM 计数 + CPU 时间分解（`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms` / `task_duration_ms`）写入 `stat.metrics`，通过 `Performance.getMetrics`。回归检测的金矿 ——「LCP 没变但 script 时长 +30%」一眼可见。 |
+| `metadata` | bool | false | 抓 `<head>` 元数据（title / description / canonical / robots / lang / viewport / charset / theme-color / OG / Twitter）写入 `stat.metadata`。SEO 回归一眼可见。 |
+| `render_blocking` | bool | false | 扫 `<head>` 找 render-blocking 同步 stylesheet 和 没 `async`/`defer`/`module` 的 script，结果在 `stat.render_blocking_resources[]`。 |
+| `service_worker` | bool | false | 抓 `navigator.serviceWorker` 注册信息写入 `stat.service_worker`（controlled / scope / active_script / waiting / installing）。 |
+| `initiators` | bool | false | 订阅 `Network.requestWillBeSent` 给每条 resource 加 `initiator` 信息（type / url / line_number），回答「这个请求是谁触发的」。 |
+| `console_messages` | bool | false | 收集 `console.log/info/warn/error/debug` 写入 `stat.console_messages`。默认关闭 —— console 通常很吵（框架开发警告、统计脚本、大对象 dump），只在确实要做 console 审计时打开。关闭时根本不订阅 CDP `Runtime.consoleAPICalled`（零成本）。 |
+| `image_sizing` | bool | false | 逐张 `<img>` 审计：解码后的原始尺寸 vs 实际布局尺寸（已按 DPR 修正，retina 优化图不会误报浪费）、`loading` 模式、是否在首屏、是否缺 `alt`；服务端关联 `transferred_bytes` 并计算 `waste_ratio`。结果按浪费率降序写入 `stat.image_sizing`。一次 `evaluate` 调用，~2ms（100+ 张图）。 |
+| `dom_mutations` | bool | false | 导航前注入 `MutationObserver`，统计整个渲染期间的 DOM 变更（childList 增删 + 属性修改）。输出 `stat.dom_mutations`：总数 + 观测窗口 + top tags + top attributes。重度 SPA 也 ≤5ms 开销（只增不读、不存原始 records、跳过 `characterData`）。 |
+| `resources` | bool | false | 是否在响应中包含完整的 `stat.resources[]` 列表。默认关闭 —— 功能校验（"页面是否正常加载"）只需要标量 `total_size` + `resource_count` + 聚合 `resource_summary`（按 MIME bucket 的字节/数量、状态码分布、缓存命中率、第三方字节、最大资源），覆盖度足够。只在需要逐条 forensics（timing / mime / 缓存命中 / initiator）时打开。内部始终采集，所以依赖 resources 的下游特性（HAR、`image_sizing.transferred_bytes`、`resource_summary`）不受影响。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
 | `normalize_custom_elements` | bool | true | （仅 markdown 模式生效）把自定义元素（如 `taro-view-core`）按 computed `display` 重写成 `<div>` / `<span>`。 |
@@ -170,6 +194,7 @@ snapshot）→ 关闭 page + 销毁 context。
 ```json
 {
   "total_size": 245678,
+  "resource_count": 26,
   "fcp_time": 234,
   "dcl_time": 567,
   "load_time": 1234,
@@ -184,6 +209,8 @@ snapshot）→ 关闭 page + 销毁 context。
       "url": "https://example.com/app.js",
       "mime_type": "application/javascript",
       "connection_reused": true,
+      "protocol": "h2",
+      "content_encoding": "br",
       "from_cache": false,
       "timing": { "request_time": 5.123, "dns_start": 0.1 }
     }
@@ -205,17 +232,137 @@ snapshot）→ 关闭 page + 销毁 context。
   "har": { "log": { "version": "1.2" } },
   "dom_snapshot": { "documents": [], "strings": [] },
   "web_vitals": {
-    "lcp": 1234.5,
-    "cls": 0.045,
-    "tbt": 182.3,
-    "ttfb": 156.0,
-    "long_tasks": 3
+    "lcp": 1234.5, "cls": 0.045, "tbt": 182.3, "ttfb": 156.0, "long_tasks": 3,
+    "lcp_element": {
+      "tag": "img", "id": "hero", "class": "hero-image",
+      "url": "https://cdn.example.com/hero.webp", "text_preview": null
+    },
+    "cls_entries": [
+      { "time_ms": 850, "value": 0.032, "sources": [{"tag":"div","id":"","class":"ad-banner"}] }
+    ],
+    "cls_top_sources": [
+      { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71, "shift_count": 1 }
+    ],
+    "inp": 0, "interaction_count": 0,
+    "loaf_count": 5, "loaf_total_blocking_duration": 312.5,
+    "loaf_top_offenders": [
+      {
+        "source_url": "https://cdn.example.com/app.js",
+        "source_function_name": "render",
+        "invoker_type": "script",
+        "total_duration_ms": 187.2,
+        "total_forced_style_layout_ms": 42.1,
+        "invocation_count": 3
+      }
+    ]
+  },
+  "metrics": {
+    "js_heap_used": 12582912, "js_heap_total": 18874368,
+    "documents": 1, "frames": 1, "nodes": 156, "js_event_listeners": 8,
+    "script_duration_ms": 234.5, "layout_duration_ms": 45.2,
+    "recalc_style_duration_ms": 12.8, "task_duration_ms": 312.1
+  },
+  "resource_summary": {
+    "bytes_by_type": { "javascript": 720000, "image": 245000, "css": 35000 },
+    "count_by_type": { "javascript": 8, "image": 5, "css": 3 },
+    "status_distribution": { "2xx": 24, "4xx": 1 },
+    "cache_hit_ratio": 0.32, "cached_bytes": 35000,
+    "third_party_bytes": 18200,
+    "largest_resource": ["https://cdn.example.com/vendors.js", 712600],
+    "protocol_distribution": { "h2": 18, "h3": 4, "http/1.1": 2 },
+    "compressed_count": 14,
+    "uncompressed_text_count": 3,
+    "uncompressed_text_bytes": 84200,
+    "connections_reused": 19,
+    "connections_new": 5,
+    "unique_hosts": 6
+  },
+  "metadata": {
+    "title": "Example", "description": "An example page",
+    "canonical": "https://example.com/", "robots": "index, follow",
+    "lang": "en", "viewport": "width=device-width, initial-scale=1",
+    "charset": "UTF-8", "theme_color": "#1976d2",
+    "og": { "title": "Example", "image": "..." },
+    "twitter": { "card": "summary_large_image" }
+  },
+  "render_blocking_resources": [
+    { "tag": "link", "url": "https://cdn.example.com/critical.css", "why": "sync stylesheet" },
+    { "tag": "script", "url": "https://cdn.example.com/jquery.min.js", "why": "no async/defer" }
+  ],
+  "security_headers": {
+    "Content-Security-Policy": "default-src 'self'",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Frame-Options": "SAMEORIGIN",
+    "X-Content-Type-Options": "nosniff"
+  },
+  "service_worker": {
+    "controlled": true, "scope": "https://example.com/",
+    "active_script": "https://example.com/sw.js",
+    "waiting": false, "installing": false
+  },
+  "tls_info": {
+    "host": "example.com",
+    "remote_ip": "203.0.113.42", "remote_port": 443,
+    "protocol": "TLS 1.3", "cipher": "TLS_AES_128_GCM_SHA256",
+    "key_exchange": null,
+    "subject_name": "*.example.com", "issuer": "Let's Encrypt R3",
+    "valid_from": 1705276800.0, "valid_to": 1713052800.0,
+    "days_remaining": 45,
+    "san_list": ["*.example.com", "example.com"]
+  },
+  "tls_certificates": [
+    {
+      "host": "fonts.gstatic.com",
+      "remote_ip": "142.250.190.10", "remote_port": 443,
+      "protocol": "TLS 1.3", "cipher": "TLS_AES_128_GCM_SHA256",
+      "issuer": "WR2", "subject_name": "*.gstatic.com",
+      "days_remaining": 67,
+      "valid_from": 1705276800.0, "valid_to": 1719052800.0,
+      "key_exchange": null, "san_list": ["*.gstatic.com"]
+    }
+  ],
+  "image_sizing": [
+    {
+      "url": "https://example.com/hero.jpg",
+      "natural_width": 3840, "natural_height": 2160,
+      "display_width": 800, "display_height": 450,
+      "device_pixel_ratio": 2.0,
+      "loaded": true, "loading": "eager", "decoding": "auto",
+      "in_viewport": true, "alt_missing": false,
+      "transferred_bytes": 1843200, "waste_ratio": 0.83
+    }
+  ],
+  "dom_mutations": {
+    "total_added_nodes": 4521, "total_removed_nodes": 1203,
+    "total_attribute_changes": 8932,
+    "observation_window_ms": 3450,
+    "top_tags_by_mutation_count": [
+      { "name": "div", "count": 3201 },
+      { "name": "span", "count": 1822 }
+    ],
+    "top_attributes_changed": [
+      { "name": "class", "count": 4521 },
+      { "name": "style", "count": 3201 }
+    ]
   }
 }
 ```
 
-可选字段（`screenshot` / `pdf` / `har` / `dom_snapshot` / `web_vitals`）
-不显式请求时为 `null`。
+`tls_info` 是主文档的证书（HTTPS 站点自动采集，HTTP / file:// 时为
+`null`）。`tls_certificates` 是页面访问过的**所有** HTTPS host
+（含第三方 CDN）去重后的证书清单，按 `days_remaining` 升序 ——
+始终存在（纯 HTTP 页面为空数组）。
+
+按需启用、未启用时为 `null` 的字段：`screenshot` / `pdf` / `har` /
+`dom_snapshot` / `web_vitals` / `metrics` / `metadata` /
+`render_blocking_resources` / `service_worker` / `image_sizing` /
+`dom_mutations`。`console_messages` 和 `resources` 在对应 flag 未设
+之前是空数组 `[]` —— `resource_count` 和 `total_size`（标量）以及
+`resource_summary`（聚合）始终存在，所以"功能校验"用法不需要拉取
+完整列表也能获得关键信号。
+
+(`resources[].initiator` 在 `initiators=true` 时也会填充：
+`{ "type": "parser" | "script" | "preload" | ..., "url": "...", "line_number": 12 }`。)
 
 #### Markdown 封装（`format=markdown`）
 
@@ -401,6 +548,70 @@ curl -X POST http://localhost:3000/summary \
 
 不开 `cpu_throttle` 跑同样请求做对比，TBT 和 LCP 会有 3–5× 差距，符合
 真实低端 Android 用户的体验 —— 在影响真实用户之前抓 Web Vitals 回归。
+
+### AI 比对 / 回归基线
+
+一次性启用所有对比维度，输出 markdown 文档给 LLM 或 diff 任务：
+
+```bash
+curl -X POST http://localhost:3000/summary \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://example.com/critical-page",
+    "format": "markdown",
+    "web_vitals": true,
+    "metrics": true,
+    "metadata": true,
+    "render_blocking": true,
+    "service_worker": true,
+    "initiators": true,
+    "image_sizing": true,
+    "dom_mutations": true,
+    "settle_ms": 500
+  }'
+```
+
+返回的单一 markdown 文档包含：加载摘要、异常、Web Vitals + LCP 元素 +
+top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-host
+清单、安全头、Service Worker、图片尺寸审计、页面元数据、Page Metrics
+（含 CPU 时间分解）、DOM 突变热点、resources 列表、cookies。
+存档多次快照按时间 diff，可捕捉：
+
+- `lcp_element` 变了 → 图片挂了走降级
+- `cls_top_sources[0].selector` 变了 → 新的布局抖动源
+- `metrics.script_duration_ms` +30% 而 LCP 没动 → JS 回归
+- `security_headers["Content-Security-Policy"]` 没了 → 安全回归
+- `metadata.robots` 意外包含 `noindex` → SEO 灾难
+- `render_blocking_resources` 新增条目 → 性能回归
+- `service_worker.controlled` 变成 false → PWA 坏了
+- 新的第三方 `resources[].url`，其 `initiator.url` 指向一个第一方脚本
+  → 立刻知道是哪个库带进来的 tracker
+- `tls_info.days_remaining < 30` → 证书快过期；< 0 → 已过期；
+  `tls_certificates[*]` 中任一接近过期 → 第三方 CDN 证书在把页面打挂
+  之前抓到
+- `tls_info.remote_ip` / `.issuer` 异常变化 → DNS 劫持 / CA 切换 /
+  MITM 信号
+- `image_sizing[0].waste_ratio > 0.5 && in_viewport=true` → 首屏关键
+  路径有大图浪费带宽
+- `dom_mutations.total_added_nodes` 比基线翻 N 倍 → 渲染抖动回归
+  （框架降级、`key` 优化失效等）
+- `dom_mutations.top_attributes_changed` 由 `style` 主导且数量极高 →
+  失控的动画 / transition 频繁触发 reflow
+- `web_vitals.loaf_top_offenders[0].source_url` 变更或在排名上升 →
+  JS 卡顿源切换；结合 `total_forced_style_layout_ms` 直接定位
+  layout thrashing 的脚本
+- `web_vitals.loaf_count` 或 `loaf_total_blocking_duration` 大幅上升 →
+  渲染期出现新的长动画帧（比 TBT 更精确）
+- `web_vitals.inp > 200ms` 且 `interaction_count > 0` → 模拟交互
+  （通过 `script` 触发点击）后响应性退化
+- `resource_summary.protocol_distribution["h2"]` 占比下降 → HTTP/2
+  覆盖率退化；回落到 `http/1.1` 会触发连接抖动
+- `resource_summary.uncompressed_text_bytes > 50_000` → 文本资源未启用
+  `Content-Encoding`，错失压缩
+- `resource_summary.connections_new` 大幅上升而 `connections_reused`
+  持平 → 连接池 / HTTP 多路复用退化
+- `resource_summary.unique_hosts` 增长 → DNS 查询开销上升，通常
+  伴随新引入的第三方脚本
 
 ---
 

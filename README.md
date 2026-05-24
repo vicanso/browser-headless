@@ -30,18 +30,40 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   (`wait_for_function`), network responses (`wait_for_request`, multiple),
   fixed `settle_ms`, custom JS via `script`.
 - **Full snapshot** — every resource with size / status / timing / mime /
-  cache flag; JS exceptions + console messages; cookies in the jar;
-  optional screenshot (PNG base64), PDF (base64), HAR 1.2 archive, CDP
+  cache flag; JS exceptions; cookies in the jar; optional console
+  messages, screenshot (PNG base64), PDF (base64), HAR 1.2 archive, CDP
   `DOMSnapshot` (structured layout + computed styles), **Core Web Vitals**
-  enriched with **LCP element identity** + per-shift **CLS sources**
-  (with pre-aggregated top offenders), **page metrics** (V8 heap + DOM
+  enriched with **LCP element identity**, per-shift **CLS sources** (with
+  pre-aggregated top offenders), **INP** (2024 Core Web Vital replacing
+  FID), and **Long Animation Frames** (Chrome 123+ jank attribution with
+  per-script source URL + forced-reflow flag), **page metrics** (V8 heap + DOM
   counts + CPU time breakdown: script/layout/style/task durations),
-  **render-blocking head resource detection**, **security response
-  headers** (CSP / HSTS / X-Frame-Options / ...), **Service Worker**
-  registration state, per-resource **request initiator** (parser / script
-  + source URL + line number), and a server-derived **resource summary**
-  (bytes & count by MIME bucket, status distribution, cache hit ratio,
-  third-party bytes, largest single resource).
+  **render-blocking head resource detection**, per-resource **request
+  initiator** (parser / script + source URL + line number), and a
+  server-derived **resource summary** (bytes & count by MIME bucket,
+  status distribution, cache hit ratio, third-party bytes, largest
+  single resource, **HTTP version distribution** h1/h2/h3,
+  **compression audit** with missed-opportunity bytes for text
+  resources without `Content-Encoding`, **connection reuse**
+  vs new-handshake counts, and **unique-host** count as DNS-lookup
+  proxy).
+- **Security audit** — **HTTP security headers** (CSP / HSTS / X-Frame-
+  Options / ...) from the main document; **TLS / certificate info** of
+  the landing page (protocol, cipher, issuer, subject, SAN list,
+  expiry-day countdown) plus the **resolved remote IP / port** the
+  browser actually connected to (DNS-resolution + cert pinning diff);
+  **per-host TLS certificate inventory** across all HTTPS resources
+  (CDNs / fonts / analytics) sorted by soonest expiry — catches
+  third-party cert expiry before it breaks the page; **Service Worker**
+  registration state.
+- **Render diagnostics (opt-in)** — **DOM mutation hotspots** via a
+  pre-navigation `MutationObserver` that counts childList /
+  attribute mutations during the full render window with top-N tag /
+  attribute breakdowns — diagnoses render-thrash regressions in SPAs.
+  **Image sizing audit** compares each `<img>`'s decoded natural size
+  vs laid-out display size (DPR-corrected, so retina-optimised images
+  aren't false-flagged) and joins with the network response to surface
+  bandwidth-wasting oversized images.
 - **Response envelope** — `format=json` for full structured access, or
   `format=markdown` for an LLM-friendly rendered document.
 - **SSRF guard** — rejects non-http(s) schemes and private / loopback /
@@ -134,12 +156,16 @@ curl -X POST http://localhost:3000/summary \
 | `pdf` | bool | false | Capture PDF via `Page.printToPDF` into `stat.pdf`. |
 | `har` | bool | false | Emit HAR 1.2 archive into `stat.har` (importable into Chrome DevTools). |
 | `save_dom_snapshot` | bool | false | Capture `DOMSnapshot.captureSnapshot` into `stat.dom_snapshot`. |
-| `web_vitals` | bool | false | Collect Core Web Vitals (LCP / CLS / TBT / TTFB / long-task count) into `stat.web_vitals` via `PerformanceObserver` installed pre-navigation. Also records `lcp_element` (tag / id / class / url / text) and `cls_entries[]` + server-aggregated `cls_top_sources[]` for attribution. |
+| `web_vitals` | bool | false | Collect Core Web Vitals (LCP / CLS / TBT / TTFB / long-task count) into `stat.web_vitals` via `PerformanceObserver` installed pre-navigation. Also records `lcp_element` (tag / id / class / url / text), `cls_entries[]` + server-aggregated `cls_top_sources[]`, **INP** (max interaction duration — 2024 Core Web Vital; `0` in non-interactive scrapes, meaningful when `script` simulates clicks), and **Long Animation Frames** (Chrome 123+: `loaf_count` + `loaf_total_blocking_duration` + server-aggregated `loaf_top_offenders[]` ranked by attributable script source — pinpoints which JS file is causing jank, with forced-reflow flag). |
 | `metrics` | bool | false | V8 heap + DOM counts + CPU time breakdown (`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms` / `task_duration_ms`) into `stat.metrics` via `Performance.getMetrics`. Gold for "LCP unchanged but script time +30%" regressions. |
 | `metadata` | bool | false | Page `<head>` metadata (title / description / canonical / robots / lang / viewport / charset / theme-color / OG / Twitter) into `stat.metadata`. Catches SEO regressions instantly. |
 | `render_blocking` | bool | false | Scan `<head>` for render-blocking sync stylesheets and scripts without `async`/`defer`/`module`; result in `stat.render_blocking_resources[]`. |
 | `service_worker` | bool | false | Snapshot `navigator.serviceWorker` registration into `stat.service_worker` (controlled / scope / active_script / waiting / installing). |
 | `initiators` | bool | false | Subscribe to `Network.requestWillBeSent` and attach per-resource `initiator` (type / url / line_number) — answers "what code triggered this request". |
+| `console_messages` | bool | false | Collect `console.log/info/warn/error/debug` lines into `stat.console_messages`. Default off — console output is noisy (framework warnings, analytics, large object dumps); enable only when actually auditing console. When off the CDP `Runtime.consoleAPICalled` stream is never subscribed (zero cost). |
+| `image_sizing` | bool | false | Per-`<img>` audit: decoded natural dimensions vs laid-out display dimensions (DPR-corrected so retina-tuned images aren't false-flagged), `loading` mode, viewport overlap, missing alt, server-joined `transferred_bytes` and computed `waste_ratio`. Output sorted worst-first into `stat.image_sizing`. One `evaluate` call, ~2ms even for 100+ images. |
+| `dom_mutations` | bool | false | Install a pre-navigation `MutationObserver` and count DOM mutations (childList adds/removes + attribute changes) during the full render window. Output: `stat.dom_mutations` with totals + observation duration + top tags + top attributes. ≤5ms overhead even on heavy SPAs (counter-only, never stores raw records, `characterData` skipped). |
+| `resources` | bool | false | Include the full per-resource list (`stat.resources[]`) in the response. Default off — for "did the page load OK" validation, scalar `total_size` + `resource_count` + aggregated `resource_summary` (bytes & count by MIME bucket, status distribution, cache hit ratio, third-party bytes, largest resource) cover the signal at a fraction of the payload. Enable only when you need per-entry forensics (timing / mime / cache flag / initiator). Internal collection is always on, so dependent features (HAR, `image_sizing.transferred_bytes`, `resource_summary`) keep working regardless. |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
 | `normalize_custom_elements` | bool | true | (Markdown only) Rewrite custom elements (`taro-view-core`, etc.) to `<div>`/`<span>` based on computed `display`. |
@@ -187,6 +213,7 @@ trivially attributable.
 ```json
 {
   "total_size": 245678,
+  "resource_count": 26,
   "fcp_time": 234,
   "dcl_time": 567,
   "load_time": 1234,
@@ -201,6 +228,8 @@ trivially attributable.
       "url": "https://example.com/app.js",
       "mime_type": "application/javascript",
       "connection_reused": true,
+      "protocol": "h2",
+      "content_encoding": "br",
       "from_cache": false,
       "timing": { "request_time": 5.123, "dns_start": 0.1 }
     }
@@ -232,6 +261,18 @@ trivially attributable.
     ],
     "cls_top_sources": [
       { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71, "shift_count": 1 }
+    ],
+    "inp": 0, "interaction_count": 0,
+    "loaf_count": 5, "loaf_total_blocking_duration": 312.5,
+    "loaf_top_offenders": [
+      {
+        "source_url": "https://cdn.example.com/app.js",
+        "source_function_name": "render",
+        "invoker_type": "script",
+        "total_duration_ms": 187.2,
+        "total_forced_style_layout_ms": 42.1,
+        "invocation_count": 3
+      }
     ]
   },
   "metrics": {
@@ -246,7 +287,14 @@ trivially attributable.
     "status_distribution": { "2xx": 24, "4xx": 1 },
     "cache_hit_ratio": 0.32, "cached_bytes": 35000,
     "third_party_bytes": 18200,
-    "largest_resource": ["https://cdn.example.com/vendors.js", 712600]
+    "largest_resource": ["https://cdn.example.com/vendors.js", 712600],
+    "protocol_distribution": { "h2": 18, "h3": 4, "http/1.1": 2 },
+    "compressed_count": 14,
+    "uncompressed_text_count": 3,
+    "uncompressed_text_bytes": 84200,
+    "connections_reused": 19,
+    "connections_new": 5,
+    "unique_hosts": 6
   },
   "metadata": {
     "title": "Example", "description": "An example page",
@@ -270,6 +318,51 @@ trivially attributable.
     "controlled": true, "scope": "https://example.com/",
     "active_script": "https://example.com/sw.js",
     "waiting": false, "installing": false
+  },
+  "tls_info": {
+    "host": "example.com",
+    "remote_ip": "203.0.113.42", "remote_port": 443,
+    "protocol": "TLS 1.3", "cipher": "TLS_AES_128_GCM_SHA256",
+    "key_exchange": null,
+    "subject_name": "*.example.com", "issuer": "Let's Encrypt R3",
+    "valid_from": 1705276800.0, "valid_to": 1713052800.0,
+    "days_remaining": 45,
+    "san_list": ["*.example.com", "example.com"]
+  },
+  "tls_certificates": [
+    {
+      "host": "fonts.gstatic.com",
+      "remote_ip": "142.250.190.10", "remote_port": 443,
+      "protocol": "TLS 1.3", "cipher": "TLS_AES_128_GCM_SHA256",
+      "issuer": "WR2", "subject_name": "*.gstatic.com",
+      "days_remaining": 67,
+      "valid_from": 1705276800.0, "valid_to": 1719052800.0,
+      "key_exchange": null, "san_list": ["*.gstatic.com"]
+    }
+  ],
+  "image_sizing": [
+    {
+      "url": "https://example.com/hero.jpg",
+      "natural_width": 3840, "natural_height": 2160,
+      "display_width": 800, "display_height": 450,
+      "device_pixel_ratio": 2.0,
+      "loaded": true, "loading": "eager", "decoding": "auto",
+      "in_viewport": true, "alt_missing": false,
+      "transferred_bytes": 1843200, "waste_ratio": 0.83
+    }
+  ],
+  "dom_mutations": {
+    "total_added_nodes": 4521, "total_removed_nodes": 1203,
+    "total_attribute_changes": 8932,
+    "observation_window_ms": 3450,
+    "top_tags_by_mutation_count": [
+      { "name": "div", "count": 3201 },
+      { "name": "span", "count": 1822 }
+    ],
+    "top_attributes_changed": [
+      { "name": "class", "count": 4521 },
+      { "name": "style", "count": 3201 }
+    ]
   }
 }
 ```
@@ -277,8 +370,20 @@ trivially attributable.
 (`resources[].initiator` is also populated when `initiators=true`:
 `{ "type": "parser" | "script" | "preload" | ..., "url": "...", "line_number": 12 }`.)
 
-Optional fields (`screenshot`, `pdf`, `har`, `dom_snapshot`) are `null`
-unless explicitly requested.
+`tls_info` is the main document's certificate (always captured for HTTPS,
+`null` for HTTP / file://). `tls_certificates` is the deduplicated cert
+list across **all** HTTPS hosts the page contacted (including third-party
+CDNs), sorted by `days_remaining` ascending — always present (empty list
+for a fully-HTTP page).
+
+Opt-in fields default to `null` until explicitly requested:
+`screenshot`, `pdf`, `har`, `dom_snapshot`, `web_vitals`, `metrics`,
+`metadata`, `render_blocking_resources`, `service_worker`, `image_sizing`,
+`dom_mutations`. `console_messages` and `resources` default to empty
+array `[]` until `console_messages=true` / `resources=true` is set ——
+`resource_count` and `total_size` (scalars) plus `resource_summary`
+(aggregates) are always emitted so functional-validation callers don't
+need the detailed list.
 
 #### Markdown envelope (`format=markdown`)
 
@@ -485,17 +590,18 @@ curl -X POST http://localhost:3000/summary \
     "render_blocking": true,
     "service_worker": true,
     "initiators": true,
+    "image_sizing": true,
+    "dom_mutations": true,
     "settle_ms": 500
   }'
 ```
 
 You get back a single markdown document with sections for: load summary,
-exceptions, console messages, cookies, resources, web vitals + LCP element
-+ top CLS offenders, security headers, service worker, page metrics with
-CPU time breakdown, render-blocking head resources, page metadata, and a
-resource summary (bytes by type + status distribution + cache hit ratio +
-third-party bytes + largest resource). Store snapshots over time and diff
-to catch:
+exceptions, web vitals + LCP element + top CLS offenders, resource
+summary, render-blocking head resources, TLS certificate + per-host
+inventory, security headers, service worker, image sizing audit, page
+metadata, page metrics with CPU time breakdown, DOM mutation hotspots,
+resources list, cookies. Store snapshots over time and diff to catch:
 
 - `lcp_element` changed → image broken → fallback rendered
 - `cls_top_sources[0].selector` changed → new layout offender
@@ -506,6 +612,32 @@ to catch:
 - `service_worker.controlled` flipped to false → PWA broken
 - New third-party `resources[].url` whose `initiator.url` points at a
   legitimate first-party script → know which library brought the tracker in
+- `tls_info.days_remaining` < 30 → cert expiring soon; < 0 → already
+  expired; any `tls_certificates[*]` close to expiry → third-party CDN
+  cert risk before it breaks the page
+- `tls_info.remote_ip` / `.issuer` changed unexpectedly → DNS hijack /
+  CA migration / MITM signal
+- `image_sizing[0].waste_ratio > 0.5 && in_viewport=true` → bandwidth
+  waste in the above-the-fold critical path
+- `dom_mutations.total_added_nodes` +N× vs baseline → render-thrash
+  regression (framework downgrade, lost `key` optimization, etc.)
+- `dom_mutations.top_attributes_changed` dominated by `style` with very
+  high count → uncontrolled animation / transition triggering reflow
+- `web_vitals.loaf_top_offenders[0].source_url` changed or moved up the
+  list → JS jank source shifted; combined with `total_forced_style_layout_ms`
+  flags layout-thrashing scripts directly
+- `web_vitals.loaf_count` or `loaf_total_blocking_duration` jumped → new
+  long animation frames during render (more precise than TBT)
+- `web_vitals.inp` > 200ms with `interaction_count > 0` → degraded
+  responsiveness on simulated interaction (`script` clicked something)
+- `resource_summary.protocol_distribution["h2"]` ratio dropped → HTTP/2
+  rollout regression; falling back to `http/1.1` triggers connection thrash
+- `resource_summary.uncompressed_text_bytes > 50_000` → text resources
+  shipped without `Content-Encoding` — missed compression opportunity
+- `resource_summary.connections_new` jumped vs baseline with
+  `connections_reused` flat → connection-pool / HTTP-multiplexing broke
+- `resource_summary.unique_hosts` ballooned → DNS-lookup overhead grew,
+  often new third-party scripts were introduced
 
 ---
 
