@@ -483,6 +483,7 @@ fn build_security_audit(
         total: cookies.len() as u32,
         ..Default::default()
     };
+    let mut header_bytes: u64 = 0;
     for cookie in cookies {
         if cookie.secure {
             c.secure += 1;
@@ -499,7 +500,18 @@ fn build_security_audit(
                 c.same_site_none_without_secure += 1;
             }
         }
+        // Estimate the on-the-wire `Cookie:` header contribution:
+        // `name=value` for the cookie, plus `"; "` separator between
+        // cookies. Subtract the trailing separator at the end.
+        header_bytes += cookie.name.len() as u64;
+        header_bytes += 1; // '='
+        header_bytes += cookie.value.len() as u64;
+        header_bytes += 2; // "; "
     }
+    if header_bytes >= 2 {
+        header_bytes -= 2; // drop the trailing "; " after the last cookie
+    }
+    c.header_bytes = header_bytes;
 
     SecurityAudit {
         headers: h,
@@ -854,6 +866,28 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
             summary.cache_control_missing += 1;
         }
 
+        // Image-format buckets — case-insensitive prefix match against
+        // the canonical IANA strings. SVG and other vector / unusual
+        // formats are intentionally excluded (no conversion target).
+        let m = r.mime_type.to_ascii_lowercase();
+        if m == "image/jpeg" || m == "image/png" || m == "image/gif" {
+            summary.legacy_image_bytes += r.content_size;
+        } else if m == "image/webp" || m == "image/avif" {
+            summary.modern_image_bytes += r.content_size;
+        }
+
+        // Source-map coverage — only JS / CSS resources contribute. Use
+        // mime-bucket so this stays consistent with the rest of the
+        // type aggregates (e.g. `application/javascript`,
+        // `text/javascript`, and `text/css` all map cleanly).
+        if bucket == "javascript" || bucket == "css" {
+            if r.has_source_map {
+                summary.source_maps_present += 1;
+            } else {
+                summary.source_maps_missing += 1;
+            }
+        }
+
         let status_bucket = match r.status {
             100..=199 => "1xx",
             200..=299 => "2xx",
@@ -968,7 +1002,186 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
         0.0
     };
 
+    summary.duplicate_resources = build_duplicate_resources(resources);
+    summary.mixed_content = build_mixed_content(resources, target_url);
+    summary.max_initiator_chain_depth = compute_initiator_chain_depth(resources);
+
     summary
+}
+
+/// Detect HTTPS-page-loading-HTTP-resource ("mixed content") findings.
+/// When the main `target_url` is not HTTPS this returns the default
+/// (no detection applies — every resource is plain HTTP and the page
+/// itself is too). Otherwise scans `resources[]` for `http://` URLs
+/// and returns the top-10 offenders by `content_size` desc.
+fn build_mixed_content(resources: &[WebPageResource], target_url: &str) -> MixedContent {
+    if !target_url.starts_with("https://") {
+        return MixedContent::default();
+    }
+    let mut offenders: Vec<MixedContentResource> = resources
+        .iter()
+        .filter(|r| r.url.starts_with("http://"))
+        .map(|r| MixedContentResource {
+            url: r.url.clone(),
+            content_size: r.content_size,
+            kind: mime_bucket(&r.mime_type).to_string(),
+        })
+        .collect();
+    let total_count = offenders.len() as u32;
+    if total_count == 0 {
+        return MixedContent::default();
+    }
+    offenders.sort_by_key(|e| std::cmp::Reverse(e.content_size));
+    offenders.truncate(10);
+    MixedContent {
+        detected: true,
+        total_count,
+        resources: offenders,
+    }
+}
+
+/// Walk `initiator.url` chains backwards from each resource to find
+/// the maximum depth. Returns `None` when no resource has initiator
+/// data (caller didn't request `initiators=true`), `Some(0)` when
+/// every resource was initiated directly by the parser at depth 1.
+///
+/// Approximates Lighthouse "Avoid chaining critical requests" —
+/// without the explicit "render-blocking only" filter, so this is
+/// the upper bound on chain length across all initiator types.
+/// Defended against cycles (rare but possible in degenerate
+/// initiator graphs) by a visited-URL set; capped at 100 hops to
+/// guarantee termination on pathological inputs.
+fn compute_initiator_chain_depth(resources: &[WebPageResource]) -> Option<u32> {
+    if !resources.iter().any(|r| r.initiator.is_some()) {
+        return None;
+    }
+    let mut parent: HashMap<&str, &str> = HashMap::new();
+    for r in resources {
+        if let Some(init) = r.initiator.as_ref()
+            && let Some(p) = init.url.as_deref()
+            && !p.is_empty()
+        {
+            parent.insert(r.url.as_str(), p);
+        }
+    }
+    let mut max_depth: u32 = 0;
+    for r in resources {
+        let mut depth: u32 = 0;
+        let mut current: &str = r.url.as_str();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        seen.insert(current);
+        while let Some(&p) = parent.get(current) {
+            if !seen.insert(p) {
+                break; // cycle guard
+            }
+            depth += 1;
+            current = p;
+            if depth > 100 {
+                break; // pathological-input safety cap
+            }
+        }
+        max_depth = max_depth.max(depth);
+    }
+    Some(max_depth)
+}
+
+/// Extract the basename (final path segment) from a URL, stripping
+/// query string and fragment. `None` for URLs whose path ends in `/`
+/// (no real filename) or that don't parse.
+fn url_basename(url: &str) -> Option<&str> {
+    let no_query = url.split('?').next().unwrap_or(url);
+    let no_frag = no_query.split('#').next().unwrap_or(no_query);
+    no_frag
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty() && !s.contains(':'))
+}
+
+/// Detect duplicate resources via two complementary passes. Pure
+/// derive; runs in `O(N log N)` worst case for the sorts.
+///
+/// Pass 1 — **exact URL**: group resources by URL, keep groups with
+/// `count ≥ 2`. Sort each group's content_size desc; waste = sum of
+/// all but the largest size (so a `[fresh, cache-hit]` pair reports
+/// `wasted = 0` while `[fresh, fresh]` reports `wasted = fresh_size`).
+///
+/// Pass 2 — **basename + size**: group by `(basename, content_size)`,
+/// dedupe URLs within each group. Keep groups with ≥2 distinct URLs.
+/// Skips entries with `content_size == 0` (cache hits and empty
+/// responses — no meaningful size signal). Skips entries with no
+/// extractable basename (path ending in `/`).
+///
+/// Both lists capped at top 10 sorted by `wasted_bytes` desc.
+fn build_duplicate_resources(resources: &[WebPageResource]) -> DuplicateResources {
+    let mut by_url: HashMap<&str, Vec<&WebPageResource>> = HashMap::new();
+    for r in resources {
+        by_url.entry(r.url.as_str()).or_default().push(r);
+    }
+    let mut exact_url: Vec<DuplicateEntry> = Vec::new();
+    let mut wasted_total: u64 = 0;
+    for (url, copies) in &by_url {
+        if copies.len() < 2 {
+            continue;
+        }
+        let mut sizes: Vec<u64> = copies.iter().map(|r| r.content_size).collect();
+        sizes.sort_by(|a, b| b.cmp(a));
+        let bytes_each = sizes.first().copied().unwrap_or(0);
+        let wasted: u64 = sizes.iter().skip(1).sum();
+        wasted_total += wasted;
+        exact_url.push(DuplicateEntry {
+            key: (*url).to_string(),
+            urls: vec![(*url).to_string()],
+            count: copies.len() as u32,
+            bytes_each,
+            wasted_bytes: wasted,
+        });
+    }
+    exact_url.sort_by_key(|e| std::cmp::Reverse(e.wasted_bytes));
+    exact_url.truncate(10);
+
+    // Pass 2: basename + size. Skip cache hits and empty responses —
+    // they have no meaningful size for comparison.
+    let mut by_name_size: HashMap<(&str, u64), Vec<&WebPageResource>> = HashMap::new();
+    for r in resources {
+        if r.content_size == 0 {
+            continue;
+        }
+        let Some(name) = url_basename(&r.url) else {
+            continue;
+        };
+        by_name_size
+            .entry((name, r.content_size))
+            .or_default()
+            .push(r);
+    }
+    let mut likely_same_file: Vec<DuplicateEntry> = Vec::new();
+    for ((name, size), copies) in &by_name_size {
+        let mut urls: Vec<String> = copies.iter().map(|r| r.url.clone()).collect();
+        urls.sort();
+        urls.dedup();
+        if urls.len() < 2 {
+            continue;
+        }
+        let count = urls.len() as u32;
+        let bytes_each = *size;
+        let wasted = (count as u64 - 1) * bytes_each;
+        wasted_total += wasted;
+        likely_same_file.push(DuplicateEntry {
+            key: format!("{name}|{bytes_each}"),
+            urls,
+            count,
+            bytes_each,
+            wasted_bytes: wasted,
+        });
+    }
+    likely_same_file.sort_by_key(|e| std::cmp::Reverse(e.wasted_bytes));
+    likely_same_file.truncate(10);
+
+    DuplicateResources {
+        exact_url,
+        likely_same_file,
+        wasted_bytes: wasted_total,
+    }
 }
 
 /// Whether a MIME type benefits from text compression (gzip/br/zstd).
@@ -1829,6 +2042,12 @@ pub struct WebPageStat {
     /// by `all_metrics=true` (coverage stays opt-in due to its
     /// instrumentation cost).
     pub coverage: Option<CoverageReport>,
+    /// Phase-by-phase timing for the main document (DNS / TCP / TLS /
+    /// TTFB). Always emitted when a Document-type response with timing
+    /// data was observed — `None` for full-cache or unusual flows.
+    /// Surfaced top-level so AI / monitors can do "server slow vs
+    /// frontend slow" first-triage without scanning `resources[]`.
+    pub document_timing: Option<DocumentTiming>,
 }
 
 /// TLS / certificate snapshot for a single host. `days_remaining` is
@@ -1985,6 +2204,13 @@ pub struct CookieSecurityCheck {
     /// reject these cookies outright — the page is shipping cookies
     /// that won't be accepted. Non-zero is always actionable.
     pub same_site_none_without_secure: u32,
+    /// Estimated `Cookie:` request-header byte size when **every**
+    /// cookie in the jar applies (worst-case same-origin GET). Sum
+    /// of `name + "=" + value` plus `"; "` separators. Servers and
+    /// CDNs typically cap inbound headers at 8 KB and many web
+    /// frameworks at 4 KB — values approaching either are a real
+    /// per-request tax (every navigation, every XHR pays this).
+    pub header_bytes: u64,
 }
 
 /// Snapshot of the page's Service Worker registration. `None` for the
@@ -2322,6 +2548,70 @@ pub struct ResourceSummary {
     /// reverted to HTTP/1.1 or a misconfigured origin lost ALPN.
     /// `0.0` when every response was cached (no real protocol observed).
     pub modern_protocol_share: f64,
+    /// Total content bytes shipped in **legacy** raster image formats
+    /// (`image/jpeg`, `image/png`, `image/gif`). Pairs with
+    /// `modern_image_bytes` — together they cover the bulk of
+    /// image payload, and the ratio drives the Lighthouse "Serve
+    /// images in next-gen formats" estimate. Vector formats (SVG)
+    /// and non-image MIME types are excluded.
+    pub legacy_image_bytes: u64,
+    /// Total content bytes shipped in **next-gen** raster image
+    /// formats (`image/webp`, `image/avif`). A high
+    /// `modern / (modern + legacy)` ratio indicates good
+    /// modernisation; `0` is itself a finding for image-heavy pages.
+    pub modern_image_bytes: u64,
+    /// Count of **JS or CSS** resources that shipped a sourcemap
+    /// pointer header (`SourceMap` or `X-SourceMap`). Two
+    /// orthogonal interpretations — useful for `coverage` analysis,
+    /// risky for production exposure — left to the caller.
+    pub source_maps_present: u32,
+    /// JS / CSS resources WITHOUT a sourcemap pointer header. Pairs
+    /// with `source_maps_present` as the coverage denominator.
+    pub source_maps_missing: u32,
+    /// Duplicate-resource detection: same URL loaded multiple times,
+    /// plus same-basename + same-size loaded from different URLs.
+    /// Always populated (empty lists when no duplicates).
+    pub duplicate_resources: DuplicateResources,
+    /// Mixed-content audit: plain HTTP resources on an HTTPS page.
+    /// Always populated; `detected=false` for HTTP-served pages
+    /// (where the check doesn't apply) and clean HTTPS pages.
+    pub mixed_content: MixedContent,
+    /// Max chain length walking backwards through `initiator.url`
+    /// from any resource to a root (a resource with no initiator).
+    /// Approximates Lighthouse's "critical request chain depth".
+    /// `None` when `initiators=false` (the per-resource initiator
+    /// data isn't captured); `Some(0)` when every resource was
+    /// initiated by the parser at depth 1 (flat dependency graph).
+    pub max_initiator_chain_depth: Option<u32>,
+}
+
+/// Mixed-content finding — HTTPS pages must not fetch sub-resources
+/// over plain HTTP (browsers either block or auto-upgrade them, and
+/// either way it's a configuration mistake the caller wants to
+/// know about). When the main page itself is HTTP this check
+/// doesn't apply (nothing to be "mixed" against).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MixedContent {
+    /// True iff the main page was loaded over HTTPS AND at least one
+    /// sub-resource came over plain HTTP. False on HTTP main pages
+    /// or clean HTTPS pages.
+    pub detected: bool,
+    /// Total count of HTTP resources observed on the HTTPS page —
+    /// **not** capped (the truncation only affects `resources`).
+    pub total_count: u32,
+    /// Up to 10 of the offending resources, sorted by `content_size`
+    /// descending (largest payload first — fixing those has the
+    /// biggest user-visible impact). Empty when `detected=false`.
+    pub resources: Vec<MixedContentResource>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MixedContentResource {
+    pub url: String,
+    pub content_size: u64,
+    /// Top-level MIME bucket (`javascript` / `css` / `image` / ...),
+    /// taken from the same `mime_bucket` mapping used elsewhere.
+    pub kind: String,
 }
 
 /// Per-host byte/count tuple for the `top_third_party_domains` ranking.
@@ -2330,6 +2620,59 @@ pub struct DomainBytes {
     pub host: String,
     pub bytes: u64,
     pub count: u32,
+}
+
+/// Duplicate-resource report — catches the "same static file loaded
+/// twice" pattern that wastes bandwidth and parse / compile time.
+///
+/// Two detection passes are run, both pure derives from `resources[]`:
+///
+///   1. **exact_url**: same URL appeared ≥2 times. Usually a real bug
+///      (double-mount, hydration loop, accidental import). Chrome
+///      normally dedupes via HTTP cache, so multiple entries means
+///      cache was bypassed or the engine treated them as distinct
+///      requests.
+///   2. **likely_same_file**: same `basename` + same `content_size`
+///      shipped from ≥2 different URLs. Catches "same library from
+///      different CDNs" (jsdelivr + cdnjs) or "fingerprinted twice
+///      with different hashes". Constraint on `content_size` cuts
+///      most false positives from generic names (`app.js`,
+///      `index.js`); same-name-different-size pairs are excluded.
+///
+/// `wasted_bytes` (top-level) sums the savings across both buckets —
+/// the bytes you'd recover if dedup were fixed. For exact_url groups
+/// with mixed cache + fresh copies, cache hits contribute `0` (no
+/// wire transfer happened), so this scalar is conservative.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DuplicateResources {
+    pub exact_url: Vec<DuplicateEntry>,
+    pub likely_same_file: Vec<DuplicateEntry>,
+    pub wasted_bytes: u64,
+}
+
+/// One bucket of duplicate-resource detection. For `exact_url` the
+/// `key` is the URL and `urls` contains that one URL (the list is
+/// just for symmetry with `likely_same_file`); for `likely_same_file`
+/// the `key` is `"<basename>|<bytes_each>"` and `urls` is the ≥2
+/// distinct origins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DuplicateEntry {
+    pub key: String,
+    pub urls: Vec<String>,
+    /// Total occurrences. For `exact_url` = how many times that URL
+    /// was loaded. For `likely_same_file` = how many distinct URLs
+    /// landed in this bucket.
+    pub count: u32,
+    /// Representative size of one copy. Same across all copies in a
+    /// `likely_same_file` group (it's part of the grouping key); for
+    /// `exact_url` it's the max content_size observed (so a fresh
+    /// copy beats a cache-hit copy at `0`).
+    pub bytes_each: u64,
+    /// Bytes that wouldn't have been transferred if dedup worked —
+    /// sum of `content_size` for all copies except the largest one.
+    /// `0` when every copy was a cache hit (still surfaces the code
+    /// bug, but acknowledges no wire cost was paid).
+    pub wasted_bytes: u64,
 }
 
 /// Page-level metadata extracted from `<head>`. Comparison signals for SEO
@@ -2581,6 +2924,16 @@ pub struct WebPageResource {
     /// freshness — usually a missed caching opportunity for static
     /// assets. Counted into `ResourceSummary.cache_control_*`.
     pub cache_control: Option<String>,
+    /// True when the response carried a `SourceMap` (or legacy
+    /// `X-SourceMap`) response header pointing to a `.map` file.
+    /// Populated for every resource type but only meaningful for
+    /// JS / CSS — those are the only kinds counted into
+    /// `ResourceSummary.source_maps_*`. Two practical uses: (a) AI
+    /// can decode `coverage.top_unused[].url` byte offsets back to
+    /// original source when a sourcemap is published; (b) the
+    /// inverse — production sites usually shouldn't expose
+    /// sourcemaps publicly.
+    pub has_source_map: bool,
     /// True if the response came from disk cache, service worker, or prefetch
     /// cache. Cache hits typically have `content_size = 0` and many `timing`
     /// fields = -1 (skipped phases).
@@ -2631,6 +2984,76 @@ pub struct ResourceTiming {
     pub send_start: f64,
     pub send_end: f64,
     pub receive_headers_end: f64,
+}
+
+/// Phase-by-phase timing for the **main document** response (final
+/// landing page when redirects happened). Promoted from
+/// `resources[].timing` to a top-level field because for SSR /
+/// server-rendered pages the "is the server slow vs is the frontend
+/// slow" split is the single most diagnostic first-triage signal —
+/// and the detailed `resources[]` array is opt-in (`resources=true`).
+///
+/// Always populated when at least one Document response was observed
+/// with timing data; `None` for fully-cached navigations or unusual
+/// flows that produced no real Document response. All phase fields
+/// are millisecond durations, **clamped to 0** when CDP reported the
+/// phase as skipped (cache hit, connection reuse, etc.).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DocumentTiming {
+    /// Final URL after redirects (matches `http_errors.final_url`
+    /// when that feature is on).
+    pub url: String,
+    pub status: u32,
+    /// True if the main document came from disk / SW / prefetch
+    /// cache — in that case all phase durations are typically `0`.
+    pub from_cache: bool,
+    /// HTTP version negotiated (`h2` / `h3` / `http/1.1` / empty for
+    /// cached responses).
+    pub protocol: String,
+    /// DNS lookup time. `0` when the host was already resolved (DNS
+    /// cache hit) or the connection was reused.
+    pub dns_ms: u32,
+    /// TCP handshake time. `0` when the connection was reused (HTTP/2
+    /// multiplexing, keep-alive).
+    pub tcp_ms: u32,
+    /// TLS handshake time. `0` for plain HTTP, when the connection
+    /// was reused, or when 0-RTT resumption was used.
+    pub tls_ms: u32,
+    /// Server processing time — from "request fully sent" to "first
+    /// response byte received". The most direct measure of "how fast
+    /// is your backend / SSR layer".
+    pub ttfb_ms: u32,
+}
+
+/// Build a `DocumentTiming` from CDP response fields. Phases that CDP
+/// reported as skipped (negative values) collapse to `0` so the
+/// individual phase scalars sum correctly. Negative / NaN inputs
+/// treated defensively.
+fn build_document_timing(
+    url: &str,
+    status: u32,
+    from_cache: bool,
+    protocol: &str,
+    t: &CdpResourceTiming,
+) -> DocumentTiming {
+    let phase = |a: f64, b: f64| -> u32 {
+        let d = b - a;
+        if d.is_finite() && d > 0.0 {
+            d as u32
+        } else {
+            0
+        }
+    };
+    DocumentTiming {
+        url: url.to_string(),
+        status,
+        from_cache,
+        protocol: protocol.to_string(),
+        dns_ms: phase(t.dns_start, t.dns_end),
+        tcp_ms: phase(t.connect_start, t.connect_end),
+        tls_ms: phase(t.ssl_start, t.ssl_end),
+        ttfb_ms: phase(t.send_start, t.receive_headers_end),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2750,6 +3173,12 @@ pub async fn collect_summary(
     let mut http_final_url: String = url.to_string();
     let mut http_redirect_count: u32 = 0;
     let mut http_network_failures: Vec<NetworkFailure> = Vec::new();
+    // Document-timing state. Captured on the LAST Document response
+    // with status <400 (so redirects don't win — we want the actual
+    // landing page). Always tracked, no gate: it's a trivial
+    // assignment per Document response, and the data is too
+    // diagnostic to keep opt-in.
+    let mut document_timing: Option<DocumentTiming> = None;
     // Coverage bookkeeping. `stylesheet_meta` is keyed by string-form
     // `style_sheet_id` (matches the field type on `RuleUsage`) and
     // carries `(source_url, length_bytes)`. Only populated when
@@ -2859,6 +3288,11 @@ pub async fn collect_summary(
                 entry.protocol = ev.response.protocol.clone().unwrap_or_default();
                 entry.content_encoding = lookup_header(&ev.response.headers, "content-encoding");
                 entry.cache_control = lookup_header(&ev.response.headers, "cache-control");
+                // Two header spellings: modern `SourceMap` and the
+                // legacy `X-SourceMap` that older tooling (webpack,
+                // pre-2018 Babel) emitted. Either one counts.
+                entry.has_source_map = lookup_header(&ev.response.headers, "sourcemap").is_some()
+                    || lookup_header(&ev.response.headers, "x-sourcemap").is_some();
 
                 // HTTP error bookkeeping. All gated — when off, the
                 // `if captures.http_errors` branch is a single bool test
@@ -2882,6 +3316,43 @@ pub async fn collect_summary(
                             http_redirect_count += 1;
                         } else if s < 400 {
                             http_final_url = entry.url.clone();
+                        }
+                    }
+                }
+
+                // Document timing: capture the FINAL (non-redirect)
+                // main-document response. Multiple Document responses
+                // can fire during a redirect chain — we only want the
+                // landing page, so 3xx responses are skipped and each
+                // subsequent <400 Document response overwrites.
+                if matches!(ev.r#type, ResourceType::Document) {
+                    let s = status as u32;
+                    if s < 400 {
+                        let from_cache = entry.from_cache;
+                        let protocol = entry.protocol.clone();
+                        let url_now = entry.url.clone();
+                        if let Some(t) = ev.response.timing.as_ref() {
+                            document_timing = Some(build_document_timing(
+                                &url_now,
+                                s,
+                                from_cache,
+                                &protocol,
+                                t,
+                            ));
+                        } else if from_cache {
+                            // Cached document: no CDP timing, but we
+                            // still want to surface "this came from
+                            // cache" rather than `None`.
+                            document_timing = Some(DocumentTiming {
+                                url: url_now,
+                                status: s,
+                                from_cache: true,
+                                protocol,
+                                dns_ms: 0,
+                                tcp_ms: 0,
+                                tls_ms: 0,
+                                ttfb_ms: 0,
+                            });
                         }
                     }
                 }
@@ -3234,6 +3705,7 @@ pub async fn collect_summary(
         dom_mutations: None,
         http_errors,
         coverage,
+        document_timing,
     })
 }
 
@@ -3417,6 +3889,34 @@ impl WebPageStat {
             let _ = writeln!(s);
         }
 
+        if let Some(dt) = &self.document_timing {
+            let _ = writeln!(s, "## Document Timing");
+            let _ = writeln!(s);
+            let url_display = if dt.url.len() > 80 {
+                format!("…{}", &dt.url[dt.url.len() - 77..])
+            } else {
+                dt.url.clone()
+            };
+            let _ = writeln!(
+                s,
+                "- `{}` — {} · {}{}",
+                url_display,
+                dt.status,
+                if dt.protocol.is_empty() {
+                    "(no protocol)"
+                } else {
+                    &dt.protocol
+                },
+                if dt.from_cache { " · cached" } else { "" },
+            );
+            let _ = writeln!(
+                s,
+                "- DNS **{}ms** · TCP **{}ms** · TLS **{}ms** · TTFB **{}ms**",
+                dt.dns_ms, dt.tcp_ms, dt.tls_ms, dt.ttfb_ms,
+            );
+            let _ = writeln!(s);
+        }
+
         if !self.resource_summary.bytes_by_type.is_empty() {
             let rs = &self.resource_summary;
             let _ = writeln!(s, "## Resource Summary");
@@ -3533,6 +4033,103 @@ impl WebPageStat {
                     "- Cache-Control coverage: **{:.0}%** ({} present · {} missing)",
                     cov, rs.cache_control_present, rs.cache_control_missing
                 );
+            }
+            // Image-format modernisation — Lighthouse "Serve images
+            // in next-gen formats" signal.
+            let img_total = rs.legacy_image_bytes + rs.modern_image_bytes;
+            if img_total > 0 {
+                let modern_pct = (rs.modern_image_bytes as f64) * 100.0 / (img_total as f64);
+                let _ = writeln!(
+                    s,
+                    "- Image formats: **{}** legacy (JPEG/PNG/GIF) · **{}** modern (WebP/AVIF) — **{:.0}%** modern",
+                    format_bytes(rs.legacy_image_bytes),
+                    format_bytes(rs.modern_image_bytes),
+                    modern_pct,
+                );
+            }
+            // Source-map coverage across JS / CSS.
+            let sm_total = rs.source_maps_present + rs.source_maps_missing;
+            if sm_total > 0 {
+                let cov = (rs.source_maps_present as f64) * 100.0 / (sm_total as f64);
+                let _ = writeln!(
+                    s,
+                    "- Source maps: **{:.0}%** of JS/CSS resources ({} present · {} missing)",
+                    cov, rs.source_maps_present, rs.source_maps_missing,
+                );
+            }
+            // Duplicate-resource findings — only render when something
+            // was detected; otherwise stay silent (empty lists carry no
+            // information for a markdown reader).
+            let dr = &rs.duplicate_resources;
+            if dr.wasted_bytes > 0 || !dr.exact_url.is_empty() || !dr.likely_same_file.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "- Duplicate resources: **{}** wasted across {} exact-URL group{}, {} likely-same-file group{} ⚠️",
+                    format_bytes(dr.wasted_bytes),
+                    dr.exact_url.len(),
+                    if dr.exact_url.len() == 1 { "" } else { "s" },
+                    dr.likely_same_file.len(),
+                    if dr.likely_same_file.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                );
+                for e in dr.exact_url.iter().take(3) {
+                    let display = if e.key.len() > 80 {
+                        format!("…{}", &e.key[e.key.len() - 77..])
+                    } else {
+                        e.key.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  - exact: `{}` ×{} ({} wasted)",
+                        display,
+                        e.count,
+                        format_bytes(e.wasted_bytes),
+                    );
+                }
+                for e in dr.likely_same_file.iter().take(3) {
+                    let _ = writeln!(
+                        s,
+                        "  - same-file: `{}` across {} URLs ({} wasted)",
+                        e.key,
+                        e.count,
+                        format_bytes(e.wasted_bytes),
+                    );
+                }
+            }
+            // Mixed content — only render when detected. Clean HTTPS
+            // pages and HTTP-served pages stay silent.
+            let mc = &rs.mixed_content;
+            if mc.detected {
+                let _ = writeln!(
+                    s,
+                    "- Mixed content: **{}** plain-HTTP resource{} on HTTPS page ⚠️",
+                    mc.total_count,
+                    if mc.total_count == 1 { "" } else { "s" },
+                );
+                for r in mc.resources.iter().take(3) {
+                    let display = if r.url.len() > 80 {
+                        format!("…{}", &r.url[r.url.len() - 77..])
+                    } else {
+                        r.url.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  - [{}] `{}` ({})",
+                        r.kind,
+                        display,
+                        format_bytes(r.content_size),
+                    );
+                }
+            }
+            // Critical-chain depth — only render when initiators were
+            // captured (`None` means `initiators=false`, value would be
+            // meaningless). `0` is a real signal too: every resource
+            // was parser-initiated, no JS-driven secondary fetches.
+            if let Some(depth) = rs.max_initiator_chain_depth {
+                let _ = writeln!(s, "- Max initiator chain depth: **{depth}**");
             }
             let _ = writeln!(s);
         }
@@ -3679,6 +4276,19 @@ impl WebPageStat {
                     ));
                 }
                 let _ = writeln!(s, "{line}");
+                // Cookie header byte size — flag when approaching the
+                // 4 KB framework limit. Otherwise stay quiet (most
+                // pages have tiny cookies).
+                let hdr = a.cookies.header_bytes;
+                if hdr >= 4096 {
+                    let _ = writeln!(
+                        s,
+                        "- Cookie header size: **{}** ⚠️ (≥ 4 KB — every request pays this tax)",
+                        format_bytes(hdr),
+                    );
+                } else if hdr > 0 {
+                    let _ = writeln!(s, "- Cookie header size: **{}**", format_bytes(hdr));
+                }
             } else {
                 let _ = writeln!(s, "- Cookies: (none)");
             }

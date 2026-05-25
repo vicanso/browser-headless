@@ -271,6 +271,11 @@ snapshot）→ 关闭 page + 销毁 context。
     "script_duration_ms": 234.5, "layout_duration_ms": 45.2,
     "recalc_style_duration_ms": 12.8, "task_duration_ms": 312.1
   },
+  "document_timing": {
+    "url": "https://example.com/",
+    "status": 200, "from_cache": false, "protocol": "h2",
+    "dns_ms": 12, "tcp_ms": 28, "tls_ms": 41, "ttfb_ms": 187
+  },
   "resource_summary": {
     "bytes_by_type": { "javascript": 720000, "image": 245000, "css": 35000 },
     "count_by_type": { "javascript": 8, "image": 5, "css": 3 },
@@ -290,6 +295,30 @@ snapshot）→ 关闭 page + 销毁 context。
     "uncompressed_text_bytes": 84200,
     "cache_control_present": 22,
     "cache_control_missing": 3,
+    "legacy_image_bytes": 180000,
+    "modern_image_bytes": 65000,
+    "source_maps_present": 2,
+    "source_maps_missing": 9,
+    "duplicate_resources": {
+      "exact_url": [
+        { "key": "https://example.com/static/app.js",
+          "urls": ["https://example.com/static/app.js"],
+          "count": 2, "bytes_each": 84200, "wasted_bytes": 84200 }
+      ],
+      "likely_same_file": [
+        { "key": "jquery.min.js|89476",
+          "urls": [
+            "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js",
+            "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"
+          ],
+          "count": 2, "bytes_each": 89476, "wasted_bytes": 89476 }
+      ],
+      "wasted_bytes": 173676
+    },
+    "mixed_content": {
+      "detected": false, "total_count": 0, "resources": []
+    },
+    "max_initiator_chain_depth": 3,
     "connections_reused": 19,
     "connections_new": 5,
     "unique_hosts": 6
@@ -323,7 +352,8 @@ snapshot）→ 关闭 page + 销毁 context。
     },
     "cookies": {
       "total": 3, "secure": 3, "http_only": 2,
-      "same_site_set": 3, "same_site_none_without_secure": 0
+      "same_site_set": 3, "same_site_none_without_secure": 0,
+      "header_bytes": 248
     }
   },
   "coverage": {
@@ -409,6 +439,13 @@ snapshot）→ 关闭 page + 销毁 context。
 监控只看一个标量 `js_exceptions.total` 就能发现回归（例如"今天突然
 多了 12 个 ReferenceError"）；`by_name` 是按出现次数排序的 top 10
 明细，每个 bucket 附带一条 sample 消息。
+
+`document_timing` 在观测到 Document 响应时始终输出（基本每次请求都
+有）。`dns_ms` / `tcp_ms` / `tls_ms` / `ttfb_ms` 这几个 phase 标量在
+CDP 报告 phase 被跳过（缓存命中、连接复用、纯 HTTP 等）时会 clamp
+到 `0`，可以直接相加。`ttfb_ms` 用来回答"后端是不是慢了"；配合
+`metrics.script_duration_ms` 区分服务端慢 vs 前端慢。仅在异常流程
+（全缓存导航，没有真实 Document 响应）下为 `None`。
 
 `security_audit` 也是始终输出（从 `security_headers` + `cookies`
 派生）：一次性配置审计的 scorecard。`security_audit.headers.present_count`
@@ -686,6 +723,26 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
   → 发送给客户端的死代码占比过大；`coverage.top_unused[]` 直接列出
   最浪费的文件（仅当显式 `coverage=true` 时输出，`all_metrics` 不会
   自动启用）
+- `document_timing.ttfb_ms` 上升而 `metrics.script_duration_ms` 没变
+  → 后端 / SSR 层慢了，跟前端无关
+- `document_timing.tls_ms` 在热连接上仍 > 100ms → 证书链过长，或者
+  0-RTT 恢复没配上
+- 在图片多的页面 `resource_summary.modern_image_bytes / (modern + legacy)`
+  偏低 → Lighthouse "Serve images in next-gen formats" 候选；把热图
+  转 WebP / AVIF
+- 生产环境 `resource_summary.source_maps_present > 0` → sourcemap
+  对外暴露（安全 / IP 泄漏），修复后应归零
+- `resource_summary.duplicate_resources.wasted_bytes > 0` → 同一份
+  静态文件被多次加载；`exact_url[]` 抓重复导入 / 水合循环这类 bug，
+  `likely_same_file[]` 抓"同一库从多个 CDN 引入"的浪费
+- `resource_summary.mixed_content.detected = true` → HTTPS 页面在加
+  plain-HTTP 资源；现代浏览器会直接拦或者自动升级。`resources[]`
+  按字节大小排序列出问题资源
+- `resource_summary.max_initiator_chain_depth > 4` → 关键请求链太深
+  （Lighthouse "Avoid chaining critical requests"）；给中间关键资源
+  加 preload 或者把依赖图压扁。仅在 `initiators=true` 时输出
+- `security_audit.cookies.header_bytes ≥ 4096` → cookie header 接近
+  或超过常见框架 4 KB 上限；每个请求都背这个带宽税
 - `resource_summary.connections_new` 大幅上升而 `connections_reused`
   持平 → 连接池 / HTTP 多路复用退化
 - `resource_summary.unique_hosts` 增长 → DNS 查询开销上升，通常

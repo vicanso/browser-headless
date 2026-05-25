@@ -290,6 +290,11 @@ trivially attributable.
     "script_duration_ms": 234.5, "layout_duration_ms": 45.2,
     "recalc_style_duration_ms": 12.8, "task_duration_ms": 312.1
   },
+  "document_timing": {
+    "url": "https://example.com/",
+    "status": 200, "from_cache": false, "protocol": "h2",
+    "dns_ms": 12, "tcp_ms": 28, "tls_ms": 41, "ttfb_ms": 187
+  },
   "resource_summary": {
     "bytes_by_type": { "javascript": 720000, "image": 245000, "css": 35000 },
     "count_by_type": { "javascript": 8, "image": 5, "css": 3 },
@@ -309,6 +314,30 @@ trivially attributable.
     "uncompressed_text_bytes": 84200,
     "cache_control_present": 22,
     "cache_control_missing": 3,
+    "legacy_image_bytes": 180000,
+    "modern_image_bytes": 65000,
+    "source_maps_present": 2,
+    "source_maps_missing": 9,
+    "duplicate_resources": {
+      "exact_url": [
+        { "key": "https://example.com/static/app.js",
+          "urls": ["https://example.com/static/app.js"],
+          "count": 2, "bytes_each": 84200, "wasted_bytes": 84200 }
+      ],
+      "likely_same_file": [
+        { "key": "jquery.min.js|89476",
+          "urls": [
+            "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js",
+            "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"
+          ],
+          "count": 2, "bytes_each": 89476, "wasted_bytes": 89476 }
+      ],
+      "wasted_bytes": 173676
+    },
+    "mixed_content": {
+      "detected": false, "total_count": 0, "resources": []
+    },
+    "max_initiator_chain_depth": 3,
     "connections_reused": 19,
     "connections_new": 5,
     "unique_hosts": 6
@@ -342,7 +371,8 @@ trivially attributable.
     },
     "cookies": {
       "total": 3, "secure": 3, "http_only": 2,
-      "same_site_set": 3, "same_site_none_without_secure": 0
+      "same_site_set": 3, "same_site_none_without_secure": 0,
+      "header_bytes": 248
     }
   },
   "coverage": {
@@ -435,6 +465,15 @@ the bucketed count is essentially zero. When no exceptions fire,
 regressions like "today this page has 12 ReferenceErrors vs 0
 yesterday"; `by_name` is the top-10 ranked breakdown with a sample
 message per class.
+
+`document_timing` is always emitted when a Document-type response was
+observed (almost every request). Phase scalars `dns_ms` / `tcp_ms` /
+`tls_ms` / `ttfb_ms` are clamped to `0` when CDP reported the phase as
+skipped (cache hit, connection reuse, plain HTTP, etc.) so they sum
+safely. Use `ttfb_ms` for "is the backend slow"; pair with
+`metrics.script_duration_ms` to distinguish server-side vs client-side
+slowness. `None` only for unusual flows (full-cache navigations without
+a real Document response).
 
 `security_audit` is also always emitted (pure derive from
 `security_headers` + `cookies`). It's a config-check scorecard:
@@ -716,6 +755,28 @@ resources list, cookies. Store snapshots over time and diff to catch:
   → significant dead code shipped to the client; `coverage.top_unused[]`
   names which files to trim first (only emitted when `coverage=true`,
   not implied by `all_metrics`)
+- `document_timing.ttfb_ms` jumped while `metrics.script_duration_ms`
+  stayed flat → backend / SSR layer slowed down; not a frontend issue
+- `document_timing.tls_ms` consistently > 100ms on warm connections →
+  certificate chain too long, or 0-RTT resumption not configured
+- `resource_summary.modern_image_bytes / (modern + legacy)` low on an
+  image-heavy page → Lighthouse "Serve images in next-gen formats"
+  candidate; convert hot images to WebP / AVIF
+- `resource_summary.source_maps_present > 0` in production → sourcemaps
+  exposed publicly (security / IP-leak concern); flip to `0` after fix
+- `resource_summary.duplicate_resources.wasted_bytes > 0` → same static
+  file loaded multiple times; `exact_url[]` flags double-imports / hydration
+  loops, `likely_same_file[]` flags same-library-from-different-CDNs
+- `resource_summary.mixed_content.detected = true` → HTTPS page is loading
+  plain-HTTP resources; modern browsers block or auto-upgrade these.
+  `mixed_content.resources[]` lists the offenders by size desc
+- `resource_summary.max_initiator_chain_depth > 4` → deep critical request
+  chain (Lighthouse "Avoid chaining critical requests"); preload key
+  intermediate resources or flatten the dependency graph. Only emitted
+  when `initiators=true`
+- `security_audit.cookies.header_bytes ≥ 4096` → cookie header at /
+  beyond the typical 4 KB framework limit; every request pays this
+  bandwidth tax
 - `resource_summary.connections_new` jumped vs baseline with
   `connections_reused` flat → connection-pool / HTTP-multiplexing broke
 - `resource_summary.unique_hosts` ballooned → DNS-lookup overhead grew,
