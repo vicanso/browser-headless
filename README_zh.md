@@ -148,8 +148,10 @@ curl -X POST http://localhost:3000/summary \
 | `console_messages` | bool | false | 收集 `console.log/info/warn/error/debug` 写入 `stat.console_messages`。默认关闭 —— console 通常很吵（框架开发警告、统计脚本、大对象 dump），只在确实要做 console 审计时打开。关闭时根本不订阅 CDP `Runtime.consoleAPICalled`（零成本）。 |
 | `image_sizing` | bool | false | 逐张 `<img>` 审计：解码后的原始尺寸 vs 实际布局尺寸（已按 DPR 修正，retina 优化图不会误报浪费）、`loading` 模式、是否在首屏、是否缺 `alt`；服务端关联 `transferred_bytes` 并计算 `waste_ratio`。结果按浪费率降序写入 `stat.image_sizing`。一次 `evaluate` 调用，~2ms（100+ 张图）。 |
 | `dom_mutations` | bool | false | 导航前注入 `MutationObserver`，统计整个渲染期间的 DOM 变更（childList 增删 + 属性修改）。输出 `stat.dom_mutations`：总数 + 观测窗口 + top tags + top attributes。重度 SPA 也 ≤5ms 开销（只增不读、不存原始 records、跳过 `characterData`）。 |
-| `resources` | bool | false | 是否在响应中包含完整的 `stat.resources[]` 列表。默认关闭 —— 功能校验（"页面是否正常加载"）只需要标量 `total_size` + `resource_count` + 聚合 `resource_summary`（按 MIME bucket 的字节/数量、状态码分布、缓存命中率、第三方字节、最大资源），覆盖度足够。只在需要逐条 forensics（timing / mime / 缓存命中 / initiator）时打开。内部始终采集，所以依赖 resources 的下游特性（HAR、`image_sizing.transferred_bytes`、`resource_summary`）不受影响。 |
-| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）—— 这些是 MB 级 payload，保持显式 opt-in 避免一个 flag 误把响应体撑大 10 倍。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
+| `resources` | bool | false | 是否在响应中包含完整的 `stat.resources[]` 列表。默认关闭 —— 功能校验（"页面是否正常加载"）只需要标量 `total_size` + `resource_count` + 聚合 `resource_summary`（按 MIME bucket 的字节/数量、状态码分布、缓存命中率、第三方字节 + top 3rd-party 域名、modern-protocol 占比、按算法的压缩分布、Cache-Control 覆盖率、最大资源），覆盖度足够。只在需要逐条 forensics（timing / mime / 缓存命中 / cache_control 头值 / initiator）时打开。内部始终采集，所以依赖 resources 的下游特性（HAR、`image_sizing.transferred_bytes`、`resource_summary`）不受影响。 |
+| `http_errors` | bool | false | 输出 `stat.http_errors`：`failed_4xx[]` / `failed_5xx[]` 列表、`network_failures[]`（DNS / TLS / 连接拒绝 / 被拦截 —— 来自 CDP `Network.loadingFailed`）、跳转后的 `final_url`、`redirect_count`。专为定时健康巡检设计，给一个聚焦的"页面是否挂了 / 被劫持 / 跳到奇怪地方"信号，不用解析整个 `resources[]`。开启时多订阅一个 CDP 事件流；关闭时零开销。 |
+| `coverage` | bool | false | 采集 CSS / JS coverage 输出到 `stat.coverage` —— Lighthouse "Reduce unused CSS / JS" 数据源（按文件统计 used / unused 字节 + top-10 浪费列表）。开启时导航前启用 CDP `Profiler.startPreciseCoverage` + `CSS.startRuleUsageTracking`，加载完后 take / stop。**`all_metrics=true` 也不会自动启用** —— coverage 会让 V8 关掉部分脚本优化、CSS 引擎全程保留 rule-usage 状态，所以即使开了 "所有分析信号" 也保持显式 opt-in。需要时单独设 `coverage=true`。 |
+| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
 | `normalize_custom_elements` | bool | true | （仅 markdown 模式生效）把自定义元素（如 `taro-view-core`）按 computed `display` 重写成 `<div>` / `<span>`。 |
@@ -201,6 +203,12 @@ snapshot）→ 关闭 page + 销毁 context。
   "load_time": 1234,
   "data": "<html>...</html>",
   "exceptions": ["42:15 ReferenceError: foo is not defined"],
+  "js_exceptions": {
+    "total": 1,
+    "by_name": [
+      { "name": "ReferenceError", "count": 1, "sample_message": "ReferenceError: foo is not defined" }
+    ]
+  },
   "console_messages": ["[log] hello world", "[error] api failed"],
   "resources": [
     {
@@ -269,11 +277,19 @@ snapshot）→ 关闭 page + 销毁 context。
     "status_distribution": { "2xx": 24, "4xx": 1 },
     "cache_hit_ratio": 0.32, "cached_bytes": 35000,
     "third_party_bytes": 18200,
+    "top_third_party_domains": [
+      { "host": "cdn.vendor.com", "bytes": 12400, "count": 3 },
+      { "host": "analytics.example", "bytes": 5800, "count": 2 }
+    ],
     "largest_resource": ["https://cdn.example.com/vendors.js", 712600],
     "protocol_distribution": { "h2": 18, "h3": 4, "http/1.1": 2 },
+    "modern_protocol_share": 0.92,
     "compressed_count": 14,
+    "compression_breakdown": { "br": 10, "gzip": 4, "none": 3 },
     "uncompressed_text_count": 3,
     "uncompressed_text_bytes": 84200,
+    "cache_control_present": 22,
+    "cache_control_missing": 3,
     "connections_reused": 19,
     "connections_new": 5,
     "unique_hosts": 6
@@ -295,6 +311,31 @@ snapshot）→ 关闭 page + 销毁 context。
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "X-Frame-Options": "SAMEORIGIN",
     "X-Content-Type-Options": "nosniff"
+  },
+  "security_audit": {
+    "headers": {
+      "hsts": true, "csp": true, "csp_report_only": false,
+      "x_frame_options": true, "x_content_type_options": true,
+      "referrer_policy": false, "permissions_policy": false,
+      "coop": false, "coep": false,
+      "present_count": 4,
+      "missing": ["Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"]
+    },
+    "cookies": {
+      "total": 3, "secure": 3, "http_only": 2,
+      "same_site_set": 3, "same_site_none_without_secure": 0
+    }
+  },
+  "coverage": {
+    "js_total_bytes": 845000, "js_used_bytes": 312000,
+    "js_unused_bytes": 533000, "js_unused_ratio": 0.63,
+    "css_total_bytes": 42000, "css_used_bytes": 18000,
+    "css_unused_bytes": 24000, "css_unused_ratio": 0.57,
+    "top_unused": [
+      { "url": "https://cdn.example.com/vendors.js", "kind": "js",
+        "total_bytes": 712600, "used_bytes": 198000,
+        "unused_bytes": 514600, "unused_ratio": 0.722 }
+    ]
   },
   "service_worker": {
     "controlled": true, "scope": "https://example.com/",
@@ -357,10 +398,28 @@ snapshot）→ 关闭 page + 销毁 context。
 按需启用、未启用时为 `null` 的字段：`screenshot` / `pdf` / `har` /
 `dom_snapshot` / `web_vitals` / `metrics` / `metadata` /
 `render_blocking_resources` / `service_worker` / `image_sizing` /
-`dom_mutations`。`console_messages` 和 `resources` 在对应 flag 未设
-之前是空数组 `[]` —— `resource_count` 和 `total_size`（标量）以及
-`resource_summary`（聚合）始终存在，所以"功能校验"用法不需要拉取
-完整列表也能获得关键信号。
+`dom_mutations` / `http_errors` / `coverage`。`console_messages` 和
+`resources` 在对应 flag 未设之前是空数组 `[]` —— `resource_count`
+和 `total_size`（标量）以及 `resource_summary`（聚合）始终存在，
+所以"功能校验"用法不需要拉取完整列表也能获得关键信号。
+
+`exceptions` 和 `js_exceptions` 始终输出（无需 opt-in）：
+`Runtime.exceptionThrown` 一直订阅，分桶统计成本基本为零。无异常时
+`exceptions: []`、`js_exceptions: { total: 0, by_name: [] }`。AI 或
+监控只看一个标量 `js_exceptions.total` 就能发现回归（例如"今天突然
+多了 12 个 ReferenceError"）；`by_name` 是按出现次数排序的 top 10
+明细，每个 bucket 附带一条 sample 消息。
+
+`security_audit` 也是始终输出（从 `security_headers` + `cookies`
+派生）：一次性配置审计的 scorecard。`security_audit.headers.present_count`
+（0..=7）表示七个核心强制头（HSTS / CSP / X-Frame-Options /
+X-Content-Type-Options / Referrer-Policy / Permissions-Policy /
+Cross-Origin-Opener-Policy）有几个存在，`missing` 列出缺失的那些；
+`security_audit.cookies` 输出 cookie 总数和各标志覆盖率（`secure` /
+`http_only` / `same_site_set`），以及反模式计数
+`same_site_none_without_secure`（任意非零都是 finding —— 现代浏览器
+会直接拒收这些 cookie）。页面没有 cookie 也没有安全头时整个 struct
+全是 0 / false，本身就是有意义的信号。
 
 (`resources[].initiator` 在 `initiators=true` 时也会填充：
 `{ "type": "parser" | "script" | "preload" | ..., "url": "...", "line_number": 12 }`。)
@@ -581,6 +640,13 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
 - `cls_top_sources[0].selector` 变了 → 新的布局抖动源
 - `metrics.script_duration_ms` +30% 而 LCP 没动 → JS 回归
 - `security_headers["Content-Security-Policy"]` 没了 → 安全回归
+- `security_audit.headers.present_count` 比基线下降 → 某次发布
+  去掉了一个核心强制头；`security_audit.headers.missing` 直接列出
+  少了哪几个
+- `security_audit.cookies.same_site_none_without_secure > 0` → 这种
+  cookie 现代浏览器会直接拒收，永远是 actionable 信号
+- `security_audit.cookies.secure / total` 比例下降 → 新增了一个不带
+  `Secure` 的 cookie（通常是某个第三方脚本设置的）
 - `metadata.robots` 意外包含 `noindex` → SEO 灾难
 - `render_blocking_resources` 新增条目 → 性能回归
 - `service_worker.controlled` 变成 false → PWA 坏了
@@ -606,8 +672,20 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
   （通过 `script` 触发点击）后响应性退化
 - `resource_summary.protocol_distribution["h2"]` 占比下降 → HTTP/2
   覆盖率退化；回落到 `http/1.1` 会触发连接抖动
+- `resource_summary.modern_protocol_share < 0.9` → HTTP/2+3 覆盖率
+  的单标量信号，比每版本直方图更适合报警阈值
 - `resource_summary.uncompressed_text_bytes > 50_000` → 文本资源未启用
   `Content-Encoding`，错失压缩
+- `resource_summary.compression_breakdown["none"]` 相对基线上升 →
+  部分文本响应丢了 encoding 头（通常是 CDN 缓存配置走偏）
+- `resource_summary.cache_control_missing` 发布后突增 → 静态资源
+  没带 caching 指令，通常是新增 origin 旁路了 CDN 配置
+- `resource_summary.top_third_party_domains[0].bytes` 突增 → 最重的
+  外部依赖膨胀，越早隔离越好
+- `coverage.js_unused_ratio > 0.6` 或 `coverage.css_unused_ratio > 0.6`
+  → 发送给客户端的死代码占比过大；`coverage.top_unused[]` 直接列出
+  最浪费的文件（仅当显式 `coverage=true` 时输出，`all_metrics` 不会
+  自动启用）
 - `resource_summary.connections_new` 大幅上升而 `connections_reused`
   持平 → 连接池 / HTTP 多路复用退化
 - `resource_summary.unique_hosts` 增长 → DNS 查询开销上升，通常

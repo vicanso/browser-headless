@@ -5,6 +5,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use chromiumoxide::cdp::browser_protocol::css::{
+    EnableParams as CssEnableParams, EventStyleSheetAdded, RuleUsage as CssRuleUsage,
+    StartRuleUsageTrackingParams, StopRuleUsageTrackingParams,
+};
+use chromiumoxide::cdp::browser_protocol::dom::EnableParams as DomEnableParams;
 use chromiumoxide::cdp::browser_protocol::dom_snapshot::CaptureSnapshotParams;
 use chromiumoxide::cdp::browser_protocol::emulation::{
     SetCpuThrottlingRateParams, SetDeviceMetricsOverrideParams, SetGeolocationOverrideParams,
@@ -17,10 +22,10 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::network::{
     BlockPattern, Cookie as CdpCookie, CookieParam, EnableParams as NetworkEnableParams,
-    ErrorReason, EventLoadingFinished, EventRequestWillBeSent, EventResponseReceived,
-    GetCookiesParams, Headers, Initiator as CdpInitiator, ResourceTiming as CdpResourceTiming,
-    ResourceType, SecurityDetails as CdpSecurityDetails, SetBlockedUrLsParams,
-    SetCacheDisabledParams, SetCookiesParams, SetExtraHttpHeadersParams,
+    ErrorReason, EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
+    EventResponseReceived, GetCookiesParams, Headers, Initiator as CdpInitiator,
+    ResourceTiming as CdpResourceTiming, ResourceType, SecurityDetails as CdpSecurityDetails,
+    SetBlockedUrLsParams, SetCacheDisabledParams, SetCookiesParams, SetExtraHttpHeadersParams,
     SetUserAgentOverrideParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
@@ -33,6 +38,10 @@ use chromiumoxide::cdp::browser_protocol::performance::{
 };
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams, DisposeBrowserContextParams,
+};
+use chromiumoxide::cdp::js_protocol::profiler::{
+    EnableParams as ProfilerEnableParams, ScriptCoverage, StartPreciseCoverageParams,
+    StopPreciseCoverageParams, TakePreciseCoverageParams,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{
     EnableParams as RuntimeEnableParams, EventConsoleApiCalled, EventExceptionThrown,
@@ -439,6 +448,65 @@ fn format_tls_expiry(days_remaining: i64) -> String {
 
 /// Extract the security-relevant headers from a response's header map.
 /// Returns None when no security headers are present.
+/// Build the `SecurityAudit` scorecard from already-captured data.
+/// `headers` is the curated main-document header map (`None` when no
+/// Document response was ever observed — same shape as
+/// `WebPageStat.security_headers`). `cookies` is the page's full jar.
+///
+/// Pure derive — runs in O(headers + cookies), no IO.
+fn build_security_audit(
+    headers: Option<&HashMap<String, String>>,
+    cookies: &[Cookie],
+) -> SecurityAudit {
+    let mut h = SecurityHeadersCheck::default();
+    let has = |name: &str| -> bool { headers.is_some_and(|m| m.contains_key(name)) };
+    h.hsts = has("Strict-Transport-Security");
+    h.csp = has("Content-Security-Policy");
+    h.csp_report_only = has("Content-Security-Policy-Report-Only");
+    h.x_frame_options = has("X-Frame-Options");
+    h.x_content_type_options = has("X-Content-Type-Options");
+    h.referrer_policy = has("Referrer-Policy");
+    h.permissions_policy = has("Permissions-Policy");
+    h.coop = has("Cross-Origin-Opener-Policy");
+    h.coep = has("Cross-Origin-Embedder-Policy");
+
+    let mut missing = Vec::new();
+    for &name in CORE_SECURITY_HEADERS {
+        if !has(name) {
+            missing.push(name.to_string());
+        }
+    }
+    h.present_count = (CORE_SECURITY_HEADERS.len() - missing.len()) as u32;
+    h.missing = missing;
+
+    let mut c = CookieSecurityCheck {
+        total: cookies.len() as u32,
+        ..Default::default()
+    };
+    for cookie in cookies {
+        if cookie.secure {
+            c.secure += 1;
+        }
+        if cookie.http_only {
+            c.http_only += 1;
+        }
+        if let Some(ss) = cookie.same_site.as_deref() {
+            c.same_site_set += 1;
+            // SameSite=None without Secure is rejected by modern browsers
+            // outright. Case-insensitive match — CDP returns "None" but
+            // origin headers may differ.
+            if ss.eq_ignore_ascii_case("None") && !cookie.secure {
+                c.same_site_none_without_secure += 1;
+            }
+        }
+    }
+
+    SecurityAudit {
+        headers: h,
+        cookies: c,
+    }
+}
+
 fn extract_security_headers(headers: &Headers) -> Option<HashMap<String, String>> {
     let obj = headers.inner().as_object()?;
     let mut out = HashMap::new();
@@ -765,11 +833,26 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
     let mut largest: Option<(String, u64)> = None;
     let mut cache_hits: u32 = 0;
     let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-host (bytes, count) for ranking top third-party domains. Only
+    // populated for hosts that differ from `target_host` so the page's
+    // own origin doesn't show up in the third-party list.
+    let mut third_party_by_host: HashMap<String, (u64, u32)> = HashMap::new();
+    let mut modern_protocol_hits: u32 = 0;
+    let mut real_network_responses: u32 = 0;
 
     for r in resources {
         let bucket = mime_bucket(&r.mime_type);
         *summary.bytes_by_type.entry(bucket.to_string()).or_insert(0) += r.content_size;
         *summary.count_by_type.entry(bucket.to_string()).or_insert(0) += 1;
+
+        // Cache-Control coverage: counted across ALL responses (cached
+        // hits too — the header is a property of the original origin
+        // response, and CDP carries the cached headers forward).
+        if r.cache_control.is_some() {
+            summary.cache_control_present += 1;
+        } else {
+            summary.cache_control_missing += 1;
+        }
 
         let status_bucket = match r.status {
             100..=199 => "1xx",
@@ -788,6 +871,7 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
             cache_hits += 1;
             summary.cached_bytes += r.content_size;
         } else {
+            real_network_responses += 1;
             // Real network responses only — cache hits never touched the
             // wire so their `connection_reused` flag is meaningless.
             if r.connection_reused {
@@ -803,12 +887,32 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
             } else {
                 r.protocol.to_lowercase()
             };
+            // Modern protocol = h2 (HTTP/2) or any h3 variant (h3,
+            // h3-29, etc.). Plain "http/1.1" and "unknown" don't count.
+            if proto == "h2" || proto.starts_with("h3") {
+                modern_protocol_hits += 1;
+            }
             *summary.protocol_distribution.entry(proto).or_insert(0) += 1;
 
             // Compression audit: track compressed vs missed-opportunity
             // for compressible text-y MIME types. Image / video / font /
             // wasm are already compressed at the format level so the
             // absence of Content-Encoding isn't a finding for them.
+            //
+            // `compression_breakdown` only buckets text-compressible
+            // resources (one row per algorithm + "none") — keeps the
+            // map small and focused on the actionable signal. The
+            // first algorithm in `Content-Encoding` wins when multiple
+            // codings are layered (e.g. `gzip, br` is rare but valid).
+            if is_text_compressible(&r.mime_type) {
+                let algo = r
+                    .content_encoding
+                    .as_deref()
+                    .map(|e| e.split(',').next().unwrap_or(e).trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "none".to_string());
+                *summary.compression_breakdown.entry(algo).or_insert(0) += 1;
+            }
             if r.content_encoding.is_some() {
                 summary.compressed_count += 1;
             } else if is_text_compressible(&r.mime_type) {
@@ -826,6 +930,9 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
             hosts.insert(h.to_string());
             if !target_host.is_empty() && h != target_host {
                 summary.third_party_bytes += r.content_size;
+                let slot = third_party_by_host.entry(h.to_string()).or_insert((0, 0));
+                slot.0 += r.content_size;
+                slot.1 += 1;
             }
         }
 
@@ -843,6 +950,24 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
     }
     summary.largest_resource = largest;
     summary.unique_hosts = hosts.len() as u32;
+
+    // Top-10 third-party hosts by bytes (ties broken by host asc for
+    // stable output across captures). All-zero ratio is fine — `0.0`
+    // when no real network responses were observed (full cache).
+    let mut by_bytes: Vec<DomainBytes> = third_party_by_host
+        .into_iter()
+        .map(|(host, (bytes, count))| DomainBytes { host, bytes, count })
+        .collect();
+    by_bytes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.host.cmp(&b.host)));
+    by_bytes.truncate(10);
+    summary.top_third_party_domains = by_bytes;
+
+    summary.modern_protocol_share = if real_network_responses > 0 {
+        modern_protocol_hits as f64 / real_network_responses as f64
+    } else {
+        0.0
+    };
+
     summary
 }
 
@@ -1124,6 +1249,44 @@ pub async fn apply_performance_enable(page: &Page, enabled: bool) -> Result<(), 
         return Ok(());
     }
     page.execute(PerformanceEnableParams::default()).await?;
+    Ok(())
+}
+
+/// Pre-navigation setup for CSS / JS coverage collection. Runs only when
+/// `enabled=true` — when off, this is a single bool test and zero CDP
+/// traffic.
+///
+/// What runs (in order, all required before `page.goto`):
+///   1. `Profiler.enable` + `Profiler.startPreciseCoverage`
+///      (`call_count=false, detailed=true, allowTriggeredUpdates=false`)
+///      — block-granularity coverage with the minimum data we need.
+///      `call_count=false` keeps payload small (we only care whether a
+///      byte was executed, not how many times).
+///   2. `DOM.enable` then `CSS.enable` (CSS domain depends on DOM).
+///   3. `CSS.startRuleUsageTracking` — starts the per-stylesheet
+///      rule-execution tracking that `stopRuleUsageTracking` later
+///      drains.
+///
+/// Both Profiler and CSS keep instrumentation state for the full page
+/// lifetime; they're stopped + drained in `collect_summary`'s finalize
+/// stage when coverage is requested.
+pub async fn apply_coverage_setup(page: &Page, enabled: bool) -> Result<(), Error> {
+    if !enabled {
+        return Ok(());
+    }
+    // Profiler first — JS coverage starts before any script can run.
+    page.execute(ProfilerEnableParams::default()).await?;
+    let start = StartPreciseCoverageParams {
+        call_count: Some(false),
+        detailed: Some(true),
+        allow_triggered_updates: Some(false),
+    };
+    page.execute(start).await?;
+    // CSS requires DOM; both must be enabled before rule-usage tracking.
+    page.execute(DomEnableParams::default()).await?;
+    page.execute(CssEnableParams::default()).await?;
+    page.execute(StartRuleUsageTrackingParams::default())
+        .await?;
     Ok(())
 }
 
@@ -1572,9 +1735,17 @@ pub struct WebPageStat {
     /// Page content. `collect_summary` populates this with raw HTML from
     /// `page.content()`; callers may overwrite with text/markdown afterwards.
     pub data: String,
+    /// Raw uncaught exception strings (one per `Runtime.exceptionThrown`),
+    /// formatted as `<line>:<col> <text> | <description>`. Kept for
+    /// forensic detail; for an AI-scannable count + per-class breakdown
+    /// see `js_exceptions`.
     pub exceptions: Vec<String>,
+    /// Counted / classified rollup of `exceptions[]` for monitoring.
+    /// Always populated (`total: 0`, `by_name: []` when no exceptions).
+    pub js_exceptions: JsExceptions,
     /// `console.log/info/warn/error/debug` calls observed during the page
-    /// lifecycle, formatted as `[<level>] <args>`.
+    /// lifecycle, formatted as `[<level>] <args>`. Distinct from uncaught
+    /// runtime exceptions, which live in `exceptions` / `js_exceptions`.
     pub console_messages: Vec<String>,
     pub resources: Vec<WebPageResource>,
     /// Cookies in the page's cookie jar at snapshot time (scoped to the
@@ -1617,6 +1788,13 @@ pub struct WebPageStat {
     /// (CSP, HSTS, X-Frame-Options, Referrer-Policy, etc.). Always
     /// populated when at least one Document response was observed.
     pub security_headers: Option<HashMap<String, String>>,
+    /// AI-scannable security scorecard derived from the already-captured
+    /// `security_headers` and `cookies`. Always populated — when
+    /// there's nothing to check (HTTP page, no cookies) every count is
+    /// `0` and every bool is `false`, which is itself a meaningful
+    /// signal. See `SecurityAudit` doc for what's covered and what's
+    /// intentionally out of scope.
+    pub security_audit: SecurityAudit,
     /// Service Worker / PWA registration state. Populated only when
     /// `SummaryRequest.service_worker = true`.
     pub service_worker: Option<ServiceWorkerStatus>,
@@ -1641,6 +1819,16 @@ pub struct WebPageStat {
     /// `SummaryRequest.dom_mutations = true`. Useful for diagnosing
     /// render thrash / over-eager reconciliation regressions.
     pub dom_mutations: Option<DomMutations>,
+    /// HTTP error rollup (4xx / 5xx lists, network failures, final URL,
+    /// redirect count). Populated only when `SummaryRequest.http_errors =
+    /// true`. The fastest path to "is this page broken / hijacked /
+    /// redirected somewhere unexpected" for monitoring use cases.
+    pub http_errors: Option<HttpErrors>,
+    /// CSS / JS code coverage — Lighthouse "Reduce unused CSS/JS" feed.
+    /// Populated only when `SummaryRequest.coverage = true`. NOT enabled
+    /// by `all_metrics=true` (coverage stays opt-in due to its
+    /// instrumentation cost).
+    pub coverage: Option<CoverageReport>,
 }
 
 /// TLS / certificate snapshot for a single host. `days_remaining` is
@@ -1698,6 +1886,107 @@ const SECURITY_HEADER_NAMES: &[&str] = &[
     "X-XSS-Protection",
 ];
 
+/// The "core enforced" subset of the above — headers that actually block
+/// something (clickjacking, MIME sniffing, mixed content, popup-tab
+/// isolation). Absence of any one is treated as a finding by
+/// `SecurityAudit.headers.missing`. Excludes:
+///   - `Content-Security-Policy-Report-Only` — report-only doesn't block.
+///   - `X-XSS-Protection` — deprecated; modern browsers ignore it.
+///   - `Cross-Origin-Embedder-Policy` / `Cross-Origin-Resource-Policy` —
+///     situational (only relevant for cross-origin isolation use cases).
+const CORE_SECURITY_HEADERS: &[&str] = &[
+    "Strict-Transport-Security",
+    "Content-Security-Policy",
+    "X-Frame-Options",
+    "X-Content-Type-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+    "Cross-Origin-Opener-Policy",
+];
+
+/// Security-config scorecard for AI / monitoring. Pure derive from
+/// already-captured `WebPageStat.security_headers` + `cookies` — no
+/// extra browser interaction. Always populated: when both inputs are
+/// empty (HTTP page with no cookies), every count is `0` and every
+/// header bool is `false`, which is itself a useful signal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityAudit {
+    pub headers: SecurityHeadersCheck,
+    pub cookies: CookieSecurityCheck,
+}
+
+/// Boolean presence flags for the most commonly-required security
+/// response headers on the main document. `present_count` and `missing`
+/// give an AI-scannable summary that doesn't require parsing the full
+/// header map.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityHeadersCheck {
+    /// `Strict-Transport-Security` — enforces HTTPS-only for the
+    /// configured `max-age`. Absence on an HTTPS site lets attackers
+    /// downgrade subsequent connections.
+    pub hsts: bool,
+    /// `Content-Security-Policy` (enforcing variant). Absence means no
+    /// browser-side XSS / inline-script mitigation.
+    pub csp: bool,
+    /// `Content-Security-Policy-Report-Only` — for monitoring CSP
+    /// rollout without blocking. Exposed separately so `csp=false &&
+    /// csp_report_only=true` (a common pre-enforcement state) is
+    /// distinguishable from "no CSP at all".
+    pub csp_report_only: bool,
+    /// `X-Frame-Options` — clickjacking mitigation. Modern equivalent
+    /// is CSP `frame-ancestors`; either one being present is a real
+    /// signal, but this field tracks the legacy header specifically.
+    pub x_frame_options: bool,
+    /// `X-Content-Type-Options: nosniff` — blocks MIME sniffing of
+    /// script/style content type. Header presence checked; value
+    /// (`nosniff` is the only valid one) is not validated here.
+    pub x_content_type_options: bool,
+    /// `Referrer-Policy` — controls how much referrer data leaks
+    /// cross-origin.
+    pub referrer_policy: bool,
+    /// `Permissions-Policy` (formerly `Feature-Policy`) — opts in/out
+    /// of powerful browser features (camera / mic / geolocation / ...).
+    pub permissions_policy: bool,
+    /// `Cross-Origin-Opener-Policy` — isolates the page's browsing
+    /// context from cross-origin popups (mitigates Spectre + tab-nabbing).
+    pub coop: bool,
+    /// `Cross-Origin-Embedder-Policy` — required for cross-origin
+    /// isolation (e.g. `SharedArrayBuffer`). Optional / situational, so
+    /// **not** counted in `present_count` / `missing`.
+    pub coep: bool,
+    /// Count of the 7 core enforced headers that were present
+    /// (`hsts` + `csp` + `x_frame_options` + `x_content_type_options` +
+    /// `referrer_policy` + `permissions_policy` + `coop`). Ranges
+    /// `0..=7`. Single scalar so monitors can alert on a deploy that
+    /// drops a header.
+    pub present_count: u32,
+    /// Canonical names of the core headers that were missing. Empty
+    /// when all 7 are present.
+    pub missing: Vec<String>,
+}
+
+/// Coverage statistics for cookie-security attributes across the page's
+/// cookie jar. Use ratios (`secure / total`, etc.) to track rollout of
+/// secure-cookie policies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CookieSecurityCheck {
+    pub total: u32,
+    /// Cookies with the `Secure` attribute — only sent over HTTPS.
+    pub secure: u32,
+    /// Cookies with `HttpOnly` — not exposed to `document.cookie`,
+    /// limits XSS-driven session theft.
+    pub http_only: u32,
+    /// Cookies with a `SameSite` attribute set (any of `Strict` / `Lax`
+    /// / `None`). "Not set" lets the browser fall back to its legacy
+    /// default, which has shifted over time and is a fingerprint of
+    /// stale cookie configuration.
+    pub same_site_set: u32,
+    /// Anti-pattern: `SameSite=None` without `Secure`. Chrome / Firefox
+    /// reject these cookies outright — the page is shipping cookies
+    /// that won't be accepted. Non-zero is always actionable.
+    pub same_site_none_without_secure: u32,
+}
+
 /// Snapshot of the page's Service Worker registration. `None` for the
 /// whole struct means navigator.serviceWorker isn't available (rare); the
 /// individual fields go to None / false when no registration exists.
@@ -1744,6 +2033,162 @@ pub struct MutationCount {
     /// Tag name (lowercased) or attribute name.
     pub name: String,
     pub count: u64,
+}
+
+/// Bucketed view of uncaught JS exceptions captured during the page
+/// lifecycle. Derived from the same `Runtime.exceptionThrown` stream that
+/// fills `WebPageStat.exceptions[]` — that field stays for forensic
+/// detail; this one exists so AI / dashboards can scan a single scalar
+/// (`total`) and a short ranked list (`by_name`) to spot regressions
+/// like "today this page has 12 ReferenceErrors vs. 0 yesterday".
+///
+/// Always populated (no opt-in) — costs essentially nothing since the
+/// exception stream is already always subscribed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JsExceptions {
+    /// Total uncaught exceptions observed. Equal to `exceptions.len()`.
+    /// Single scalar so monitors can alert on `>0` (or on
+    /// deltas across captures) without parsing detail strings.
+    pub total: u32,
+    /// Per-exception-class roll-up, sorted by `count` descending (ties
+    /// broken by `name` ascending). Class name comes from CDP
+    /// `RemoteObject.className` (`TypeError`, `ReferenceError`,
+    /// `SyntaxError`, custom error subclasses, ...). When CDP didn't
+    /// provide one — e.g. `throw "literal string"` — the entry is
+    /// classified as `"Other"`. Capped at the 10 most frequent classes
+    /// to keep the payload bounded.
+    pub by_name: Vec<JsExceptionCount>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JsExceptionCount {
+    /// Exception class name (`TypeError` / `ReferenceError` / custom /
+    /// `Other`).
+    pub name: String,
+    pub count: u32,
+    /// First-seen message text for this class, truncated to 200 chars.
+    /// Lets AI / humans see the actual error without expanding the full
+    /// `exceptions[]` list. `None` when CDP returned no description.
+    pub sample_message: Option<String>,
+}
+
+/// HTTP-layer health snapshot for AI-friendly anomaly detection / "is the
+/// page broken?" checks. Populated only when `SummaryRequest.http_errors`
+/// is true. Derived from the response stream + an extra
+/// `Network.loadingFailed` listener — no `evaluate` calls, no per-resource
+/// overhead.
+///
+/// Three signals callers typically act on:
+///   - `failed_count > 0` → at least one resource didn't load cleanly.
+///   - `network_failures` non-empty → DNS / TLS / connection-refused
+///     errors (CDP never produced a `responseReceived` for these, so they
+///     would be invisible from `resources[]` alone).
+///   - `final_url != requested URL` (or `redirect_count > 0`) → the
+///     response came from somewhere unexpected (hijack / login-wall /
+///     CDN-level redirect).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HttpErrors {
+    /// `failed_4xx.len() + failed_5xx.len() + network_failures.len()`.
+    /// Single scalar so monitors can alert on `>0` without parsing the
+    /// detail lists.
+    pub failed_count: u32,
+    /// HTTP 4xx responses observed during page load. Includes the main
+    /// document if it returned 4xx (no implicit filter on resource type).
+    pub failed_4xx: Vec<FailedRequest>,
+    /// HTTP 5xx responses.
+    pub failed_5xx: Vec<FailedRequest>,
+    /// Requests that never produced a response — DNS failure, TLS handshake
+    /// abort, connection refused, blocked by CSP/CORS/extension, etc.
+    /// Sourced from CDP `Network.loadingFailed`; `error_text` is Chromium's
+    /// `net::ERR_*` constant verbatim.
+    pub network_failures: Vec<NetworkFailure>,
+    /// Final document URL after any HTTP 3xx redirects were followed.
+    /// Equal to the requested URL when no redirect happened. Use
+    /// `final_url != requested URL` as a "landed somewhere unexpected"
+    /// signal.
+    pub final_url: String,
+    /// Number of HTTP 3xx Document responses observed before the final
+    /// landing page. `0` for direct navigation; `N` for an N-hop redirect
+    /// chain.
+    pub redirect_count: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FailedRequest {
+    pub url: String,
+    pub status: u32,
+    /// CDP `ResourceType` lowercased (`document`, `script`, `image`, ...).
+    /// Lets monitors distinguish "main doc 404" from "missing favicon".
+    pub resource_type: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkFailure {
+    pub url: String,
+    /// Chromium net-error constant
+    /// (`net::ERR_NAME_NOT_RESOLVED`, `net::ERR_CONNECTION_REFUSED`,
+    /// `net::ERR_CERT_DATE_INVALID`, ...). Source list:
+    /// <https://cs.chromium.org/chromium/src/net/base/net_error_list.h>.
+    pub error_text: String,
+    pub resource_type: String,
+    /// True when the failure was a deliberate cancellation (e.g. navigation
+    /// superseded by another, or a `block_urls` policy hit). Lets callers
+    /// filter out "expected" failures when alerting on real ones.
+    pub canceled: bool,
+}
+
+/// CSS / JS code-coverage report — the Lighthouse "Reduce unused CSS /
+/// JS" feed. Populated only when `SummaryRequest.coverage = true`.
+///
+/// **Not** enabled by `all_metrics=true`: precise V8 coverage
+/// instruments every script for the page lifetime (disables some
+/// optimizations) and CSS rule-usage tracking keeps style-engine state
+/// for the whole load. The cost is small per page but real, so
+/// coverage stays explicitly opt-in even when the caller asks for
+/// "every analytical signal".
+///
+/// JS bytes are computed via the standard innermost-wins sweep over
+/// `Profiler.takePreciseCoverage` ranges (a byte is "used" iff its
+/// smallest enclosing range has `count > 0`). CSS bytes come from
+/// `CSS.stopRuleUsageTracking` (each `RuleUsage` has a `used` flag and
+/// start/end offsets within its stylesheet); per-stylesheet totals
+/// from the `length` field on `CSS.styleSheetAdded` headers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CoverageReport {
+    /// Aggregate JavaScript source bytes seen across every script the
+    /// V8 isolate reported coverage for (inline + external).
+    pub js_total_bytes: u64,
+    /// JS bytes that V8 marked as executed at least once.
+    pub js_used_bytes: u64,
+    /// `js_total_bytes - js_used_bytes` — the Lighthouse "unused JS"
+    /// figure.
+    pub js_unused_bytes: u64,
+    /// `js_unused_bytes / js_total_bytes`, `0.0..1.0`. `0.0` when no JS
+    /// was observed; AI / monitors can alert on a single scalar.
+    pub js_unused_ratio: f64,
+    /// CSS aggregates — same semantics as the JS counters, sourced from
+    /// rule-usage tracking instead of V8 precise coverage.
+    pub css_total_bytes: u64,
+    pub css_used_bytes: u64,
+    pub css_unused_bytes: u64,
+    pub css_unused_ratio: f64,
+    /// Top files ranked by `unused_bytes` descending (mixed JS + CSS),
+    /// capped at 10. Direct feed for AI "what should I trim first?"
+    /// suggestions. Files with `total_bytes == 0` are excluded (anonymous
+    /// inline scripts that V8 reports but have no measurable size).
+    pub top_unused: Vec<CoverageEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CoverageEntry {
+    pub url: String,
+    /// `"js"` or `"css"`.
+    pub kind: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub unused_bytes: u64,
+    /// `unused_bytes / total_bytes`, `0.0..1.0`.
+    pub unused_ratio: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1847,6 +2292,44 @@ pub struct ResourceSummary {
     /// DNS lookup count (one per unique host). Lower is better for
     /// HTTP/2 connection coalescing.
     pub unique_hosts: u32,
+    /// Distribution of `Content-Encoding` algorithms across real-network
+    /// responses to **text-compressible** resources (HTML/CSS/JS/JSON/
+    /// SVG/XML — see `is_text_compressible`). Keys: `"gzip"` / `"br"` /
+    /// `"zstd"` / `"deflate"` / `"none"`. `"none"` means the response
+    /// was a compressible text type but shipped uncompressed (each one
+    /// also counted in `uncompressed_text_count`). Binary types
+    /// (image/video/font/wasm) are excluded — they're already format-
+    /// compressed and the absence of Content-Encoding isn't a finding.
+    pub compression_breakdown: HashMap<String, u32>,
+    /// Real-network responses that carried a `Cache-Control` header
+    /// (any value, including `no-store` — the point is the origin made
+    /// an explicit caching statement). Pairs with `cache_control_missing`
+    /// to compute a coverage ratio.
+    pub cache_control_present: u32,
+    /// Real-network responses that shipped without `Cache-Control`. Each
+    /// one falls back to browser heuristic freshness — typically a
+    /// missed caching opportunity for static assets. Watch for spikes
+    /// after deploys that add a new origin or CDN tier.
+    pub cache_control_missing: u32,
+    /// Top third-party hosts ranked by bytes shipped, capped at 10.
+    /// Lets callers spot the heaviest external dependencies (analytics,
+    /// ads, fonts, vendor CDNs) without parsing the per-resource list.
+    /// Empty when the page loaded zero third-party content.
+    pub top_third_party_domains: Vec<DomainBytes>,
+    /// Fraction of real-network responses negotiated over HTTP/2 or
+    /// HTTP/3 (`0.0 .. 1.0`). Single scalar so monitors can alert on
+    /// regressions — e.g. `0.95 → 0.20` typically means a vendor CDN
+    /// reverted to HTTP/1.1 or a misconfigured origin lost ALPN.
+    /// `0.0` when every response was cached (no real protocol observed).
+    pub modern_protocol_share: f64,
+}
+
+/// Per-host byte/count tuple for the `top_third_party_domains` ranking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DomainBytes {
+    pub host: String,
+    pub bytes: u64,
+    pub count: u32,
 }
 
 /// Page-level metadata extracted from `<head>`. Comparison signals for SEO
@@ -2091,6 +2574,13 @@ pub struct WebPageResource {
     /// (`gzip` / `br` / `deflate` / `zstd`). `None` when the response
     /// shipped uncompressed.
     pub content_encoding: Option<String>,
+    /// `Cache-Control` response header value if present (any value —
+    /// `no-store` is "present" because the origin made an explicit
+    /// statement). `None` means the origin shipped no caching policy,
+    /// which leaves the browser falling back to RFC 7234 heuristic
+    /// freshness — usually a missed caching opportunity for static
+    /// assets. Counted into `ResourceSummary.cache_control_*`.
+    pub cache_control: Option<String>,
     /// True if the response came from disk cache, service worker, or prefetch
     /// cache. Cache hits typically have `content_size = 0` and many `timing`
     /// fields = -1 (skipped phases).
@@ -2150,6 +2640,31 @@ pub struct Screenshot {
     pub mime_type: String,
 }
 
+/// Per-feature capture toggles for `collect_summary`. Bundled together so
+/// the function signature stays short as new optional captures are added
+/// (each one would otherwise add a bool param). All default to `false` —
+/// callers opt in explicitly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollectCaptures {
+    /// Take a PNG screenshot at end of capture (`Page.captureScreenshot`).
+    pub screenshot: bool,
+    /// Subscribe to `Network.requestWillBeSent` and attach
+    /// `initiator` info to each resource entry.
+    pub initiators: bool,
+    /// Subscribe to `Runtime.consoleAPICalled` and collect formatted
+    /// log lines.
+    pub console: bool,
+    /// Subscribe to `Network.loadingFailed` and build the
+    /// `HttpErrors` rollup (4xx/5xx lists, network failures, final
+    /// URL, redirect count).
+    pub http_errors: bool,
+    /// Enable CDP `Profiler` precise coverage + `CSS` rule-usage
+    /// tracking pre-navigation, then drain `takePreciseCoverage` +
+    /// `stopRuleUsageTracking` after the page settles. Builds
+    /// `CoverageReport`.
+    pub coverage: bool,
+}
+
 /// Navigate to `url` and collect a full page summary: lifecycle timings,
 /// per-resource network stats, JS exceptions, final HTML, and optionally a
 /// screenshot. Drives Page / Network / Runtime CDP domains in parallel and
@@ -2159,10 +2674,8 @@ pub async fn collect_summary(
     page: &Page,
     url: &str,
     timeout: Duration,
-    capture_screenshot: bool,
     wait_for_request: &[String],
-    capture_initiators: bool,
-    capture_console: bool,
+    captures: CollectCaptures,
 ) -> Result<WebPageStat, Error> {
     page.execute(NetworkEnableParams::default()).await?;
     page.execute(PageEnableParams::default()).await?;
@@ -2179,14 +2692,33 @@ pub async fn collect_summary(
     // but never wakes — zero runtime cost and the page never even decodes
     // console arg payloads we'd throw away.
     let mut console_stream: BoxStream<'static, std::sync::Arc<EventConsoleApiCalled>> =
-        if capture_console {
+        if captures.console {
             Box::pin(page.event_listener::<EventConsoleApiCalled>().await?)
         } else {
             Box::pin(stream::pending())
         };
     let mut request_stream: BoxStream<'static, std::sync::Arc<EventRequestWillBeSent>> =
-        if capture_initiators {
+        if captures.initiators {
             Box::pin(page.event_listener::<EventRequestWillBeSent>().await?)
+        } else {
+            Box::pin(stream::pending())
+        };
+    // `loadingFailed`: fired when a request never produces a response
+    // (DNS / TLS / connection refused / blocked / canceled). Same gated
+    // pending-stream pattern as console/initiators — zero cost when off.
+    let mut loading_failed_stream: BoxStream<'static, std::sync::Arc<EventLoadingFailed>> =
+        if captures.http_errors {
+            Box::pin(page.event_listener::<EventLoadingFailed>().await?)
+        } else {
+            Box::pin(stream::pending())
+        };
+    // `styleSheetAdded`: fires once per stylesheet the CSS engine
+    // registers. Needed only for coverage — the header carries
+    // `length` (total stylesheet bytes) and the `style_sheet_id` that
+    // `RuleUsage` entries reference. Gated zero-cost when off.
+    let mut stylesheet_stream: BoxStream<'static, std::sync::Arc<EventStyleSheetAdded>> =
+        if captures.coverage {
+            Box::pin(page.event_listener::<EventStyleSheetAdded>().await?)
         } else {
             Box::pin(stream::pending())
         };
@@ -2195,9 +2727,34 @@ pub async fn collect_summary(
 
     let mut resources: HashMap<String, WebPageResource> = HashMap::new();
     let mut exceptions: Vec<String> = Vec::new();
+    // Classified-exception roll-up state. Keyed by class name. The tuple
+    // is `(count, first_seen_sample_message)` so we keep the FIRST sample
+    // per class rather than overwriting — the AI usually wants to see
+    // the earliest occurrence (often the trigger), not the latest.
+    let mut exception_buckets: HashMap<String, (u32, Option<String>)> = HashMap::new();
     let mut console_messages: Vec<String> = Vec::new();
     let mut security_headers: Option<HashMap<String, String>> = None;
     let mut tls_info: Option<TlsInfo> = None;
+    // HTTP error rollup state. All four are only meaningfully populated
+    // when `captures.http_errors` is true — the response-handler arm
+    // gates writes on the same flag so the per-resource hot path stays
+    // cheap for callers who don't ask for this feature.
+    //
+    // `http_final_url` defaults to the navigation target; every Document-
+    // type response with status <400 overwrites it, so the LAST surviving
+    // Document URL wins (= post-redirect landing page).
+    //
+    // `http_redirect_count` increments for every Document-type response in
+    // the 300-399 range — that's exactly one per redirect hop in the chain.
+    let mut http_resource_types: HashMap<String, ResourceType> = HashMap::new();
+    let mut http_final_url: String = url.to_string();
+    let mut http_redirect_count: u32 = 0;
+    let mut http_network_failures: Vec<NetworkFailure> = Vec::new();
+    // Coverage bookkeeping. `stylesheet_meta` is keyed by string-form
+    // `style_sheet_id` (matches the field type on `RuleUsage`) and
+    // carries `(source_url, length_bytes)`. Only populated when
+    // `captures.coverage` is true.
+    let mut stylesheet_meta: HashMap<String, (String, u64)> = HashMap::new();
     // Per-host TLS dedup. Same host on the page almost always serves the
     // same cert, so first sighting wins; subsequent sightings are skipped.
     let mut tls_by_host: HashMap<String, TlsInfo> = HashMap::new();
@@ -2301,6 +2858,33 @@ pub async fn collect_summary(
                     || ev.response.from_prefetch_cache.unwrap_or(false);
                 entry.protocol = ev.response.protocol.clone().unwrap_or_default();
                 entry.content_encoding = lookup_header(&ev.response.headers, "content-encoding");
+                entry.cache_control = lookup_header(&ev.response.headers, "cache-control");
+
+                // HTTP error bookkeeping. All gated — when off, the
+                // `if captures.http_errors` branch is a single bool test
+                // and nothing else runs.
+                //
+                //   - Cache resource_type by request_id so the finalize
+                //     pass can label failed_4xx/5xx entries without
+                //     widening WebPageResource just for this feature.
+                //   - Track final URL: every Document response with
+                //     status <400 updates the running landing-page URL
+                //     (last successful Document wins). 3xx responses are
+                //     intentionally skipped here — they're redirects, not
+                //     the destination.
+                //   - Count redirects: Document responses in 300-399 are
+                //     exactly one per redirect hop.
+                if captures.http_errors {
+                    http_resource_types.insert(id.clone(), ev.r#type.clone());
+                    if matches!(ev.r#type, ResourceType::Document) {
+                        let s = status as u32;
+                        if (300..400).contains(&s) {
+                            http_redirect_count += 1;
+                        } else if s < 400 {
+                            http_final_url = entry.url.clone();
+                        }
+                    }
+                }
 
                 // Pluck security headers from the main document response.
                 // Last Document-type response wins (handles redirects +
@@ -2349,6 +2933,12 @@ pub async fn collect_summary(
             }
             Some(ev) = exception_stream.next() => {
                 exceptions.push(format_exception(&ev));
+                let name = classify_exception(&ev);
+                let entry = exception_buckets.entry(name).or_insert((0, None));
+                entry.0 += 1;
+                if entry.1.is_none() {
+                    entry.1 = exception_sample_message(&ev);
+                }
             }
             Some(ev) = console_stream.next() => {
                 console_messages.push(format_console(&ev));
@@ -2364,6 +2954,39 @@ pub async fn collect_summary(
                     ..Default::default()
                 });
                 entry.initiator = Some(mapped);
+            }
+            Some(ev) = loading_failed_stream.next() => {
+                // Filter pseudo-schemes for parity with the response arm
+                // (data:/blob:/about: never make it into `resources`, so
+                // their failures wouldn't be actionable either).
+                let failed_url = resources
+                    .get(ev.request_id.inner())
+                    .map(|r| r.url.clone())
+                    .unwrap_or_default();
+                if !failed_url.is_empty() && !is_real_resource(&failed_url) {
+                    continue;
+                }
+                http_network_failures.push(NetworkFailure {
+                    url: failed_url,
+                    error_text: ev.error_text.clone(),
+                    resource_type: format!("{:?}", ev.r#type).to_lowercase(),
+                    canceled: ev.canceled.unwrap_or(false),
+                });
+            }
+            Some(ev) = stylesheet_stream.next() => {
+                // Record total length so `RuleUsage` ranges can be
+                // converted into a meaningful "% used" later. Inline
+                // stylesheets get an empty source_url — we use a
+                // synthetic `inline:<id>` label so they're still
+                // rankable in `top_unused`.
+                let id = ev.header.style_sheet_id.inner().to_string();
+                let url = if ev.header.source_url.is_empty() {
+                    format!("inline:{id}")
+                } else {
+                    ev.header.source_url.clone()
+                };
+                let length = ev.header.length.max(0.0) as u64;
+                stylesheet_meta.insert(id, (url, length));
             }
             else => break,
         }
@@ -2387,7 +3010,7 @@ pub async fn collect_summary(
     // `data` is populated by `capture()` AFTER any user script runs, so the
     // returned HTML reflects post-script DOM. collect_summary just leaves it
     // empty.
-    let screenshot = if capture_screenshot {
+    let screenshot = if captures.screenshot {
         let resp = page.execute(CaptureScreenshotParams::default()).await?;
         Some(Screenshot {
             data: resp.result.data.clone().into(),
@@ -2401,6 +3024,177 @@ pub async fn collect_summary(
     let resources_vec: Vec<WebPageResource> = resources.into_values().collect();
     let resource_count = resources_vec.len() as u64;
 
+    // Bucketed exceptions: count desc, ties broken by name asc, top 10.
+    // Always built — when zero exceptions fired, `total: 0, by_name: []`
+    // (consistent with the existing `exceptions: Vec<String>` always
+    // being present as `[]` rather than absent).
+    let js_exceptions = {
+        let mut entries: Vec<JsExceptionCount> = exception_buckets
+            .into_iter()
+            .map(|(name, (count, sample_message))| JsExceptionCount {
+                name,
+                count,
+                sample_message,
+            })
+            .collect();
+        entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        entries.truncate(10);
+        JsExceptions {
+            total: exceptions.len() as u32,
+            by_name: entries,
+        }
+    };
+
+    // Partition non-2xx/3xx responses into the failed_4xx / failed_5xx
+    // buckets. Status 0 happens for the "request canceled before response"
+    // edge case — we leave those to `network_failures` since CDP would
+    // have fired `loadingFailed` for them. Only built when feature is on.
+    let http_errors = if captures.http_errors {
+        let mut failed_4xx: Vec<FailedRequest> = Vec::new();
+        let mut failed_5xx: Vec<FailedRequest> = Vec::new();
+        for r in &resources_vec {
+            if r.status < 400 || r.status >= 600 {
+                continue;
+            }
+            let entry = FailedRequest {
+                url: r.url.clone(),
+                status: r.status,
+                resource_type: http_resource_types
+                    .get(&r.request_id)
+                    .map(|t| format!("{t:?}").to_lowercase())
+                    .unwrap_or_default(),
+            };
+            if r.status < 500 {
+                failed_4xx.push(entry);
+            } else {
+                failed_5xx.push(entry);
+            }
+        }
+        let failed_count =
+            (failed_4xx.len() + failed_5xx.len() + http_network_failures.len()) as u32;
+        Some(HttpErrors {
+            failed_count,
+            failed_4xx,
+            failed_5xx,
+            network_failures: http_network_failures,
+            final_url: http_final_url,
+            redirect_count: http_redirect_count,
+        })
+    } else {
+        None
+    };
+
+    let security_audit = build_security_audit(security_headers.as_ref(), &cookies);
+
+    // Coverage finalize — only when feature was enabled in apply stage.
+    // Calls Profiler.takePreciseCoverage + Profiler.stopPreciseCoverage
+    // + CSS.stopRuleUsageTracking, then aggregates into a CoverageReport.
+    let coverage = if captures.coverage {
+        let js_coverage = page
+            .execute(TakePreciseCoverageParams::default())
+            .await?
+            .result
+            .result
+            .clone();
+        // Best-effort stop; failure to stop doesn't invalidate the
+        // already-drained data, so ignore the error.
+        let _ = page.execute(StopPreciseCoverageParams::default()).await;
+        let css_coverage = page
+            .execute(StopRuleUsageTrackingParams::default())
+            .await?
+            .result
+            .rule_usage
+            .clone();
+
+        // Per-file entries: walk JS scripts first, then CSS stylesheets.
+        let mut entries: Vec<CoverageEntry> = Vec::new();
+        let mut js_total: u64 = 0;
+        let mut js_used: u64 = 0;
+        for script in &js_coverage {
+            // Skip anonymous / internal scripts (no URL) and known
+            // pseudo URLs — they're typically eval / Function-ctor
+            // shims with no source the user controls.
+            if script.url.is_empty() || !is_real_resource(&script.url) {
+                continue;
+            }
+            let (used, total) = compute_js_coverage(script);
+            if total == 0 {
+                continue;
+            }
+            js_total += total;
+            js_used += used;
+            let unused = total.saturating_sub(used);
+            entries.push(CoverageEntry {
+                url: script.url.clone(),
+                kind: "js".to_string(),
+                total_bytes: total,
+                used_bytes: used,
+                unused_bytes: unused,
+                unused_ratio: unused as f64 / total as f64,
+            });
+        }
+
+        // Group CSS rule usage by stylesheet id, then look up the
+        // total length from the styleSheetAdded map.
+        let mut css_by_sheet: HashMap<String, Vec<&CssRuleUsage>> = HashMap::new();
+        for r in &css_coverage {
+            let id = r.style_sheet_id.inner().to_string();
+            css_by_sheet.entry(id).or_default().push(r);
+        }
+        let mut css_total: u64 = 0;
+        let mut css_used: u64 = 0;
+        for (id, rules) in &css_by_sheet {
+            let Some((url, total)) = stylesheet_meta.get(id) else {
+                // No header was observed for this sheet (rare — user-agent
+                // / extension sheets sometimes skip the event). Skip.
+                continue;
+            };
+            if *total == 0 {
+                continue;
+            }
+            let (used, total_bytes) = compute_css_coverage(rules, *total);
+            css_total += total_bytes;
+            css_used += used;
+            let unused = total_bytes.saturating_sub(used);
+            entries.push(CoverageEntry {
+                url: url.clone(),
+                kind: "css".to_string(),
+                total_bytes,
+                used_bytes: used,
+                unused_bytes: unused,
+                unused_ratio: unused as f64 / total_bytes as f64,
+            });
+        }
+
+        // Top 10 by unused_bytes desc (largest waste first).
+        entries.sort_by_key(|e| std::cmp::Reverse(e.unused_bytes));
+        entries.truncate(10);
+
+        let js_unused = js_total.saturating_sub(js_used);
+        let css_unused = css_total.saturating_sub(css_used);
+        Some(CoverageReport {
+            js_total_bytes: js_total,
+            js_used_bytes: js_used,
+            js_unused_bytes: js_unused,
+            js_unused_ratio: if js_total > 0 {
+                js_unused as f64 / js_total as f64
+            } else {
+                0.0
+            },
+            css_total_bytes: css_total,
+            css_used_bytes: css_used,
+            css_unused_bytes: css_unused,
+            css_unused_ratio: if css_total > 0 {
+                css_unused as f64 / css_total as f64
+            } else {
+                0.0
+            },
+            top_unused: entries,
+        })
+    } else {
+        None
+    };
+
     Ok(WebPageStat {
         total_size,
         resource_count,
@@ -2409,6 +3203,7 @@ pub async fn collect_summary(
         load_time: to_ms(load_ts),
         data: String::new(),
         exceptions,
+        js_exceptions,
         console_messages,
         resources: resources_vec,
         cookies,
@@ -2422,6 +3217,7 @@ pub async fn collect_summary(
         metadata: None,
         render_blocking_resources: None,
         security_headers,
+        security_audit,
         service_worker: None,
         tls_info,
         tls_certificates: {
@@ -2436,6 +3232,8 @@ pub async fn collect_summary(
         },
         image_sizing: None,
         dom_mutations: None,
+        http_errors,
+        coverage,
     })
 }
 
@@ -2478,6 +3276,21 @@ impl WebPageStat {
         if !self.exceptions.is_empty() {
             let _ = writeln!(s, "## JavaScript Exceptions ({})", self.exceptions.len());
             let _ = writeln!(s);
+            if !self.js_exceptions.by_name.is_empty() {
+                let _ = writeln!(s, "By class:");
+                for entry in &self.js_exceptions.by_name {
+                    match entry.sample_message.as_deref() {
+                        Some(msg) => {
+                            let _ = writeln!(s, "- **{}** ×{}: {}", entry.name, entry.count, msg);
+                        }
+                        None => {
+                            let _ = writeln!(s, "- **{}** ×{}", entry.name, entry.count);
+                        }
+                    }
+                }
+                let _ = writeln!(s);
+                let _ = writeln!(s, "Full list:");
+            }
             for ex in &self.exceptions {
                 let _ = writeln!(s, "- {ex}");
             }
@@ -2639,11 +3452,27 @@ impl WebPageStat {
                 "- Third-party bytes: **{}**",
                 format_bytes(rs.third_party_bytes)
             );
+            // Top third-party domains by bytes — ranks the heaviest
+            // external dependencies for an AI-scannable view.
+            if !rs.top_third_party_domains.is_empty() {
+                let _ = writeln!(s, "- Top third-party domains:");
+                for d in rs.top_third_party_domains.iter().take(5) {
+                    let _ = writeln!(
+                        s,
+                        "  - `{}` — {} ({} resource{})",
+                        d.host,
+                        format_bytes(d.bytes),
+                        d.count,
+                        if d.count == 1 { "" } else { "s" }
+                    );
+                }
+            }
             if let Some((url, sz)) = &rs.largest_resource {
                 let _ = writeln!(s, "- Largest: `{url}` ({})", format_bytes(*sz));
             }
             // HTTP version distribution — sort by count desc so the
-            // dominant protocol leads.
+            // dominant protocol leads. Adjacent line shows the modern-
+            // protocol scalar so AI can alert on a single ratio drop.
             if !rs.protocol_distribution.is_empty() {
                 let mut proto: Vec<(&String, &u32)> = rs.protocol_distribution.iter().collect();
                 proto.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -2652,7 +3481,11 @@ impl WebPageStat {
                     .map(|(k, v)| format!("{k} {v}"))
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let _ = writeln!(s, "- HTTP versions: {line}");
+                let _ = writeln!(
+                    s,
+                    "- HTTP versions: {line} (HTTP/2+3 share **{:.0}%**)",
+                    rs.modern_protocol_share * 100.0
+                );
             }
             // Connection reuse + DNS approximation. Skip if no real
             // network resources (everything cached).
@@ -2677,6 +3510,71 @@ impl WebPageStat {
                     ));
                 }
                 let _ = writeln!(s, "{line}");
+            }
+            // Compression algorithm breakdown — sort gzip/br/zstd by
+            // count desc so the dominant codec leads.
+            if !rs.compression_breakdown.is_empty() {
+                let mut algos: Vec<(&String, &u32)> = rs.compression_breakdown.iter().collect();
+                algos.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                let line = algos
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let _ = writeln!(s, "- Compression breakdown: {line}");
+            }
+            // Cache-Control coverage — single ratio so monitors can
+            // alert when a deploy drops headers from static assets.
+            let cc_total = rs.cache_control_present + rs.cache_control_missing;
+            if cc_total > 0 {
+                let cov = (rs.cache_control_present as f64) * 100.0 / (cc_total as f64);
+                let _ = writeln!(
+                    s,
+                    "- Cache-Control coverage: **{:.0}%** ({} present · {} missing)",
+                    cov, rs.cache_control_present, rs.cache_control_missing
+                );
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(cov) = &self.coverage {
+            let _ = writeln!(s, "## CSS / JS Coverage");
+            let _ = writeln!(s);
+            if cov.js_total_bytes > 0 {
+                let _ = writeln!(
+                    s,
+                    "- JS: **{}** unused / {} total (**{:.0}%** unused)",
+                    format_bytes(cov.js_unused_bytes),
+                    format_bytes(cov.js_total_bytes),
+                    cov.js_unused_ratio * 100.0
+                );
+            }
+            if cov.css_total_bytes > 0 {
+                let _ = writeln!(
+                    s,
+                    "- CSS: **{}** unused / {} total (**{:.0}%** unused)",
+                    format_bytes(cov.css_unused_bytes),
+                    format_bytes(cov.css_total_bytes),
+                    cov.css_unused_ratio * 100.0
+                );
+            }
+            if !cov.top_unused.is_empty() {
+                let _ = writeln!(s, "- Top wasteful files:");
+                for e in cov.top_unused.iter().take(5) {
+                    let display_url = if e.url.len() > 80 {
+                        format!("…{}", &e.url[e.url.len() - 77..])
+                    } else {
+                        e.url.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  - [{}] `{}` — {} unused ({:.0}%)",
+                        e.kind,
+                        display_url,
+                        format_bytes(e.unused_bytes),
+                        e.unused_ratio * 100.0
+                    );
+                }
             }
             let _ = writeln!(s);
         }
@@ -2742,6 +3640,47 @@ impl WebPageStat {
                     tls.issuer,
                     format_tls_expiry(tls.days_remaining),
                 );
+            }
+            let _ = writeln!(s);
+        }
+
+        // Security audit scorecard — rendered as a compact 2-line view
+        // so AI can see headers score + cookie coverage without scanning
+        // the full headers map below. Always emitted (the struct is
+        // always populated).
+        {
+            let a = &self.security_audit;
+            let _ = writeln!(s, "## Security Audit");
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- Headers: **{}/{}** core present{}",
+                a.headers.present_count,
+                CORE_SECURITY_HEADERS.len(),
+                if a.headers.missing.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — missing: {}", a.headers.missing.join(", "))
+                }
+            );
+            if a.cookies.total > 0 {
+                let pct = |n: u32| (n as f64) * 100.0 / (a.cookies.total as f64);
+                let mut line = format!(
+                    "- Cookies ({}): Secure **{:.0}%** · HttpOnly **{:.0}%** · SameSite **{:.0}%**",
+                    a.cookies.total,
+                    pct(a.cookies.secure),
+                    pct(a.cookies.http_only),
+                    pct(a.cookies.same_site_set),
+                );
+                if a.cookies.same_site_none_without_secure > 0 {
+                    line.push_str(&format!(
+                        " ⚠️ {} cookie(s) `SameSite=None` without `Secure`",
+                        a.cookies.same_site_none_without_secure
+                    ));
+                }
+                let _ = writeln!(s, "{line}");
+            } else {
+                let _ = writeln!(s, "- Cookies: (none)");
             }
             let _ = writeln!(s);
         }
@@ -3265,6 +4204,25 @@ pub struct SummaryRequest {
     /// dozens of detailed entries. Enable for forensic / per-request
     /// inspection.
     pub resources: bool,
+    /// Emit a focused HTTP error rollup at `stat.http_errors`: failed_4xx
+    /// / failed_5xx lists, network failures (DNS / TLS / connection
+    /// refused — sourced from `Network.loadingFailed`), final URL after
+    /// redirects, and redirect chain length. Costs one extra event
+    /// subscription (`loadingFailed`); when off, that subscription is
+    /// skipped entirely. Intended for periodic-health-check workflows
+    /// where the caller needs a single "is this page broken / hijacked
+    /// / redirected somewhere weird" signal without parsing
+    /// `resources[]`.
+    pub http_errors: bool,
+    /// Capture CSS / JS coverage (Lighthouse "Reduce unused CSS / JS"
+    /// feed) into `stat.coverage`. Enables CDP `Profiler` precise
+    /// coverage + `CSS` rule-usage tracking pre-navigation. Costs:
+    /// V8 disables some script optimisations while precise coverage is
+    /// on, and the per-stylesheet rule-usage map keeps style-engine
+    /// state for the full load. Small but real overhead — explicitly
+    /// **not** enabled by `all_metrics=true`, so callers must opt in
+    /// per request.
+    pub coverage: bool,
 }
 
 /// End-to-end browser-side orchestration for `/summary`:
@@ -3321,7 +4279,7 @@ pub async fn capture(
     // complete **before** `page.goto()` in stage 2 starts, preserving the
     // "observer in place before initial render" guarantee.
     let t_apply = Instant::now();
-    let (_, _, _, _, _, _, _, _, _, _, _resource_block_guard, _, _, _, _) = tokio::try_join!(
+    let (_, _, _, _, _, _, _, _, _, _, _resource_block_guard, _, _, _, _, _) = tokio::try_join!(
         apply_viewport(&page, req.width, req.height, req.device_scale_factor),
         apply_touch_emulation(&page, req.touch),
         apply_user_agent(
@@ -3360,6 +4318,10 @@ pub async fn capture(
         // requested — lets the later `collect_page_metrics` skip the
         // domain-enable RTT (saves ~3-5ms in the format stage).
         apply_performance_enable(&page, req.metrics),
+        // Coverage: enables Profiler + DOM + CSS, starts precise
+        // coverage + rule-usage tracking. Must be pre-navigation so
+        // bytecode generated during script parsing is instrumented.
+        apply_coverage_setup(&page, req.coverage),
     )?;
     tracing::debug!(
         stage = "apply",
@@ -3372,10 +4334,14 @@ pub async fn capture(
         &page,
         &req.url,
         req.timeout,
-        req.screenshot,
         &req.wait_for_request,
-        req.initiators,
-        req.console_messages,
+        CollectCaptures {
+            screenshot: req.screenshot,
+            initiators: req.initiators,
+            console: req.console_messages,
+            http_errors: req.http_errors,
+            coverage: req.coverage,
+        },
     )
     .await?;
     tracing::debug!(
@@ -3463,9 +4429,7 @@ pub async fn capture(
                         page.content().await?
                     };
                     let converter = HtmlToMarkdown::builder()
-                        .skip_tags(vec![
-                            "img", "script", "style", "svg", "iframe", "noscript",
-                        ])
+                        .skip_tags(vec!["img", "script", "style", "svg", "iframe", "noscript"])
                         .build();
                     converter
                         .convert(&source)
@@ -3503,10 +4467,9 @@ pub async fn capture(
                     .build()
                     .map_err(|e| Error::InvalidInput(format!("snapshot params: {e}")))?;
                 let resp = page.execute(params).await?;
-                Ok(Some(
-                    serde_json::to_value(&resp.result)
-                        .map_err(|e| Error::Cdp(format!("dom snapshot serialize: {e}")))?,
-                ))
+                Ok(Some(serde_json::to_value(&resp.result).map_err(|e| {
+                    Error::Cdp(format!("dom snapshot serialize: {e}"))
+                })?))
             } else {
                 Ok(None)
             }
@@ -3792,6 +4755,102 @@ fn map_cookie(c: &CdpCookie) -> Cookie {
     }
 }
 
+/// Compute `(used_bytes, total_bytes)` for a single script coverage
+/// payload using the "innermost wins" sweep. A byte is "used" iff its
+/// smallest enclosing range has `count > 0`. This matches what
+/// puppeteer / playwright report as Lighthouse coverage.
+///
+/// Algorithm:
+///
+/// Steps: (1) flatten every function's ranges into a single list and
+/// generate open/close events; (2) sort by offset asc — at the same
+/// offset, closes happen before opens (adjacent ranges work
+/// correctly); same offset + same type → longer opens first / shorter
+/// closes first (parent contains child); (3) sweep, keeping a stack
+/// of active range counts. The top of stack is the innermost active
+/// range — its `> 0` / `== 0` count decides whether the current span
+/// is used.
+///
+/// `total` is taken as `max(end_offset)` across all ranges (the
+/// outermost script range almost always extends to script length).
+fn compute_js_coverage(script: &ScriptCoverage) -> (u64, u64) {
+    // (offset, ty, length, count). ty=0 open, ty=1 close.
+    let mut points: Vec<(i64, u8, i64, i64)> = Vec::new();
+    for f in &script.functions {
+        for r in &f.ranges {
+            let len = r.end_offset - r.start_offset;
+            if len <= 0 {
+                continue;
+            }
+            points.push((r.start_offset, 0, len, r.count));
+            points.push((r.end_offset, 1, len, r.count));
+        }
+    }
+    if points.is_empty() {
+        return (0, 0);
+    }
+    let total = points
+        .iter()
+        .filter(|p| p.1 == 1)
+        .map(|p| p.0)
+        .max()
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    points.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1)) // close (1) before open (0) at same offset
+            .then_with(|| {
+                if a.1 == 0 {
+                    b.2.cmp(&a.2) // opens: longer first (outer before inner)
+                } else {
+                    a.2.cmp(&b.2) // closes: shorter first (inner before outer)
+                }
+            })
+    });
+
+    let mut stack: Vec<i64> = Vec::new();
+    let mut used: u64 = 0;
+    let mut last_offset: i64 = points[0].0;
+    for (offset, ty, _len, count) in points {
+        if !stack.is_empty() && offset > last_offset && stack.last().copied().unwrap_or(0) > 0 {
+            used += (offset - last_offset) as u64;
+        }
+        last_offset = offset;
+        if ty == 0 {
+            stack.push(count);
+        } else {
+            // Pop the matching count; ranges are well-formed so the
+            // top of stack should equal `count` here. Pop unconditionally
+            // — if backend produced mis-nested ranges we'd rather
+            // under-count than panic.
+            stack.pop();
+        }
+    }
+
+    (used, total)
+}
+
+/// Compute per-stylesheet `(used_bytes, total_bytes)` from a slice of
+/// `RuleUsage` entries that all share the same `style_sheet_id`. CSS
+/// rule usage is non-overlapping (each rule is a top-level CSS rule
+/// inside the stylesheet), so we just sum the `used: true` lengths;
+/// total comes from the stylesheet header.
+fn compute_css_coverage(rules: &[&CssRuleUsage], total_bytes: u64) -> (u64, u64) {
+    let mut used: u64 = 0;
+    for r in rules {
+        if !r.used {
+            continue;
+        }
+        let len = (r.end_offset - r.start_offset).max(0.0) as u64;
+        used += len;
+    }
+    // Clamp — defensive. If rules overlapped or extended past total,
+    // cap so the ratio stays sane.
+    let used = used.min(total_bytes);
+    (used, total_bytes)
+}
+
 fn format_exception(ev: &EventExceptionThrown) -> String {
     let d = &ev.exception_details;
     let extra = d
@@ -3808,4 +4867,57 @@ fn format_exception(ev: &EventExceptionThrown) -> String {
             d.line_number, d.column_number, d.text, extra
         )
     }
+}
+
+/// Classify an uncaught exception by its error class for the
+/// `js_exceptions.by_name` rollup. Resolution order:
+///
+///   1. `RemoteObject.className` — set when JS code threw an `Error`
+///      subclass (built-in or user-defined). This is the cleanest signal.
+///   2. Parse `"Foo: bar baz"` prefix from `description` — covers cases
+///      where CDP omitted `className` but the description still leads
+///      with the class name (common for re-thrown errors and some hosts).
+///   3. `"Other"` — `throw "string"` / `throw 42` / unparseable.
+fn classify_exception(ev: &EventExceptionThrown) -> String {
+    if let Some(exc) = ev.exception_details.exception.as_ref() {
+        if let Some(class) = exc.class_name.as_ref().filter(|s| !s.is_empty()) {
+            return class.clone();
+        }
+        if let Some(desc) = exc.description.as_ref()
+            && let Some((head, _)) = desc.split_once(':')
+        {
+            let head = head.trim();
+            // Filter pathological cases: descriptions like
+            // "http://example.com: ..." would otherwise classify as
+            // "http". Require ascii-letter start + no whitespace.
+            if !head.is_empty()
+                && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                && !head.chars().any(char::is_whitespace)
+            {
+                return head.to_string();
+            }
+        }
+    }
+    "Other".to_string()
+}
+
+/// First-line message text for the `sample_message` field — prefers the
+/// remote-object description, falls back to `ExceptionDetails.text`, and
+/// trims to 200 chars so a stack trace doesn't blow up the payload.
+fn exception_sample_message(ev: &EventExceptionThrown) -> Option<String> {
+    const MAX: usize = 200;
+    let raw = ev
+        .exception_details
+        .exception
+        .as_ref()
+        .and_then(|e| e.description.as_ref())
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&ev.exception_details.text);
+    if raw.is_empty() {
+        return None;
+    }
+    let first_line = raw.lines().next().unwrap_or(raw);
+    let trimmed: String = first_line.chars().take(MAX).collect();
+    Some(trimmed)
 }

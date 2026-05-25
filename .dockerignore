@@ -1,0 +1,33 @@
+# Build context exclusions. Shrinks what Docker uploads to the daemon
+# and prevents local artifacts from accidentally entering image layers.
+#
+# Anything not listed here is fair game for `COPY` in the Dockerfile.
+# The Dockerfile only copies `Cargo.toml`, `Cargo.lock`, and `src/`, so
+# this list is conservative — its job is to avoid uploading useless
+# bytes, not to enforce what's copied.
+
+# Cargo build output — recreated inside the image, multi-GB locally.
+target/
+
+# Git history — never needed at build time; expensive to ship.
+.git/
+.gitignore
+
+# CI/CD workflows — consumed by GitHub, not by the build.
+.github/
+
+# Documentation — large (~60KB combined) and irrelevant to the binary.
+README.md
+README_zh.md
+LICENSE
+
+# The Dockerfile / Makefile themselves.
+Dockerfile
+.dockerignore
+Makefile
+
+# Editor / OS junk that might linger in the working tree.
+.vscode/
+.idea/
+.DS_Store
+*.swp

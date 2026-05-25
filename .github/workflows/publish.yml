@@ -71,6 +71,20 @@ jobs:
           build-args: |
             GIT_COMMIT_ID=${{ github.sha }}
           outputs: ${{ env.IMAGE_OUTPUT }}
+          # GHA layer cache, scoped per architecture so amd64 and arm64
+          # don't overwrite each other's cache namespace. Two practical
+          # effects:
+          #   1) CI builds skip `apt-get install chromium` (~120MB, 30-60s
+          #      per arch) when the Dockerfile and base image are unchanged.
+          #   2) Across releases the chromium layer keeps the SAME sha256,
+          #      so end-user `docker pull v1.2.3` only fetches the changed
+          #      Rust binary (~10MB) instead of re-downloading chromium.
+          # `mode=max` is required — the default only caches the final
+          # layer, which would defeat the purpose for multi-stage builds
+          # where intermediate layers (rust builder, apt install) are
+          # what we actually want to reuse.
+          cache-from: type=gha,scope=${{ matrix.platform.tag }}
+          cache-to: type=gha,scope=${{ matrix.platform.tag }},mode=max
       - name: Export digest
         run: |
           mkdir -p ${{ runner.temp }}/digests

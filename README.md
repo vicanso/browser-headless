@@ -165,8 +165,10 @@ curl -X POST http://localhost:3000/summary \
 | `console_messages` | bool | false | Collect `console.log/info/warn/error/debug` lines into `stat.console_messages`. Default off — console output is noisy (framework warnings, analytics, large object dumps); enable only when actually auditing console. When off the CDP `Runtime.consoleAPICalled` stream is never subscribed (zero cost). |
 | `image_sizing` | bool | false | Per-`<img>` audit: decoded natural dimensions vs laid-out display dimensions (DPR-corrected so retina-tuned images aren't false-flagged), `loading` mode, viewport overlap, missing alt, server-joined `transferred_bytes` and computed `waste_ratio`. Output sorted worst-first into `stat.image_sizing`. One `evaluate` call, ~2ms even for 100+ images. |
 | `dom_mutations` | bool | false | Install a pre-navigation `MutationObserver` and count DOM mutations (childList adds/removes + attribute changes) during the full render window. Output: `stat.dom_mutations` with totals + observation duration + top tags + top attributes. ≤5ms overhead even on heavy SPAs (counter-only, never stores raw records, `characterData` skipped). |
-| `resources` | bool | false | Include the full per-resource list (`stat.resources[]`) in the response. Default off — for "did the page load OK" validation, scalar `total_size` + `resource_count` + aggregated `resource_summary` (bytes & count by MIME bucket, status distribution, cache hit ratio, third-party bytes, largest resource) cover the signal at a fraction of the payload. Enable only when you need per-entry forensics (timing / mime / cache flag / initiator). Internal collection is always on, so dependent features (HAR, `image_sizing.transferred_bytes`, `resource_summary`) keep working regardless. |
-| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) — those produce MB-scale payloads and stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
+| `resources` | bool | false | Include the full per-resource list (`stat.resources[]`) in the response. Default off — for "did the page load OK" validation, scalar `total_size` + `resource_count` + aggregated `resource_summary` (bytes & count by MIME bucket, status distribution, cache hit ratio, third-party bytes + top third-party domains, modern-protocol share, compression breakdown by algorithm, Cache-Control coverage, largest resource) cover the signal at a fraction of the payload. Enable only when you need per-entry forensics (timing / mime / cache flag / cache_control header value / initiator). Internal collection is always on, so dependent features (HAR, `image_sizing.transferred_bytes`, `resource_summary`) keep working regardless. |
+| `http_errors` | bool | false | Emit `stat.http_errors`: `failed_4xx[]` / `failed_5xx[]` lists, `network_failures[]` (DNS / TLS / connection-refused / blocked — sourced from CDP `Network.loadingFailed`), `final_url` after redirects, and `redirect_count`. Built for periodic health checks where the caller wants one focused "is this page broken / hijacked / redirected somewhere weird" signal without parsing `resources[]`. Subscribes to one extra CDP event stream when on; zero overhead when off. |
+| `coverage` | bool | false | Capture CSS / JS coverage into `stat.coverage` — Lighthouse "Reduce unused CSS / JS" feed (per-file used / unused bytes + top-10 wasteful files). Enables CDP `Profiler.startPreciseCoverage` + `CSS.startRuleUsageTracking` pre-navigation; takes / stops both after load. **Explicitly NOT enabled by `all_metrics=true`** — coverage disables some V8 script optimisations and keeps style-engine state for the full load, so it stays per-request opt-in even when the caller asks for "every analytical signal". Set `coverage=true` explicitly. |
+| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
 | `normalize_custom_elements` | bool | true | (Markdown only) Rewrite custom elements (`taro-view-core`, etc.) to `<div>`/`<span>` based on computed `display`. |
@@ -220,6 +222,12 @@ trivially attributable.
   "load_time": 1234,
   "data": "<html>...</html>",
   "exceptions": ["42:15 ReferenceError: foo is not defined"],
+  "js_exceptions": {
+    "total": 1,
+    "by_name": [
+      { "name": "ReferenceError", "count": 1, "sample_message": "ReferenceError: foo is not defined" }
+    ]
+  },
   "console_messages": ["[log] hello world", "[error] api failed"],
   "resources": [
     {
@@ -288,11 +296,19 @@ trivially attributable.
     "status_distribution": { "2xx": 24, "4xx": 1 },
     "cache_hit_ratio": 0.32, "cached_bytes": 35000,
     "third_party_bytes": 18200,
+    "top_third_party_domains": [
+      { "host": "cdn.vendor.com", "bytes": 12400, "count": 3 },
+      { "host": "analytics.example", "bytes": 5800, "count": 2 }
+    ],
     "largest_resource": ["https://cdn.example.com/vendors.js", 712600],
     "protocol_distribution": { "h2": 18, "h3": 4, "http/1.1": 2 },
+    "modern_protocol_share": 0.92,
     "compressed_count": 14,
+    "compression_breakdown": { "br": 10, "gzip": 4, "none": 3 },
     "uncompressed_text_count": 3,
     "uncompressed_text_bytes": 84200,
+    "cache_control_present": 22,
+    "cache_control_missing": 3,
     "connections_reused": 19,
     "connections_new": 5,
     "unique_hosts": 6
@@ -314,6 +330,31 @@ trivially attributable.
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "X-Frame-Options": "SAMEORIGIN",
     "X-Content-Type-Options": "nosniff"
+  },
+  "security_audit": {
+    "headers": {
+      "hsts": true, "csp": true, "csp_report_only": false,
+      "x_frame_options": true, "x_content_type_options": true,
+      "referrer_policy": false, "permissions_policy": false,
+      "coop": false, "coep": false,
+      "present_count": 4,
+      "missing": ["Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"]
+    },
+    "cookies": {
+      "total": 3, "secure": 3, "http_only": 2,
+      "same_site_set": 3, "same_site_none_without_secure": 0
+    }
+  },
+  "coverage": {
+    "js_total_bytes": 845000, "js_used_bytes": 312000,
+    "js_unused_bytes": 533000, "js_unused_ratio": 0.63,
+    "css_total_bytes": 42000, "css_used_bytes": 18000,
+    "css_unused_bytes": 24000, "css_unused_ratio": 0.57,
+    "top_unused": [
+      { "url": "https://cdn.example.com/vendors.js", "kind": "js",
+        "total_bytes": 712600, "used_bytes": 198000,
+        "unused_bytes": 514600, "unused_ratio": 0.722 }
+    ]
   },
   "service_worker": {
     "controlled": true, "scope": "https://example.com/",
@@ -380,11 +421,32 @@ for a fully-HTTP page).
 Opt-in fields default to `null` until explicitly requested:
 `screenshot`, `pdf`, `har`, `dom_snapshot`, `web_vitals`, `metrics`,
 `metadata`, `render_blocking_resources`, `service_worker`, `image_sizing`,
-`dom_mutations`. `console_messages` and `resources` default to empty
-array `[]` until `console_messages=true` / `resources=true` is set ——
-`resource_count` and `total_size` (scalars) plus `resource_summary`
-(aggregates) are always emitted so functional-validation callers don't
-need the detailed list.
+`dom_mutations`, `http_errors`, `coverage`. `console_messages` and
+`resources` default to empty array `[]` until `console_messages=true`
+/ `resources=true` is set —— `resource_count` and `total_size`
+(scalars) plus `resource_summary` (aggregates) are always emitted so
+functional-validation callers don't need the detailed list.
+
+`exceptions` and `js_exceptions` are always emitted (no opt-in): the
+`Runtime.exceptionThrown` stream is always subscribed, so the cost of
+the bucketed count is essentially zero. When no exceptions fire,
+`exceptions: []` and `js_exceptions: { total: 0, by_name: [] }`. Use
+`js_exceptions.total` as a single AI-/monitor-scannable scalar to spot
+regressions like "today this page has 12 ReferenceErrors vs 0
+yesterday"; `by_name` is the top-10 ranked breakdown with a sample
+message per class.
+
+`security_audit` is also always emitted (pure derive from
+`security_headers` + `cookies`). It's a config-check scorecard:
+`security_audit.headers.present_count` (0..=7) shows how many core
+enforced headers (HSTS / CSP / X-Frame-Options / X-Content-Type-Options
+/ Referrer-Policy / Permissions-Policy / Cross-Origin-Opener-Policy) are
+present, `missing` names the gaps; `security_audit.cookies` reports
+total cookies plus per-flag coverage (`secure` / `http_only` /
+`same_site_set`) and the `same_site_none_without_secure` anti-pattern
+counter (any non-zero value is a finding — modern browsers reject those
+cookies). When the page sets no cookies and serves no security headers
+the whole struct is zeroes/falses, which is itself a real signal.
 
 #### Markdown envelope (`format=markdown`)
 
@@ -607,6 +669,13 @@ resources list, cookies. Store snapshots over time and diff to catch:
 - `cls_top_sources[0].selector` changed → new layout offender
 - `metrics.script_duration_ms` +30% with LCP unchanged → JS regression
 - `security_headers["Content-Security-Policy"]` missing → security regression
+- `security_audit.headers.present_count` dropped vs baseline → a deploy
+  stripped one of the core enforced headers; `security_audit.headers.missing`
+  names exactly which
+- `security_audit.cookies.same_site_none_without_secure > 0` → cookies
+  that modern browsers reject outright; always actionable
+- `security_audit.cookies.secure / total` ratio dropped → a new cookie was
+  set without the `Secure` flag (likely a third-party script)
 - `metadata.robots` contains `noindex` unexpectedly → SEO catastrophe
 - New entries in `render_blocking_resources` → perf regression
 - `service_worker.controlled` flipped to false → PWA broken
@@ -632,8 +701,21 @@ resources list, cookies. Store snapshots over time and diff to catch:
   responsiveness on simulated interaction (`script` clicked something)
 - `resource_summary.protocol_distribution["h2"]` ratio dropped → HTTP/2
   rollout regression; falling back to `http/1.1` triggers connection thrash
+- `resource_summary.modern_protocol_share < 0.9` → HTTP/2+3 coverage gap
+  in a single scalar — easier to alert on than the per-version histogram
 - `resource_summary.uncompressed_text_bytes > 50_000` → text resources
   shipped without `Content-Encoding` — missed compression opportunity
+- `resource_summary.compression_breakdown["none"]` rising vs baseline →
+  some text responses lost their encoding header (CDN cache misconfig)
+- `resource_summary.cache_control_missing` jumped after deploy → static
+  assets shipped without caching directives; usually a new origin tier
+  bypassing the CDN config
+- `resource_summary.top_third_party_domains[0].bytes` jumped → heaviest
+  external vendor grew; isolate before it dominates total payload
+- `coverage.js_unused_ratio > 0.6` or `coverage.css_unused_ratio > 0.6`
+  → significant dead code shipped to the client; `coverage.top_unused[]`
+  names which files to trim first (only emitted when `coverage=true`,
+  not implied by `all_metrics`)
 - `resource_summary.connections_new` jumped vs baseline with
   `connections_reused` flat → connection-pool / HTTP-multiplexing broke
 - `resource_summary.unique_hosts` ballooned → DNS-lookup overhead grew,

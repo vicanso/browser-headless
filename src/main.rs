@@ -398,17 +398,45 @@ struct SummaryQuery {
     #[serde(default)]
     resources: bool,
 
+    /// Emit `stat.http_errors`: failed_4xx / failed_5xx lists, network
+    /// failures (DNS / TLS / connection refused / blocked — pulled from
+    /// CDP `Network.loadingFailed`), final URL after redirects, and
+    /// redirect chain length. Built for periodic health checks where
+    /// the caller needs a single "is this page broken / hijacked /
+    /// redirected somewhere weird" signal without parsing
+    /// `resources[]`. Costs one extra event subscription when on; zero
+    /// when off.
+    #[serde(default)]
+    http_errors: bool,
+
+    /// Capture CSS / JS coverage (Lighthouse "Reduce unused CSS / JS"
+    /// feed) into `stat.coverage`. Enables CDP `Profiler` precise
+    /// coverage + `CSS` rule-usage tracking pre-navigation; computes
+    /// per-file used / unused bytes and a top-10 wasteful-files list.
+    ///
+    /// **Explicitly NOT enabled by `all_metrics=true`** — coverage
+    /// instrumentation disables some V8 optimisations and keeps style-
+    /// engine state for the full load, so it stays per-request opt-in
+    /// even when the caller asks for "every analytical signal". Set
+    /// `coverage=true` explicitly when you actually want it.
+    #[serde(default)]
+    coverage: bool,
+
     /// Convenience switch that turns ON every **analytical** flag:
     /// `web_vitals` / `metrics` / `metadata` / `render_blocking` /
     /// `service_worker` / `initiators` / `console_messages` /
-    /// `image_sizing` / `dom_mutations` / `resources`. Equivalent to
-    /// setting all ten manually — saves long query strings in AI
-    /// comparison / regression-audit workflows.
+    /// `image_sizing` / `dom_mutations` / `resources` / `http_errors`.
+    /// Equivalent to setting all eleven manually — saves long query
+    /// strings in AI comparison / regression-audit workflows.
     ///
     /// **Does NOT enable binary captures** (`screenshot` / `pdf` / `har`
     /// / `save_dom_snapshot`) — those produce MB-scale payloads and are
     /// kept on explicit opt-in so a stray `all_metrics=true` can't
     /// accidentally balloon a response by 10×.
+    ///
+    /// **Does NOT enable `coverage`** either — coverage has real
+    /// per-request instrumentation cost, so callers must set it
+    /// explicitly even when using `all_metrics`.
     ///
     /// Combine semantics: OR with each individual flag (anything already
     /// `true` stays `true`). When `false` (default), individual flags
@@ -668,6 +696,12 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         image_sizing: q.image_sizing || q.all_metrics,
         dom_mutations: q.dom_mutations || q.all_metrics,
         resources: q.resources || q.all_metrics,
+        http_errors: q.http_errors || q.all_metrics,
+        // `coverage` is INTENTIONALLY NOT or-merged with `all_metrics`
+        // — coverage has real V8 instrumentation cost (precise
+        // coverage disables some optimisations) and CSS rule-usage
+        // tracking. Keep it strictly per-request opt-in.
+        coverage: q.coverage,
     };
 
     // Snapshot the current browser handle out from under the RwLock so the
