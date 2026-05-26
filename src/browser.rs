@@ -96,13 +96,22 @@ const DEFAULT_SCALE: f64 = 1.0;
 pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver<()>), Error> {
     // --no-sandbox: required when running as non-root inside a container
     //   without user-namespace mapping (the default Docker config).
-    // --disable-dev-shm-usage: containers ship a 64MB /dev/shm by default,
+    //   Wired through chromiumoxide's `.no_sandbox()` builder rather than
+    //   `.arg("--no-sandbox")` — `.arg(...)` stores the string verbatim
+    //   and `ArgsBuilder` prepends `--`, so a literal `--no-sandbox`
+    //   becomes `----no-sandbox` (quadruple-dash, ignored by Chrome) and
+    //   the sandbox stays enforced. `.no_sandbox()` sets the internal
+    //   flag, which chromiumoxide expands to the correctly-formatted
+    //   `--no-sandbox --disable-setuid-sandbox` pair.
+    // disable-dev-shm-usage: containers ship a 64MB /dev/shm by default,
     //   which Chrome fills up under load and then crashes; switch to /tmp.
+    //   Pass WITHOUT leading dashes for the same reason — chromiumoxide
+    //   prepends `--` itself.
     // Safe defaults for an internal scraping service. Remove them if
     // exposing this to untrusted URLs in a multi-tenant context.
     let config = BrowserConfig::builder()
-        .arg("--no-sandbox")
-        .arg("--disable-dev-shm-usage")
+        .no_sandbox()
+        .arg("disable-dev-shm-usage")
         .build()
         .map_err(|e| Error::InvalidInput(format!("browser config: {e}")))?;
     let (browser, mut handler) = Browser::launch(config).await?;
