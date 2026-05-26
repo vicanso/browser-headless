@@ -109,6 +109,21 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
     //   prepends `--` itself.
     // Safe defaults for an internal scraping service. Remove them if
     // exposing this to untrusted URLs in a multi-tenant context.
+    // Record the explicit Chromium flags we requested. chromiumoxide doesn't
+    // expose the final flattened argv (DEFAULT_ARGS + sandbox flags + our
+    // extras + headless flags) once the subprocess is spawned, so this log
+    // is "what WE asked for" not "what Chromium received". Still essential
+    // for diagnosing future arg-mangling bugs (cf. the `--no-sandbox` →
+    // `----no-sandbox` quadruple-dash trap we just fixed): if a future
+    // refactor passes a flag a different way, you can compare intent vs.
+    // observed behavior side-by-side from the logs.
+    let requested_args: Vec<&'static str> = vec!["disable-dev-shm-usage"];
+    tracing::info!(
+        no_sandbox = true,
+        args = ?requested_args,
+        "launching chromium",
+    );
+
     let config = BrowserConfig::builder()
         .no_sandbox()
         .arg("disable-dev-shm-usage")
@@ -140,6 +155,19 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
     });
 
     let version = browser.version().await?;
+    // Full version snapshot — `product` carries the Chromium binary
+    // identity (e.g. "HeadlessChrome/119.0.6045.105"), `revision` is
+    // the build hash, `js_version` is the V8 version. Together they
+    // pin down exactly what binary started up, which is what you want
+    // when a CDP feature behaves differently in two environments.
+    tracing::info!(
+        product = %version.product,
+        revision = %version.revision,
+        protocol_version = %version.protocol_version,
+        js_version = %version.js_version,
+        user_agent = %version.user_agent,
+        "chromium launched",
+    );
     Ok((browser, version.user_agent, notify_rx))
 }
 

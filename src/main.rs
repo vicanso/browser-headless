@@ -84,7 +84,6 @@ fn main() {
 async fn run() {
     let (browser_inst, default_ua, disconnect_rx) =
         browser::launch().await.expect("failed to launch browser");
-    tracing::info!(user_agent = %default_ua, "browser launched");
 
     let max_pages = std::env::var("BROWSER_HEADLESS_MAX_PAGES")
         .ok()
