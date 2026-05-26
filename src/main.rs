@@ -460,9 +460,10 @@ struct SummaryQuery {
     wait_for_function: Option<String>,
 
     /// Optional stabilization period (ms) applied after every deterministic
-    /// gate (`wait_for_request`, `networkIdle`, `wait_for_element`) and just
-    /// before `data` extraction. Lets late JS render / CSS animation finish
-    /// for cases the explicit waits can't express.
+    /// gate (`wait_for_request`, the lifecycle gate selected by
+    /// `wait_until_load`, `wait_for_element`, `wait_for_function`) and
+    /// just before `data` extraction. Lets late JS render / CSS animation
+    /// finish for cases the explicit waits can't express.
     settle_ms: Option<u64>,
 
     /// Optional JavaScript to evaluate in the page right after `settle_ms`,
@@ -481,6 +482,22 @@ struct SummaryQuery {
     /// 4xx/5xx → 502). Repeat the key: `?wait_for_request=a&wait_for_request=b`.
     #[serde(default)]
     wait_for_request: Vec<String>,
+
+    /// Wait-gate strategy for the collect stage:
+    /// - `true`  → return shortly after the `load` (onload) lifecycle
+    ///   event. Faster + more deterministic on pages with long-tail
+    ///   analytics / websocket traffic that never quiesce. Pair with
+    ///   `settle_ms` if late JS still needs to run before capture.
+    /// - `false` (default) → return shortly after Chrome's `networkIdle`
+    ///   lifecycle event (≥500ms with zero in-flight requests). Use this
+    ///   when you need every late-firing response recorded in `resources`.
+    ///
+    /// Independent of `wait_for_element` / `wait_for_function` /
+    /// `wait_for_request`, which run / match regardless of which gate is
+    /// active. Caller must explicitly opt in — the gate choice is not
+    /// inferred from the other wait flags.
+    #[serde(default)]
+    wait_until_load: bool,
 
     /// Response envelope format. `json` (default) returns `application/json`
     /// with all `WebPageStat` fields. `markdown` returns `text/markdown`
@@ -650,6 +667,7 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         timeout: Duration::from_millis(q.timeout_ms),
         screenshot: q.screenshot,
         wait_for_request: q.wait_for_request,
+        wait_until_load: q.wait_until_load,
         width: q.width,
         height: q.height,
         device_scale_factor: q.device_scale_factor,

@@ -100,8 +100,7 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
 ### Docker
 
 ```bash
-docker build -t browser-headless .
-docker run --rm -p 3000:3000 --shm-size=512m browser-headless
+docker run --rm -p 3000:3000 --shm-size=512m vicanso/browser-headless
 ```
 
 ### Build from source

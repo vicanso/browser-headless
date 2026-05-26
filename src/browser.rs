@@ -3091,13 +3091,25 @@ pub struct CollectCaptures {
 /// Navigate to `url` and collect a full page summary: lifecycle timings,
 /// per-resource network stats, JS exceptions, final HTML, and optionally a
 /// screenshot. Drives Page / Network / Runtime CDP domains in parallel and
-/// returns once the `load` lifecycle event fires (or `timeout` elapses,
-/// returning a best-effort partial snapshot).
+/// returns once the wait gate fires (or `timeout` elapses, returning a
+/// best-effort partial snapshot).
+///
+/// Wait gate selection (`wait_until_load`):
+/// - `true`  → exit shortly after the `load` (onload) lifecycle event.
+///   Used when the caller didn't specify any of `wait_for_element` /
+///   `wait_for_function` / `wait_for_request`; the page is considered
+///   "ready enough" at onload and the caller drives any further waits
+///   themselves (e.g. via `settle`).
+/// - `false` → exit shortly after the `networkIdle` lifecycle event
+///   (Chrome's ≥500ms zero-in-flight signal). Used when explicit waits
+///   are in play and we want network to actually quiesce so all
+///   responses are recorded.
 pub async fn collect_summary(
     page: &Page,
     url: &str,
     timeout: Duration,
     wait_for_request: &[String],
+    wait_until_load: bool,
     captures: CollectCaptures,
 ) -> Result<WebPageStat, Error> {
     page.execute(NetworkEnableParams::default()).await?;
@@ -3195,23 +3207,32 @@ pub async fn collect_summary(
     // Exit policy:
     // - `load` alone is unsafe to break on: select may have skipped already-
     //   queued response events; breaking immediately drops them.
-    // - Wait for `networkIdle` lifecycle (Chrome emits this after ≥500ms with
-    //   zero in-flight requests, i.e. all responses have already fired).
-    // - After networkIdle fires, give a 500ms grace window so the select loop
-    //   can drain any response events still sitting in their channels.
+    // - When `wait_until_load` is true (no explicit caller-side waits), gate
+    //   on the `load` (onload) lifecycle event and add a short grace window
+    //   for the select loop to drain in-flight response events.
+    // - Otherwise, gate on `networkIdle` lifecycle (Chrome emits this after
+    //   ≥500ms with zero in-flight requests, i.e. all responses have already
+    //   fired).
+    // - After the chosen gate fires, give a 500ms grace window so the select
+    //   loop can drain any response events still sitting in their channels.
+    // - `wait_for_request` patterns (if any) always need to be matched
+    //   regardless of which gate is active.
     // - Soft cap: `timeout` (the page never settles → return best-effort).
     const POST_IDLE_GRACE: Duration = Duration::from_millis(500);
     let deadline = Instant::now() + timeout;
     let mut idle_at: Option<Instant> = None;
+    let mut load_at: Option<Instant> = None;
     let mut pending_patterns: Vec<&str> = wait_for_request.iter().map(String::as_str).collect();
     let total_patterns = pending_patterns.len();
 
     loop {
-        // Grace period only kicks in once BOTH networkIdle has fired AND all
-        // wait_for_request patterns have been matched. If patterns are still
-        // pending after idle, keep waiting (up to timeout) for them.
-        let ready_to_finish = idle_at.is_some() && pending_patterns.is_empty();
-        let stop_at = match (ready_to_finish, idle_at) {
+        // Pick the gate marker per strategy. Grace period only kicks in once
+        // the gate has fired AND all wait_for_request patterns have matched.
+        // If patterns are still pending after the gate, keep waiting (up to
+        // timeout) for them.
+        let gate_at = if wait_until_load { load_at } else { idle_at };
+        let ready_to_finish = gate_at.is_some() && pending_patterns.is_empty();
+        let stop_at = match (ready_to_finish, gate_at) {
             (true, Some(t)) => deadline.min(t + POST_IDLE_GRACE),
             _ => deadline,
         };
@@ -3227,6 +3248,8 @@ pub async fn collect_summary(
             _ = &mut sleep => {
                 tracing::debug!(
                     timeout_ms = timeout.as_millis() as u64,
+                    wait_until_load,
+                    load = load_at.is_some(),
                     idle = idle_at.is_some(),
                     "collect_summary stopping",
                 );
@@ -3238,7 +3261,10 @@ pub async fn collect_summary(
                     "init" => { init_ts.get_or_insert(ts); }
                     "firstContentfulPaint" => { fcp_ts.get_or_insert(ts); }
                     "DOMContentLoaded" => { dcl_ts.get_or_insert(ts); }
-                    "load" => { load_ts.get_or_insert(ts); }
+                    "load" => {
+                        load_ts.get_or_insert(ts);
+                        load_at.get_or_insert(Instant::now());
+                    }
                     "networkIdle" => { idle_at.get_or_insert(Instant::now()); }
                     _ => {}
                 }
@@ -4701,6 +4727,11 @@ pub struct SummaryRequest {
     pub timeout: Duration,
     pub screenshot: bool,
     pub wait_for_request: Vec<String>,
+    /// When `true`, the collect stage exits shortly after the `load`
+    /// (onload) lifecycle event instead of waiting for `networkIdle`.
+    /// Caller-controlled — set explicitly per request. See the
+    /// `SummaryQuery::wait_until_load` doc comment for trade-offs.
+    pub wait_until_load: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub device_scale_factor: Option<f64>,
@@ -4939,12 +4970,18 @@ pub async fn capture(
     );
 
     // Stage 2: collect — navigate + drain lifecycle / network / exception events.
+    //
+    // `req.wait_until_load` is caller-supplied (no longer inferred from the
+    // presence of other wait flags). `true` exits at onload + grace; `false`
+    // waits for `networkIdle`. Pair with `settle` (stage 3) when late JS
+    // needs to run before capture.
     let t_collect = Instant::now();
     let mut stat = collect_summary(
         &page,
         &req.url,
         req.timeout,
         &req.wait_for_request,
+        req.wait_until_load,
         CollectCaptures {
             screenshot: req.screenshot,
             initiators: req.initiators,

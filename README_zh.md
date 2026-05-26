@@ -85,8 +85,7 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
 ### Docker
 
 ```bash
-docker build -t browser-headless .
-docker run --rm -p 3000:3000 --shm-size=512m browser-headless
+docker run --rm -p 3000:3000 --shm-size=512m vicanso/browser-headless
 ```
 
 ### 从源码构建
