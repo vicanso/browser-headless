@@ -138,28 +138,31 @@ curl -X POST http://localhost:3000/summary \
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |
 | `save_dom_snapshot` | bool | false | `DOMSnapshot.captureSnapshot` 写入 `stat.dom_snapshot`。 |
-| `web_vitals` | bool | false | 收集 Core Web Vitals（LCP / CLS / TBT / TTFB / 长任务计数）写入 `stat.web_vitals`，通过导航前安装的 `PerformanceObserver` 实现。同时记录 `lcp_element`（tag / id / class / url / text）、`cls_entries[]` + 服务端聚合的 `cls_top_sources[]`、**INP**（最大交互响应时长，2024 Core Web Vital；纯抓取场景为 `0`，`script` 模拟点击时变得有意义）以及 **Long Animation Frames**（Chrome 123+：`loaf_count` + `loaf_total_blocking_duration` + 服务端聚合的 `loaf_top_offenders[]`，按脚本源 URL 归因，标记 forced reflow —— 直接定位是哪个 JS 文件在卡顿）。 |
+| `web_vitals` | bool | false | 收集 Core Web Vitals（LCP / CLS / TBT / TTFB / 长任务计数）写入 `stat.web_vitals`，通过导航前安装的 `PerformanceObserver` 实现。同时记录 `lcp_element`（tag / id / class / url / text **再加 `size` / `load_time` / `render_time` / `natural_width` / `natural_height`** —— AI 能直接说出"LCP 是 3840×2160 图被渲染成 1920×1080，980ms 加载、1023ms 上屏，应该换更小尺寸"），`cls_entries[]` 携带每个 source 的移动几何（`previous_rect` / `current_rect` / `distance_px`），加上服务端聚合的 `cls_top_sources[]`（新增 `max_distance_px` —— 单次最大跳动距离，就是预留 `min-height` 的下限），**`long_task_top_offenders[]`**（服务端按 `PerformanceLongTaskTiming.attribution[].container_src` 归类聚合 —— 把"long_tasks: 3"变成"3 个 longtask 共 800ms，全来自 gtm.js"这种可定位的归因），**INP**（最大交互响应时长，2024 Core Web Vital；纯抓取场景为 `0`，`script` 模拟点击时才有意义），**Long Animation Frames**（Chrome 123+：`loaf_count` + `loaf_total_blocking_duration` + 服务端聚合的 `loaf_top_offenders[]`，按脚本源 URL 归因，标记 forced reflow —— 直接定位是哪个 JS 文件在卡顿），以及 **FPS**（`fps_avg` / `fps_jank_ratio` / `fps_longest_frame_ms` / `fps_frame_count` —— 基于 rAF 循环、对照 60fps 基准；`jank_ratio` 和 `longest_frame_ms` 是动画 / 滚动密集型页面真正可行动的信号，能补 LoAF 漏掉的"亚 jank 阈值"平滑度损失，比如稳定 45fps 的 banner 动画。headless + VM 用软件光栅化，绝对数字不能跟真机比 —— 同 harness 做回归对比是 ok 的）。 |
 | `metrics` | bool | false | V8 heap + DOM 计数 + CPU 时间分解（`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms` / `task_duration_ms`）写入 `stat.metrics`，通过 `Performance.getMetrics`。回归检测的金矿 ——「LCP 没变但 script 时长 +30%」一眼可见。 |
 | `metadata` | bool | false | 抓 `<head>` 元数据（title / description / canonical / robots / lang / viewport / charset / theme-color / OG / Twitter）写入 `stat.metadata`。SEO 回归一眼可见。 |
 | `render_blocking` | bool | false | 扫 `<head>` 找 render-blocking 同步 stylesheet 和 没 `async`/`defer`/`module` 的 script，结果在 `stat.render_blocking_resources[]`。 |
 | `service_worker` | bool | false | 抓 `navigator.serviceWorker` 注册信息写入 `stat.service_worker`（controlled / scope / active_script / waiting / installing）。 |
 | `initiators` | bool | false | 订阅 `Network.requestWillBeSent` 给每条 resource 加 `initiator` 信息（type / url / line_number），回答「这个请求是谁触发的」。 |
 | `console_messages` | bool | false | 收集 `console.log/info/warn/error/debug` 写入 `stat.console_messages`。默认关闭 —— console 通常很吵（框架开发警告、统计脚本、大对象 dump），只在确实要做 console 审计时打开。关闭时根本不订阅 CDP `Runtime.consoleAPICalled`（零成本）。 |
-| `image_sizing` | bool | false | 逐张 `<img>` 审计：解码后的原始尺寸 vs 实际布局尺寸（已按 DPR 修正，retina 优化图不会误报浪费）、`loading` 模式、是否在首屏、是否缺 `alt`；服务端关联 `transferred_bytes` 并计算 `waste_ratio`。结果按浪费率降序写入 `stat.image_sizing`。一次 `evaluate` 调用，~2ms（100+ 张图）。 |
+| `image_sizing` | bool | false | 逐张 `<img>` 审计：解码后的原始尺寸 vs 实际布局尺寸（已按 DPR 修正，retina 优化图不会误报浪费）、`loading` 模式、是否在首屏、是否缺 `alt`、**`has_width_attr` / `has_height_attr` / `has_srcset`** 属性是否存在；服务端关联 `transferred_bytes` 并计算 `waste_ratio`。结果按浪费率降序写入 `stat.image_sizing`。同一遍派生出 `stat.image_audit` —— Lighthouse "图片四大件"（`oversized` / `missing_dimensions` / `missing_lazy` / `missing_srcset`），每项是预排序好的 top-20 列表，带具体 URL + 显示尺寸，AI 能按类别一行一条出建议。一次 `evaluate` 调用，~2ms（100+ 张图）。 |
 | `dom_mutations` | bool | false | 导航前注入 `MutationObserver`，统计整个渲染期间的 DOM 变更（childList 增删 + 属性修改）。输出 `stat.dom_mutations`：总数 + 观测窗口 + top tags + top attributes。重度 SPA 也 ≤5ms 开销（只增不读、不存原始 records、跳过 `characterData`）。 |
 | `resources` | bool | false | 是否在响应中包含完整的 `stat.resources[]` 列表。默认关闭 —— 功能校验（"页面是否正常加载"）只需要标量 `total_size` + `resource_count` + 聚合 `resource_summary`（按 MIME bucket 的字节/数量、状态码分布、缓存命中率、第三方字节 + top 3rd-party 域名、modern-protocol 占比、按算法的压缩分布、Cache-Control 覆盖率、最大资源），覆盖度足够。只在需要逐条 forensics（timing / mime / 缓存命中 / cache_control 头值 / initiator）时打开。内部始终采集，所以依赖 resources 的下游特性（HAR、`image_sizing.transferred_bytes`、`resource_summary`）不受影响。 |
 | `http_errors` | bool | false | 输出 `stat.http_errors`：`failed_4xx[]` / `failed_5xx[]` 列表、`network_failures[]`（DNS / TLS / 连接拒绝 / 被拦截 —— 来自 CDP `Network.loadingFailed`）、跳转后的 `final_url`、`redirect_count`。专为定时健康巡检设计，给一个聚焦的"页面是否挂了 / 被劫持 / 跳到奇怪地方"信号，不用解析整个 `resources[]`。开启时多订阅一个 CDP 事件流；关闭时零开销。 |
 | `coverage` | bool | false | 采集 CSS / JS coverage 输出到 `stat.coverage` —— Lighthouse "Reduce unused CSS / JS" 数据源（按文件统计 used / unused 字节 + top-10 浪费列表）。开启时导航前启用 CDP `Profiler.startPreciseCoverage` + `CSS.startRuleUsageTracking`，加载完后 take / stop。**`all_metrics=true` 也不会自动启用** —— coverage 会让 V8 关掉部分脚本优化、CSS 引擎全程保留 rule-usage 状态，所以即使开了 "所有分析信号" 也保持显式 opt-in。需要时单独设 `coverage=true`。 |
-| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
+| `resource_hints` | bool | false | 审计 `<link rel="preconnect">` / `<link rel="dns-prefetch">` 声明与实际命中的第三方主机的差距。结果写入 `resource_summary.resource_hints`，包含 `declared_preconnect[]` / `declared_dns_prefetch[]` 以及 `gap[]` —— 实际加载量大但未声明 hint 的第三方主机列表（每个 = 一次可避免的 100–300ms DNS+TLS 开销）。多一次 `<head>` evaluate（约 5ms）。与 `all_metrics` OR 合并。 |
+| `font_audit` | bool | false | 审计 `@font-face` 声明 + `document.fonts` 的 FOIT（Flash of Invisible Text，"文字加载期间不可见"）风险。结果写入 `stat.font_audit`，包含 `font-display` 取值分布、`missing_swap[]`（FOIT 罪魁列表 —— 每条对应一个 `font-display: swap;` 的具体修复）、`declared_preload_count`（标量 —— "你到底有没有 preload 字体"）、`unreadable_stylesheets`（CORS 盲区计数 —— 跨域 stylesheet 没加 `crossorigin` 就读不到 cssRules，把这部分数据如实暴露而不是默默丢掉）。多一次 CSSOM `page.evaluate`（约 3–8ms）。与 `all_metrics` OR 合并。 |
+| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
+| `lang` | `en`\|`zh` | `en` | **markdown 渲染**的语言（section 标题、说明文字、警告标签）。JSON 封装**绝不**翻译 —— 字段名、enum 标签值（`missing_immutable` / `short_max_age` 等）以及其它机器可读字符串始终保持英文，让下游基于这些值做分支的代码跨语言依然能工作。`format=json` 时该参数被忽略。 |
 | `normalize_custom_elements` | bool | true | （仅 markdown 模式生效）把自定义元素（如 `taro-view-core`）按 computed `display` 重写成 `<div>` / `<span>`。 |
 | `width` / `height` | u32 | 1920 / 1080 | viewport 尺寸（width / height / DPR 任一字段都会触发 override）。 |
 | `device_scale_factor` | f64 | 1.0 | 设备像素比。 |
 | `touch` | bool | false | 启用移动端 touch 事件模拟（`navigator.maxTouchPoints=5`，`ontouchstart` 可派发）。配合小 viewport 是完整移动端模拟。 |
 | `cpu_throttle` | f64 | — | CPU 节流倍率（1.0 = 原生，4.0 = 4× 慢）。≤ 1.0 忽略。 |
-| `user_agent` | string | — | UA 覆盖。 |
-| `accept_language` | string | — | `Accept-Language` header 覆盖。仅设此字段不设 `user_agent` 时，UA 用启动时缓存的浏览器原生 UA。 |
+| `user_agent` | string | — | UA 覆盖。**未指定时的默认 UA** 是一个 pin 死的主线 Chrome 字符串：`Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36`，专门避开 `HeadlessChrome` 这个关键字（绝大多数 WAF —— Cloudflare / Akamai / 企业网关 —— 会直接拦带这个 token 的请求）。真实的 Chromium 二进制版本仍然记录在 `chromium launched` 日志的 `binary_user_agent` 字段里，方便排查。 |
+| `accept_language` | string | — | `Accept-Language` header 覆盖。跟 `user_agent` 独立；可以单独设而不指定 UA（此时 UA 用上面那个默认 Chrome 字符串）。 |
 | `cookie` | string | — | 标准 HTTP `Cookie` header 格式（`name=v; name2=v2`）。导航前写入。 |
 | `headers` | `{ string: string }` | `{}` | 额外的 HTTP 请求 header。推荐用 POST JSON 传。 |
 | `timezone` | string | — | IANA 时区 ID（如 `Asia/Shanghai`）。 |
@@ -173,6 +176,7 @@ curl -X POST http://localhost:3000/summary \
 | `wait_for_element` | string | — | CSS 选择器 —— 阻塞直到该元素出现。 |
 | `wait_for_function` | string | — | JS 表达式轮询，truthy 即通过。 |
 | `wait_for_request` | `[string]` | `[]` | URL 子串列表 —— 阻塞直到**所有**匹配的响应都到（4xx/5xx → 502）。 |
+| `wait_until_load` | bool | false | collect 阶段的等待策略。`true` 在 `load`（onload）lifecycle 事件后短暂等待即返回 —— 在带大量长尾分析 / WebSocket 流量、永远到不了 `networkIdle` 的页面上更快、更确定。`false`（默认）在 Chrome 的 `networkIdle`（≥500ms 零在飞请求）之后返回 —— 当你需要把每个迟到的响应都记录进 `resources[]` 时用这个。与 `wait_for_element` / `wait_for_function` / `wait_for_request` 独立（不论用哪种 gate，这三个都会照常执行 / 匹配）。如果还有迟到的 JS 要跑完才能抓数据，配合 `settle_ms` 用。 |
 | `settle_ms` | u64 | — | 所有等待之后、数据抓取之前的固定延迟。 |
 | `script` | string | — | settle 之后、抓取之前执行的 JS。用于关弹窗、触发懒加载等。 |
 | `capture_element` | string | — | CSS 选择器 —— `data` 只放该元素的内容。 |
@@ -192,6 +196,9 @@ snapshot）→ 关闭 page + 销毁 context。
 每个阶段在 debug 级别记 `duration_ms`，方便定位慢请求。
 
 #### 响应结构（JSON 封装）
+
+<details>
+<summary>点击展开完整 JSON 示例（约 300 行，所有分析字段齐全）</summary>
 
 ```json
 {
@@ -219,6 +226,8 @@ snapshot）→ 关闭 page + 销毁 context。
       "connection_reused": true,
       "protocol": "h2",
       "content_encoding": "br",
+      "cache_control": "public, max-age=31536000, immutable",
+      "has_source_map": true,
       "from_cache": false,
       "timing": { "request_time": 5.123, "dns_start": 0.1 }
     }
@@ -243,13 +252,21 @@ snapshot）→ 关闭 page + 销毁 context。
     "lcp": 1234.5, "cls": 0.045, "tbt": 182.3, "ttfb": 156.0, "long_tasks": 3,
     "lcp_element": {
       "tag": "img", "id": "hero", "class": "hero-image",
-      "url": "https://cdn.example.com/hero.webp", "text_preview": null
+      "url": "https://cdn.example.com/hero.webp", "text_preview": null,
+      "size": 384000.0, "load_time": 980.4, "render_time": 1023.7,
+      "natural_width": 1920, "natural_height": 1080
     },
     "cls_entries": [
-      { "time_ms": 850, "value": 0.032, "sources": [{"tag":"div","id":"","class":"ad-banner"}] }
+      { "time_ms": 850, "value": 0.032, "sources": [
+        { "tag": "div", "id": "", "class": "ad-banner",
+          "previous_rect": { "x": 0, "y": 200, "width": 1280, "height": 90 },
+          "current_rect":  { "x": 0, "y": 440, "width": 1280, "height": 90 },
+          "distance_px": 240.0 }
+      ] }
     ],
     "cls_top_sources": [
-      { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71, "shift_count": 1 }
+      { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71,
+        "shift_count": 1, "max_distance_px": 240.0 }
     ],
     "inp": 0, "interaction_count": 0,
     "loaf_count": 5, "loaf_total_blocking_duration": 312.5,
@@ -262,7 +279,15 @@ snapshot）→ 关闭 page + 销毁 context。
         "total_forced_style_layout_ms": 42.1,
         "invocation_count": 3
       }
-    ]
+    ],
+    "long_task_top_offenders": [
+      { "source": "https://www.googletagmanager.com/gtm.js?id=GTM-XYZ",
+        "total_duration_ms": 412.0, "max_duration_ms": 187.5, "task_count": 3 },
+      { "source": "self", "total_duration_ms": 96.4,
+        "max_duration_ms": 96.4, "task_count": 1 }
+    ],
+    "fps_avg": 58.7, "fps_jank_ratio": 0.04,
+    "fps_longest_frame_ms": 42.0, "fps_frame_count": 178
   },
   "metrics": {
     "js_heap_used": 12582912, "js_heap_total": 18874368,
@@ -298,6 +323,41 @@ snapshot）→ 关闭 page + 销毁 context。
     "modern_image_bytes": 65000,
     "source_maps_present": 2,
     "source_maps_missing": 9,
+    "top_largest_by_type": {
+      "javascript": [
+        { "url": "https://cdn.example.com/vendors.js",
+          "bytes": 712600, "mime_type": "application/javascript",
+          "from_cache": false }
+      ],
+      "image": [
+        { "url": "https://example.com/hero.png",
+          "bytes": 184000, "mime_type": "image/png",
+          "from_cache": false }
+      ]
+    },
+    "uncompressed_text_resources": [
+      { "url": "https://example.com/static/legacy.js",
+        "mime_type": "application/javascript", "bytes": 62000 },
+      { "url": "https://example.com/static/styles.css",
+        "mime_type": "text/css", "bytes": 22200 }
+    ],
+    "cache_policy_issues": [
+      { "url": "https://cdn.example.com/app.4f7c2a91.js",
+        "mime_type": "application/javascript",
+        "cache_control": "public, max-age=31536000",
+        "reason": "missing_immutable" },
+      { "url": "https://example.com/static/logo.svg",
+        "mime_type": "image/svg+xml",
+        "cache_control": "public, max-age=30",
+        "reason": "short_max_age" }
+    ],
+    "resource_hints": {
+      "declared_preconnect": ["https://cdn.example.com"],
+      "declared_dns_prefetch": [],
+      "gap": [
+        { "host": "analytics.example", "bytes": 5800, "count": 2 }
+      ]
+    },
     "duplicate_resources": {
       "exact_url": [
         { "key": "https://example.com/static/app.js",
@@ -366,6 +426,24 @@ snapshot）→ 关闭 page + 销毁 context。
         "unused_bytes": 514600, "unused_ratio": 0.722 }
     ]
   },
+  "http_errors": {
+    "failed_count": 2,
+    "failed_4xx": [
+      { "url": "https://api.example.com/missing.json",
+        "status": 404, "resource_type": "Fetch" }
+    ],
+    "failed_5xx": [
+      { "url": "https://api.example.com/buggy",
+        "status": 503, "resource_type": "Xhr" }
+    ],
+    "network_failures": [
+      { "url": "https://blocked.example.com/script.js",
+        "error_text": "net::ERR_BLOCKED_BY_CLIENT",
+        "resource_type": "Script", "canceled": false }
+    ],
+    "final_url": "https://example.com/",
+    "redirect_count": 0
+  },
   "service_worker": {
     "controlled": true, "scope": "https://example.com/",
     "active_script": "https://example.com/sw.js",
@@ -400,9 +478,46 @@ snapshot）→ 关闭 page + 销毁 context。
       "device_pixel_ratio": 2.0,
       "loaded": true, "loading": "eager", "decoding": "auto",
       "in_viewport": true, "alt_missing": false,
+      "has_width_attr": false, "has_height_attr": false, "has_srcset": false,
       "transferred_bytes": 1843200, "waste_ratio": 0.83
     }
   ],
+  "image_audit": {
+    "oversized": [
+      { "url": "https://example.com/hero.jpg",
+        "display_width": 800, "display_height": 450,
+        "in_viewport": true, "ratio": 5.76 }
+    ],
+    "missing_dimensions": [
+      { "url": "https://example.com/hero.jpg",
+        "display_width": 800, "display_height": 450,
+        "in_viewport": true, "ratio": 0.0 }
+    ],
+    "missing_lazy": [
+      { "url": "https://example.com/footer-ad.png",
+        "display_width": 728, "display_height": 90,
+        "in_viewport": false, "ratio": 0.0 }
+    ],
+    "missing_srcset": [
+      { "url": "https://example.com/hero.jpg",
+        "display_width": 800, "display_height": 450,
+        "in_viewport": true, "ratio": 0.0 }
+    ]
+  },
+  "font_audit": {
+    "font_count": 4, "loaded_count": 3,
+    "display_distribution": { "swap": 2, "auto": 2 },
+    "missing_swap": [
+      { "family": "Inter",
+        "source_url": "https://example.com/fonts/inter.woff2",
+        "display": "auto" },
+      { "family": "Roboto Mono",
+        "source_url": "https://fonts.gstatic.com/s/robotomono/v23/...woff2",
+        "display": "block" }
+    ],
+    "declared_preload_count": 1,
+    "unreadable_stylesheets": 0
+  },
   "dom_mutations": {
     "total_added_nodes": 4521, "total_removed_nodes": 1203,
     "total_attribute_changes": 8932,
@@ -418,6 +533,8 @@ snapshot）→ 关闭 page + 销毁 context。
   }
 }
 ```
+
+</details>
 
 `tls_info` 是主文档的证书（HTTPS 站点自动采集，HTTP / file:// 时为
 `null`）。`tls_certificates` 是页面访问过的**所有** HTTPS host
@@ -673,7 +790,47 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
 存档多次快照按时间 diff，可捕捉：
 
 - `lcp_element` 变了 → 图片挂了走降级
+- `lcp_element.natural_width / display_width > 2`（display 取自
+  `image_sizing` 或 LCP `size`）→ 首屏图过大；换更小尺寸的变体并
+  对其 origin 加 `<link rel="preload">`
+- `lcp_element.load_time` 涨了但 `render_time` 没变 → LCP 资源的
+  网络阶段变慢（CDN 退化 / 缺 preconnect 到其 origin）；反过来
+  `render_time` 涨而 `load_time` 平 → 瓶颈移到主线程绘制阶段
 - `cls_top_sources[0].selector` 变了 → 新的布局抖动源
+- `cls_top_sources[0].max_distance_px > 100` → 至少有一次单次跳
+  动超过 100px；这个数就是"如果当初给它写死 `min-height`"的下限
+- `web_vitals.fps_jank_ratio > 0.10` → 观察窗口内超过 10% 的帧没达到
+  60fps 目标；marketing / 滚动密集型页面会有明显卡顿感。结合
+  `loaf_top_offenders` 看是哪个脚本源造成的。当作"同 harness 上的回归
+  告警"用，不要当成"真机上的用户体感"—— headless 走的是软件光栅化
+- `web_vitals.fps_longest_frame_ms > 100` → 至少有一帧耗时超过
+  100ms；用户能明显感觉到一次停顿。罪魁脚本通常就在
+  `loaf_top_offenders[0].source_url`
+- `web_vitals.long_task_top_offenders[0].source` 指明了贡献最多
+  主线程阻塞时间的脚本 URL / iframe / 函数名。当 `total_duration_ms
+  > 200` 且来源是第三方标签（gtm / segment / 各种 analytics），可以
+  考虑改 `async` 加载或者拆出关键路径
+- `image_audit.oversized[]` 非空 → 每条的 `ratio` 是 natural /
+  effective-display 的倍数；ratio > 4 就该换更小尺寸或加 `srcset`
+- `image_audit.missing_dimensions[]` 非空 → CLS 直接成因（解码前
+  浏览器无法预留布局空间）；给 `<img>` 加上等于显示尺寸的
+  `width=` / `height=` 属性
+- `image_audit.missing_lazy[]` 非空 → 首屏外的图被立即加载；逐个
+  加 `loading="lazy"`
+- `image_audit.missing_srcset[]` 非空 → 没做响应式变体；加
+  `srcset`（需要 art direction 再加 `sizes`）
+- `font_audit.missing_swap[]` 非空 → `@font-face` 的 `font-display`
+  不在 `{swap, optional}` 集合里，会出现 FOIT（加载期间不可见）。
+  每条带 `family` + `source_url`，直接对应一条修复："在这个
+  `@font-face` 块加 `font-display: swap;`"
+- `font_audit.declared_preload_count == 0` 且 `font_count > 0` →
+  页面用了 web 字体但一个都没 preload。如果有渲染关键字体（首屏
+  正文 / 标题用的），加 `<link rel="preload" as="font"
+  type="font/woff2" crossorigin>`
+- `font_audit.unreadable_stylesheets > 0` → 因为跨域 stylesheet
+  没加 `crossorigin`，审计本身是不完整的。AI 建议：给那些
+  `<link rel="stylesheet">` 加 `crossorigin`，既能让审计看到，
+  又能让浏览器一致地缓存它们
 - `metrics.script_duration_ms` +30% 而 LCP 没动 → JS 回归
 - `security_headers["Content-Security-Policy"]` 没了 → 安全回归
 - `security_audit.headers.present_count` 比基线下降 → 某次发布
@@ -737,6 +894,22 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
 - `resource_summary.mixed_content.detected = true` → HTTPS 页面在加
   plain-HTTP 资源；现代浏览器会直接拦或者自动升级。`resources[]`
   按字节大小排序列出问题资源
+- `resource_summary.top_largest_by_type["javascript"][0].bytes > 500_000`
+  （或其它桶的对应阈值）→ 单个 bundle 主导了这一类型，是代码分割或
+  重新评估压缩方案的候选。每个桶（`javascript` / `css` / `image` /
+  `font`）都有独立的 top-5 列表
+- `resource_summary.uncompressed_text_resources[]` 非空 → 文本资源未
+  带 `Content-Encoding`；每条直接指向具体文件（aggregate 数据
+  在 `uncompressed_text_bytes`）
+- `resource_summary.cache_policy_issues[]` 非空 → 静态资源的缓存配置
+  有问题。`reason="short_max_age"` 标记 JS / CSS / image / font 上
+  `max-age < 60s`；`reason="missing_immutable"` 标记指纹化 URL
+  （≥ 8 位 hex token）带了 `Cache-Control` 但缺少 `immutable` ——
+  每次重新校验都是纯浪费
+- `resource_summary.resource_hints.gap[]` 非空 → 实际命中的第三方
+  主机没有声明 `<link rel="preconnect">` / `dns-prefetch`。每个 gap
+  ≈ 一次可避免的 DNS+TLS 往返（~100–300ms）。仅当 `resource_hints=true`
+  （或 `all_metrics=true`）时输出
 - `resource_summary.max_initiator_chain_depth > 4` → 关键请求链太深
   （Lighthouse "Avoid chaining critical requests"）；给中间关键资源
   加 preload 或者把依赖图压扁。仅在 `initiators=true` 时输出

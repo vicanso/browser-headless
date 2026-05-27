@@ -421,6 +421,30 @@ struct SummaryQuery {
     #[serde(default)]
     coverage: bool,
 
+    /// Audit declared `<link rel="preconnect">` and
+    /// `<link rel="dns-prefetch">` hints against actually-loaded
+    /// third-party hosts. Populates
+    /// `resource_summary.resource_hints` with the declared origins
+    /// and a gap list (hot third parties missing a hint = avoidable
+    /// 100-300ms of DNS+TLS overhead per origin). One extra
+    /// `page.evaluate` over `<head>` (~5ms). OR-merged with
+    /// `all_metrics`.
+    #[serde(default)]
+    resource_hints: bool,
+
+    /// Audit `@font-face` declarations + `document.fonts` FontFaceSet
+    /// for FOIT (Flash of Invisible Text) risk. Populates
+    /// `stat.font_audit` with `font-display` distribution, the
+    /// `missing_swap[]` list (per-face FOIT offenders), preload
+    /// coverage count, and a CORS blind-spot counter
+    /// (`unreadable_stylesheets` — cross-origin sheets without
+    /// `crossorigin` can't be inspected, so the audit is honest
+    /// about what it couldn't see). One extra `page.evaluate`
+    /// (~3–8ms depending on stylesheet count). OR-merged with
+    /// `all_metrics`.
+    #[serde(default)]
+    font_audit: bool,
+
     /// Convenience switch that turns ON every **analytical** flag:
     /// `web_vitals` / `metrics` / `metadata` / `render_blocking` /
     /// `service_worker` / `initiators` / `console_messages` /
@@ -504,6 +528,16 @@ struct SummaryQuery {
     /// `data_format` which controls only the `data` field's representation.
     #[serde(default)]
     format: ResponseFormat,
+
+    /// Language used for the **markdown rendering** when
+    /// `format=markdown`. `en` (default) emits English section headings +
+    /// prose; `zh` emits Chinese. The JSON envelope is **never** translated
+    /// — all field names, enum tag values, and other machine-readable
+    /// strings stay English regardless of `lang`, so downstream code that
+    /// branches on them keeps working across languages. Ignored when
+    /// `format=json`.
+    #[serde(default)]
+    lang: browser::Lang,
 }
 
 /// GET wrapper — query params drive a single page summary capture.
@@ -719,6 +753,8 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         // coverage disables some optimisations) and CSS rule-usage
         // tracking. Keep it strictly per-request opt-in.
         coverage: q.coverage,
+        resource_hints: q.resource_hints || q.all_metrics,
+        font_audit: q.font_audit || q.all_metrics,
     };
 
     // Snapshot the current browser handle out from under the RwLock so the
@@ -764,7 +800,7 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
                 axum::http::header::CONTENT_TYPE,
                 "text/markdown; charset=utf-8",
             )],
-            stat.to_markdown(),
+            stat.to_markdown(q.lang),
         )
             .into_response(),
     };

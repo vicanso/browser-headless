@@ -88,6 +88,35 @@ const DEFAULT_WIDTH: u32 = 1920;
 const DEFAULT_HEIGHT: u32 = 1080;
 const DEFAULT_SCALE: f64 = 1.0;
 
+/// Default `User-Agent` advertised by every page unless the caller
+/// overrides via `SummaryRequest.user_agent`. Pinned to a recent
+/// stable Chrome string on macOS so requests don't carry the literal
+/// `HeadlessChrome` token — many WAFs (Cloudflare, Akamai, custom
+/// enterprise gateways) blanket-block that token, returning 403 / no
+/// CORS headers and breaking otherwise-valid scrapes.
+///
+/// The actual Chromium binary version is logged once at launch
+/// (`chromium launched` event) so admins can still tell what's
+/// running; this constant only controls what pages see over the wire.
+/// If you need a different default per deployment, override on every
+/// request via the `user_agent` query param.
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+/// Custom tracing target for the per-resource diagnostic logs
+/// (`request_will_be_sent` / `response_received` / `loading_failed` /
+/// `resource has status=0 ...`). Independent target means callers can
+/// enable just these without flooding stdout with every other debug
+/// log in the crate. Enable with:
+///
+/// ```sh
+/// RUST_LOG=warn,browser_headless::diag::resource=debug
+/// ```
+///
+/// — sets default to `warn` (quiet) and only this target to `debug`.
+/// Default crate-wide log filter still picks up the `warn!` walker
+/// because warn-level passes any `warn`-or-higher filter.
+const DIAG_RESOURCE: &str = "browser_headless::diag::resource";
+
 /// Launch Chromium, spawn the watcher task that keeps the CDP connection
 /// alive, and return the browser handle, its default user-agent string,
 /// and a `oneshot::Receiver` that fires once when the CDP stream ends
@@ -165,10 +194,15 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
         revision = %version.revision,
         protocol_version = %version.protocol_version,
         js_version = %version.js_version,
-        user_agent = %version.user_agent,
+        binary_user_agent = %version.user_agent,
+        default_user_agent = DEFAULT_USER_AGENT,
         "chromium launched",
     );
-    Ok((browser, version.user_agent, notify_rx))
+    // Return the pinned default UA (NOT the raw Chromium binary UA).
+    // The binary UA contains the literal `HeadlessChrome` token, which
+    // is the single most common reason WAFs reject scrapes. Pages see
+    // `DEFAULT_USER_AGENT` unless the caller overrides per-request.
+    Ok((browser, DEFAULT_USER_AGENT.to_string(), notify_rx))
 }
 
 pub async fn apply_viewport(
@@ -636,6 +670,255 @@ pub async fn collect_render_blocking(page: &Page) -> Result<Vec<RenderBlocker>, 
         .map_err(|e| Error::Cdp(format!("render_blocking decode: {e}")))
 }
 
+/// Scan `<head>` for declared `<link rel="preconnect">` and
+/// `<link rel="dns-prefetch">` hints. Returns each hint's resolved
+/// href (the browser normalizes relative/protocol-relative URLs for
+/// us). The Rust side later parses these into hosts to compare
+/// against actually-loaded third-party domains.
+///
+/// We don't filter `disabled` here (matches real browser behavior:
+/// disabled `<link>`s don't trigger preconnect/dns-prefetch).
+const RESOURCE_HINTS_JS: &str = r#"
+(function() {
+  const preconnect = [];
+  const dnsPrefetch = [];
+  for (const el of document.head.querySelectorAll('link[rel]')) {
+    if (el.disabled) continue;
+    const rel = (el.rel || '').toLowerCase();
+    const href = el.href || '';
+    if (!href) continue;
+    if (rel.indexOf('preconnect') >= 0) {
+      preconnect.push(href);
+    } else if (rel.indexOf('dns-prefetch') >= 0) {
+      dnsPrefetch.push(href);
+    }
+  }
+  return { preconnect, dns_prefetch: dnsPrefetch };
+})()
+"#;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawResourceHints {
+    preconnect: Vec<String>,
+    dns_prefetch: Vec<String>,
+}
+
+pub async fn collect_resource_hints(page: &Page) -> Result<RawResourceHintsPublic, Error> {
+    let eval = page.evaluate(RESOURCE_HINTS_JS).await?;
+    let raw: RawResourceHints = eval
+        .into_value()
+        .map_err(|e| Error::Cdp(format!("resource_hints decode: {e}")))?;
+    Ok(RawResourceHintsPublic {
+        preconnect: raw.preconnect,
+        dns_prefetch: raw.dns_prefetch,
+    })
+}
+
+/// Exported shape for the raw resource-hint scrape — kept distinct from
+/// the final `ResourceHints` (which carries the computed `gap` derived
+/// against the resource list). Pub-by-necessity so the format stage
+/// can `try_join!` the call.
+#[derive(Debug, Clone, Default)]
+pub struct RawResourceHintsPublic {
+    pub preconnect: Vec<String>,
+    pub dns_prefetch: Vec<String>,
+}
+
+/// Build the final `ResourceHints` with computed `gap`. Compares
+/// already-built `top_third_party_domains` (computed earlier in
+/// `build_resource_summary`) against the declared hint origins.
+/// Hosts that account for `< gap_floor_bytes` bytes are skipped to
+/// avoid noisy gaps from tiny one-off fetches (telemetry beacons,
+/// 1x1 pixels) where the preconnect cost can outweigh the gain.
+fn build_resource_hints(
+    raw: RawResourceHintsPublic,
+    top_third_party_domains: &[DomainBytes],
+) -> ResourceHints {
+    const GAP_FLOOR_BYTES: u64 = 4096;
+    // Normalize declared hint URLs → host strings for comparison.
+    // We accept either full URL (preconnect: `https://cdn.example.com`)
+    // or host-only DNS hints. Stripping the scheme + trailing path
+    // keeps the comparison uniform.
+    let to_host = |s: &String| -> Option<String> {
+        url::Url::parse(s)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .or_else(|| {
+                // Bare-host form (no scheme) — chrome's `link.href`
+                // usually resolves to absolute, but be defensive.
+                let trimmed = s.trim().trim_start_matches("//");
+                trimmed
+                    .split('/')
+                    .next()
+                    .filter(|h| !h.is_empty() && h.contains('.'))
+                    .map(str::to_string)
+            })
+    };
+    let declared: std::collections::HashSet<String> = raw
+        .preconnect
+        .iter()
+        .chain(raw.dns_prefetch.iter())
+        .filter_map(to_host)
+        .collect();
+
+    let gap: Vec<ResourceHintGap> = top_third_party_domains
+        .iter()
+        .filter(|d| d.bytes >= GAP_FLOOR_BYTES)
+        .filter(|d| !declared.contains(&d.host))
+        .map(|d| ResourceHintGap {
+            host: d.host.clone(),
+            bytes: d.bytes,
+            count: d.count,
+        })
+        .collect();
+
+    ResourceHints {
+        declared_preconnect: raw.preconnect,
+        declared_dns_prefetch: raw.dns_prefetch,
+        gap,
+    }
+}
+
+/// Walk `document.styleSheets` for `@font-face` rules + read the
+/// `document.fonts` FontFaceSet for counts. Two outputs the AI cares
+/// about most: distribution of `font-display` values, and the per-face
+/// "missing swap" list (FOIT risk — invisible-text-during-load).
+///
+/// CORS caveat: cross-origin stylesheets without `crossorigin` + CORS
+/// headers raise on `sheet.cssRules` access. We catch and increment
+/// `unreadable_stylesheets` so the audit is honest about its blind
+/// spots. Same-origin + properly-CORS'd third-party stylesheets work.
+///
+/// The `src` URL extraction is regex-based on the `src:` descriptor's
+/// string form because CSS Typed OM doesn't expose `format()` /
+/// `url()` cleanly. We take the first `url(...)` token only — most
+/// `@font-face` blocks list one URL + optional `local()` fallbacks
+/// and several format hints, but the first URL is the one the
+/// browser would actually fetch when the local fonts are absent.
+const FONT_AUDIT_JS: &str = r#"
+(function() {
+  const out = {
+    font_count: 0,
+    loaded_count: 0,
+    display_distribution: {},
+    missing_swap: [],
+    declared_preload_count: 0,
+    unreadable_stylesheets: 0,
+  };
+
+  // Walk every @font-face rule across all readable stylesheets.
+  // CSSFontFaceRule.style is a CSSStyleDeclaration; `font-display` may
+  // be missing (defaults to `auto` per CSS spec → FOIT risk).
+  const fontFaces = [];
+  for (const sheet of document.styleSheets) {
+    let rules;
+    try {
+      rules = sheet.cssRules;
+    } catch (e) {
+      // Cross-origin without CORS — the browser blocks rule access as
+      // a side-channel mitigation. Count and skip so the caller knows
+      // the audit isn't complete.
+      out.unreadable_stylesheets++;
+      continue;
+    }
+    if (!rules) continue;
+    for (const rule of rules) {
+      // CSSRule.FONT_FACE_RULE === 5 in the legacy enum; instanceof
+      // covers modern engines where the numeric type is deprecated.
+      const isFontFace =
+        (typeof CSSFontFaceRule !== 'undefined' && rule instanceof CSSFontFaceRule) ||
+        rule.type === 5;
+      if (!isFontFace) continue;
+      const style = rule.style;
+      // Strip wrapping quotes from family — declared as
+      //   font-family: 'Inter';
+      // the property value comes back as `'Inter'` literally.
+      const familyRaw = style.getPropertyValue('font-family') || '';
+      const family = familyRaw.replace(/^\s*['"]|['"]\s*$/g, '').trim();
+      const src = style.getPropertyValue('src') || '';
+      const display = (style.getPropertyValue('font-display') || '').trim();
+      fontFaces.push({ family, src, display });
+    }
+  }
+
+  // Tally `font-display` values + flag faces likely to cause FOIT.
+  // `swap` (text visible immediately with fallback, swap when ready)
+  // and `optional` (use only if cached) both avoid FOIT. `auto`
+  // (= the default) and `block` are the FOIT-prone cases. `fallback`
+  // has a 100ms invisible window — short but still a FOIT, flag it.
+  for (const ff of fontFaces) {
+    const d = ff.display || 'auto';
+    out.display_distribution[d] = (out.display_distribution[d] || 0) + 1;
+    if (d !== 'swap' && d !== 'optional') {
+      // Extract first url() from `src` — string parse rather than CSS
+      // Typed OM because the latter doesn't expose `format()` tokens.
+      let sourceUrl = null;
+      const m = ff.src.match(/url\(\s*['"]?([^'")]+)['"]?\s*\)/);
+      if (m && m[1]) {
+        try {
+          sourceUrl = new URL(m[1], document.baseURI).href;
+        } catch (e) {
+          sourceUrl = m[1];
+        }
+      }
+      out.missing_swap.push({
+        family: ff.family,
+        source_url: sourceUrl,
+        display: d || null,
+      });
+    }
+  }
+
+  // FontFaceSet counts. `document.fonts` iterates every FontFace the
+  // engine knows about (including the ones from @font-face above,
+  // plus any added programmatically via `document.fonts.add(...)`).
+  if (document.fonts) {
+    document.fonts.forEach((f) => {
+      out.font_count++;
+      if (f.status === 'loaded') out.loaded_count++;
+    });
+  }
+
+  // Preload coverage — single scalar count of `<link rel="preload"
+  // as="font">`. Per-font preload gap analysis is intentionally NOT
+  // done: preloading every font is itself an anti-pattern (eager
+  // render-blocking fetch), and the "preload only above-fold fonts"
+  // suggestion requires viewport text analysis. Keep this honest:
+  // tell the caller whether they bothered to preload anything,
+  // leave deciding which fonts deserve preload to the AI.
+  for (const link of document.head.querySelectorAll('link[rel="preload"][as="font"]')) {
+    if (!link.disabled && link.href) out.declared_preload_count++;
+  }
+
+  return out;
+})()
+"#;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawFontAudit {
+    font_count: u32,
+    loaded_count: u32,
+    display_distribution: HashMap<String, u32>,
+    missing_swap: Vec<FontIssue>,
+    declared_preload_count: u32,
+    unreadable_stylesheets: u32,
+}
+
+pub async fn collect_font_audit(page: &Page) -> Result<FontAudit, Error> {
+    let eval = page.evaluate(FONT_AUDIT_JS).await?;
+    let raw: RawFontAudit = eval
+        .into_value()
+        .map_err(|e| Error::Cdp(format!("font_audit decode: {e}")))?;
+    Ok(FontAudit {
+        font_count: raw.font_count,
+        loaded_count: raw.loaded_count,
+        display_distribution: raw.display_distribution,
+        missing_swap: raw.missing_swap,
+        declared_preload_count: raw.declared_preload_count,
+        unreadable_stylesheets: raw.unreadable_stylesheets,
+    })
+}
+
 /// Per-image sizing collector. Reads `naturalWidth/Height` (decoded pixel
 /// dimensions, populated by the browser as a side effect of decoding the
 /// image bytes — no extra IO on our side) and the laid-out display
@@ -673,6 +956,19 @@ const IMAGE_SIZING_JS: &str = r#"
     if (!loaded && loading !== 'lazy') continue;
     const inViewport =
       rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+    // Lighthouse "image" four-pack inputs — we capture presence of
+    // the relevant <img> attributes here, then the server-side
+    // enrichment buckets them into ImageAudit.
+    //   `width` / `height` attrs — when both are missing the image
+    //     contributes to CLS (browser can't reserve layout space
+    //     until decode). We check the IDL property `attributes` so a
+    //     CSS-set width counts as "no attribute" (it's what causes
+    //     CLS, not the visual size).
+    //   `srcset` — without it there's no responsive variant; the
+    //     same source ships to every viewport / DPR.
+    const hasWidthAttr = img.hasAttribute('width');
+    const hasHeightAttr = img.hasAttribute('height');
+    const hasSrcset = img.hasAttribute('srcset') && (img.srcset || '').trim().length > 0;
     out.push({
       url: img.currentSrc || img.src || '',
       natural_width: nw,
@@ -685,6 +981,9 @@ const IMAGE_SIZING_JS: &str = r#"
       decoding: img.decoding || 'auto',
       in_viewport: inViewport,
       alt_missing: !img.alt,
+      has_width_attr: hasWidthAttr,
+      has_height_attr: hasHeightAttr,
+      has_srcset: hasSrcset,
     });
   }
   return out;
@@ -704,7 +1003,11 @@ pub async fn collect_image_sizing(page: &Page) -> Result<Vec<ImageSizing>, Error
 /// intuitive reading.
 fn aggregate_cls_sources(vitals: &mut WebVitals) {
     use std::collections::HashMap;
-    let mut by_selector: HashMap<String, (f64, u32)> = HashMap::new();
+    // Per-selector accumulator: (total_shift, shift_count, max_distance_px).
+    // Max-distance is tracked so the AI can give concrete "reserve N px"
+    // suggestions instead of just "fix CLS" — the biggest single jump is
+    // the lower bound for `min-height` / layout reservation.
+    let mut by_selector: HashMap<String, (f64, u32, f64)> = HashMap::new();
 
     for entry in &vitals.cls_entries {
         if entry.sources.is_empty() {
@@ -713,9 +1016,12 @@ fn aggregate_cls_sources(vitals: &mut WebVitals) {
         let per_source = entry.value / entry.sources.len() as f64;
         for src in &entry.sources {
             let selector = format_cls_selector(src);
-            let agg = by_selector.entry(selector).or_insert((0.0, 0));
+            let agg = by_selector.entry(selector).or_insert((0.0, 0, 0.0));
             agg.0 += per_source;
             agg.1 += 1;
+            if src.distance_px > agg.2 {
+                agg.2 = src.distance_px;
+            }
         }
     }
 
@@ -723,12 +1029,15 @@ fn aggregate_cls_sources(vitals: &mut WebVitals) {
     let total_cls = if vitals.cls > 0.0 { vitals.cls } else { 1.0 };
     let mut sources: Vec<ClsTopSource> = by_selector
         .into_iter()
-        .map(|(selector, (total_shift, shift_count))| ClsTopSource {
-            selector,
-            total_shift,
-            fraction: total_shift / total_cls,
-            shift_count,
-        })
+        .map(
+            |(selector, (total_shift, shift_count, max_distance_px))| ClsTopSource {
+                selector,
+                total_shift,
+                fraction: total_shift / total_cls,
+                shift_count,
+                max_distance_px,
+            },
+        )
         .collect();
     sources.sort_by(|a, b| {
         b.total_shift
@@ -801,6 +1110,69 @@ fn aggregate_loaf(vitals: &mut WebVitals, raw: &[LoafRawEntry]) {
     vitals.loaf_top_offenders = offenders;
 }
 
+/// Aggregate raw longtask entries into the `WebVitals` summary. Groups by
+/// best-effort "source" (preferring `attribution[0].container_src`, else
+/// `attribution[0].container_name`, else the task's `name`) and returns
+/// the top 5 by `total_duration_ms` desc.
+///
+/// `PerformanceLongTaskTiming.attribution[].containerSrc` is informative
+/// for cross-frame longtasks (iframe URL) but typically empty for
+/// same-frame tasks. We capture both signals — the function name and
+/// the iframe URL — and degrade gracefully. The Long Animation Frame
+/// API (see `aggregate_loaf`) is more precise for same-frame attribution
+/// when available; longtask attribution is the broader-compat fallback.
+fn aggregate_long_tasks(vitals: &mut WebVitals, raw: &[LongTaskRawEntry]) {
+    use std::collections::HashMap;
+    if raw.is_empty() {
+        return;
+    }
+    let mut by_source: HashMap<String, LongTaskOffender> = HashMap::new();
+    for entry in raw {
+        // Pick the most actionable label available. Empty attribution
+        // (or all-empty fields) falls back to the task name; a final
+        // `"(same-page)"` keeps the bucket labeled even when every
+        // signal is empty (older Chromium, weird embedders).
+        let source = entry
+            .attribution
+            .iter()
+            .find_map(|a| {
+                if !a.container_src.is_empty() {
+                    Some(a.container_src.clone())
+                } else if !a.container_name.is_empty() {
+                    Some(a.container_name.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                if !entry.name.is_empty() {
+                    entry.name.clone()
+                } else {
+                    "(same-page)".to_string()
+                }
+            });
+        let agg = by_source
+            .entry(source.clone())
+            .or_insert_with(|| LongTaskOffender {
+                source,
+                ..Default::default()
+            });
+        agg.total_duration_ms += entry.duration;
+        if entry.duration > agg.max_duration_ms {
+            agg.max_duration_ms = entry.duration;
+        }
+        agg.task_count += 1;
+    }
+    let mut offenders: Vec<LongTaskOffender> = by_source.into_values().collect();
+    offenders.sort_by(|a, b| {
+        b.total_duration_ms
+            .partial_cmp(&a.total_duration_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    offenders.truncate(5);
+    vitals.long_task_top_offenders = offenders;
+}
+
 /// Server-side enrichment for `image_sizing` entries: join `transferred_bytes`
 /// from the captured `resources` (matched by URL) and compute `waste_ratio`.
 /// Then sort worst-waste-first with unknown ratios trailing for a useful
@@ -818,7 +1190,7 @@ fn aggregate_loaf(vitals: &mut WebVitals, raw: &[LoafRawEntry]) {
 /// dimension is 0 (not loaded / lazy off-screen). When the image is
 /// already at-size or under-size we emit `Some(0.0)` so callers can still
 /// filter on it.
-fn enrich_image_sizing(images: &mut [ImageSizing], resources: &[WebPageResource]) {
+fn enrich_image_sizing(images: &mut [ImageSizing], resources: &[WebPageResource]) -> ImageAudit {
     // Build URL → content_size map once. Resources can repeat (redirects),
     // last write wins which is fine — final response is what mattered.
     let mut bytes_by_url: HashMap<&str, u64> = HashMap::with_capacity(resources.len());
@@ -867,11 +1239,177 @@ fn enrich_image_sizing(images: &mut [ImageSizing], resources: &[WebPageResource]
         let br = b.waste_ratio.unwrap_or(-1.0);
         br.partial_cmp(&ar).unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    build_image_audit(images)
+}
+
+/// Build the Lighthouse-aligned "image" four-pack from already-enriched
+/// `ImageSizing` entries. Each list independently sorted + capped at 20.
+///
+/// Filters:
+/// - All categories skip the LCP / hero pre-image case (data: URLs, empty
+///   URLs) — they're not actionable as URL references.
+/// - `oversized` requires the natural-vs-effective-display ratio > 2.0.
+///   The 2× threshold (vs Lighthouse's stricter 1.0) suppresses the
+///   "off by a few percent at fractional DPR" noise.
+/// - `missing_dimensions` skips unloaded lazy images — natural size
+///   isn't known yet, and the fix (add width/height attrs) applies to
+///   them in the same way; we just list once they've loaded.
+/// - `missing_lazy` requires `in_viewport=false` AND `loading!="lazy"`.
+///   Above-the-fold images legitimately load eagerly.
+/// - `missing_srcset` lists every img without srcset over a minimal
+///   display-area floor (32×32) to suppress 1px tracking pixels.
+fn build_image_audit(images: &[ImageSizing]) -> ImageAudit {
+    let mut oversized: Vec<ImageIssue> = Vec::new();
+    let mut missing_dimensions: Vec<ImageIssue> = Vec::new();
+    let mut missing_lazy: Vec<ImageIssue> = Vec::new();
+    let mut missing_srcset: Vec<ImageIssue> = Vec::new();
+
+    const SRCSET_AREA_FLOOR: u32 = 32 * 32;
+
+    for img in images.iter() {
+        if img.url.is_empty() || img.url.starts_with("data:") {
+            continue;
+        }
+        let dpr = if img.device_pixel_ratio > 0.0 {
+            img.device_pixel_ratio
+        } else {
+            1.0
+        };
+        let np = (img.natural_width as f64) * (img.natural_height as f64);
+        let dp = (img.display_width as f64 * dpr) * (img.display_height as f64 * dpr);
+        let oversize_ratio = if dp > 0.0 && np > 0.0 { np / dp } else { 0.0 };
+        let display_area = img.display_width.saturating_mul(img.display_height);
+
+        if oversize_ratio > 2.0 {
+            oversized.push(ImageIssue {
+                url: img.url.clone(),
+                display_width: img.display_width,
+                display_height: img.display_height,
+                in_viewport: img.in_viewport,
+                ratio: oversize_ratio,
+            });
+        }
+        if img.loaded && !(img.has_width_attr && img.has_height_attr) && display_area > 0 {
+            missing_dimensions.push(ImageIssue {
+                url: img.url.clone(),
+                display_width: img.display_width,
+                display_height: img.display_height,
+                in_viewport: img.in_viewport,
+                ratio: 0.0,
+            });
+        }
+        if !img.in_viewport && img.loading != "lazy" {
+            missing_lazy.push(ImageIssue {
+                url: img.url.clone(),
+                display_width: img.display_width,
+                display_height: img.display_height,
+                in_viewport: false,
+                ratio: 0.0,
+            });
+        }
+        if !img.has_srcset && display_area >= SRCSET_AREA_FLOOR {
+            missing_srcset.push(ImageIssue {
+                url: img.url.clone(),
+                display_width: img.display_width,
+                display_height: img.display_height,
+                in_viewport: img.in_viewport,
+                ratio: 0.0,
+            });
+        }
+    }
+
+    // `oversized` ranks by ratio desc — biggest waste first.
+    oversized.sort_by(|a, b| {
+        b.ratio
+            .partial_cmp(&a.ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    oversized.truncate(20);
+    // Other lists rank by display area desc — bigger images cost more
+    // to fix in shifted layout / fetched bytes / wrong-sized decode.
+    let area_desc = |a: &ImageIssue, b: &ImageIssue| {
+        let aa = (b.display_width as u64).saturating_mul(b.display_height as u64);
+        let bb = (a.display_width as u64).saturating_mul(a.display_height as u64);
+        aa.cmp(&bb)
+    };
+    missing_dimensions.sort_by(area_desc);
+    missing_dimensions.truncate(20);
+    missing_lazy.sort_by(area_desc);
+    missing_lazy.truncate(20);
+    missing_srcset.sort_by(area_desc);
+    missing_srcset.truncate(20);
+
+    ImageAudit {
+        oversized,
+        missing_dimensions,
+        missing_lazy,
+        missing_srcset,
+    }
 }
 
 /// Aggregate `resources` into comparable scalars. Pure derive — no browser
 /// interaction. MIME mapped to a small bucket set for stable bucket names
 /// across deploys.
+/// Parse `max-age=N` out of a `Cache-Control` header. Returns the
+/// numeric value when found (clamped to u32; values like `0` and
+/// `no-cache` legitimately mean "must revalidate" and are returned
+/// as `Some(0)`). Returns `None` when no `max-age` directive is
+/// present, when the value is malformed, or when an `s-maxage`-only
+/// header was supplied (shared-cache only — irrelevant to browser
+/// caching). Case-insensitive. Whitespace-tolerant around `=`.
+fn parse_max_age(cache_control: &str) -> Option<u32> {
+    for token in cache_control.split(',') {
+        let t = token.trim();
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("max-age") {
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix('=')?.trim_start();
+            return rest
+                .parse::<u64>()
+                .ok()
+                .map(|v| v.min(u32::MAX as u64) as u32);
+        }
+    }
+    None
+}
+
+/// True when the URL path looks fingerprinted — i.e. contains a
+/// hex token of length ≥ 8 (typical webpack / vite / rollup output:
+/// `app.4f7c2a91.js`, `main-9d3b8e2f.css`, `chunk.a1b2c3d4e5f6.js`).
+/// Length ≥ 8 dodges short hex words like `cafe` or `dead` that
+/// might legitimately appear in non-versioned URLs. We scan the
+/// *path* segments of the URL (so query strings and host don't
+/// confuse the detector) and require the hex run to be flanked by
+/// non-hex characters so the path itself doesn't need to be all hex.
+fn is_hashed_url_path(parsed: &url::Url) -> bool {
+    let path = parsed.path();
+    let bytes = path.as_bytes();
+    let is_hex =
+        |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b);
+    let mut run: usize = 0;
+    for &b in bytes {
+        if is_hex(b) {
+            run += 1;
+            if run >= 8 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// True iff the MIME bucket represents a static asset whose cache
+/// policy should be tightly controlled (long max-age, `immutable`
+/// for hashed URLs). HTML / JSON / XHR / generic "other" all
+/// legitimately use short or no-store policies and are excluded so
+/// `cache_policy_issues` stays signal-only.
+fn is_static_asset_bucket(bucket: &str) -> bool {
+    matches!(bucket, "javascript" | "css" | "image" | "font")
+}
+
 fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> ResourceSummary {
     let target_host = url::Url::parse(target_url)
         .ok()
@@ -1042,6 +1580,134 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
     summary.duplicate_resources = build_duplicate_resources(resources);
     summary.mixed_content = build_mixed_content(resources, target_url);
     summary.max_initiator_chain_depth = compute_initiator_chain_depth(resources);
+
+    // Top-N largest resources per static-asset MIME bucket. Restricted
+    // to JS / CSS / image / font — the four types where "this one file
+    // is huge" is directly actionable. Skip `from_cache=true` AND
+    // `content_size=0` (cache hits with no real size) to avoid noise.
+    // Each bucket capped at 5 to keep the JSON / markdown compact.
+    {
+        let mut by_bucket: HashMap<&'static str, Vec<&WebPageResource>> = HashMap::new();
+        for r in resources {
+            let bucket = mime_bucket(&r.mime_type);
+            let bucket_static: &'static str = match bucket {
+                "javascript" => "javascript",
+                "css" => "css",
+                "image" => "image",
+                "font" => "font",
+                _ => continue,
+            };
+            // Skip cache-hits with zero bytes — they convey no size info.
+            if r.from_cache && r.content_size == 0 {
+                continue;
+            }
+            by_bucket.entry(bucket_static).or_default().push(r);
+        }
+        for (bucket, mut group) in by_bucket {
+            group.sort_by_key(|r| std::cmp::Reverse(r.content_size));
+            let top: Vec<LargestResource> = group
+                .into_iter()
+                .take(5)
+                .map(|r| LargestResource {
+                    url: r.url.clone(),
+                    bytes: r.content_size,
+                    mime_type: r.mime_type.clone(),
+                    from_cache: r.from_cache,
+                })
+                .collect();
+            if !top.is_empty() {
+                summary.top_largest_by_type.insert(bucket.to_string(), top);
+            }
+        }
+    }
+
+    // Uncompressed text resources — the offender list. Already counted
+    // by the scalar pair `uncompressed_text_count` / `_bytes`; this
+    // surfaces the specific URLs. Filter mirrors the scalar derive:
+    // real-network responses only (cache hits never paid wire cost),
+    // text-compressible MIME types, no `Content-Encoding`. Floor at
+    // 1KB to avoid noise from tiny placeholders.
+    {
+        let mut candidates: Vec<UncompressedResource> = resources
+            .iter()
+            .filter(|r| {
+                !r.from_cache
+                    && r.content_encoding.is_none()
+                    && is_text_compressible(&r.mime_type)
+                    && r.content_size >= 1024
+            })
+            .map(|r| UncompressedResource {
+                url: r.url.clone(),
+                mime_type: r.mime_type.clone(),
+                bytes: r.content_size,
+            })
+            .collect();
+        candidates.sort_by_key(|e| std::cmp::Reverse(e.bytes));
+        candidates.truncate(20);
+        summary.uncompressed_text_resources = candidates;
+    }
+
+    // Cache-policy anti-patterns on static assets. Two reason codes:
+    //   `short_max_age` — `max-age` parsed below 60s on JS/CSS/img/font.
+    //   `missing_immutable` — fingerprinted URL with cache-control set
+    //     but missing the `immutable` directive (each hard refresh
+    //     triggers a revalidation round-trip that could be skipped).
+    // Cap at 20 worst entries (by raw content_size desc — biggest waste
+    // first). HTML / JSON / API responses excluded — their headers
+    // reflect business rules, not asset misconfig.
+    {
+        let mut findings: Vec<(u64, CachePolicyIssue)> = Vec::new();
+        for r in resources {
+            let bucket = mime_bucket(&r.mime_type);
+            if !is_static_asset_bucket(bucket) {
+                continue;
+            }
+            let Some(cc) = r.cache_control.as_deref() else {
+                continue;
+            };
+            let cc_lower = cc.to_ascii_lowercase();
+            // Skip explicit no-store / no-cache — those declare a
+            // policy and aren't an oversight (rare on static assets,
+            // but valid for one-off cache busters).
+            if cc_lower.contains("no-store") || cc_lower.contains("no-cache") {
+                continue;
+            }
+            if let Some(max_age) = parse_max_age(cc)
+                && max_age < 60
+            {
+                findings.push((
+                    r.content_size,
+                    CachePolicyIssue {
+                        url: r.url.clone(),
+                        mime_type: r.mime_type.clone(),
+                        cache_control: cc.to_string(),
+                        reason: "short_max_age".to_string(),
+                    },
+                ));
+                continue;
+            }
+            // Missing-immutable check — only for fingerprinted URLs
+            // (otherwise `immutable` would be unsafe). The parsed_url
+            // cache means no extra Url::parse cost here.
+            if let Some(parsed) = r.parsed_url.as_ref()
+                && is_hashed_url_path(parsed)
+                && !cc_lower.contains("immutable")
+            {
+                findings.push((
+                    r.content_size,
+                    CachePolicyIssue {
+                        url: r.url.clone(),
+                        mime_type: r.mime_type.clone(),
+                        cache_control: cc.to_string(),
+                        reason: "missing_immutable".to_string(),
+                    },
+                ));
+            }
+        }
+        findings.sort_by_key(|(sz, _)| std::cmp::Reverse(*sz));
+        findings.truncate(20);
+        summary.cache_policy_issues = findings.into_iter().map(|(_, e)| e).collect();
+    }
 
     summary
 }
@@ -1334,16 +2000,37 @@ const WEB_VITALS_SETUP_JS: &str = r#"
           const node = e.element;
           if (node && node.nodeType === 1) {
             const desc = describeNode(node);
-            // Image-like: prefer currentSrc, fall back to src attr.
+            // Image-like: prefer currentSrc, fall back to src / poster.
             const isImg = desc.tag === 'img' || desc.tag === 'video';
-            const url = isImg ? (node.currentSrc || node.src || null) : null;
+            const url = isImg
+              ? (node.currentSrc || node.src || node.poster || e.url || null)
+              : null;
             // Text-like: snapshot first 120 chars.
             const text = !isImg
               ? (node.textContent || '').trim().slice(0, 120) || null
               : null;
+            // Image natural dimensions (decoded pixel size). Lets the AI
+            // detect "image is N× the display size" without a separate
+            // image_sizing fetch. `videoWidth`/`videoHeight` for <video>.
+            let nw = 0, nh = 0;
+            if (desc.tag === 'img') {
+              nw = node.naturalWidth | 0; nh = node.naturalHeight | 0;
+            } else if (desc.tag === 'video') {
+              nw = node.videoWidth | 0; nh = node.videoHeight | 0;
+            }
             window.__web_vitals.lcp_element = {
               tag: desc.tag, id: desc.id, class: desc.class,
               url: url, text_preview: text,
+              // Computed area of the LCP candidate in CSS px². Always set.
+              size: e.size || 0,
+              // For images: when the resource finished loading
+              // (ms from nav start). `0` for text LCP candidates.
+              load_time: e.loadTime || 0,
+              // When the element was actually painted. May be `0` on
+              // cross-origin images without `Timing-Allow-Origin` —
+              // browser hides exact paint time as a side-channel guard.
+              render_time: e.renderTime || 0,
+              natural_width: nw, natural_height: nh,
             };
           }
         }
@@ -1356,8 +2043,31 @@ const WEB_VITALS_SETUP_JS: &str = r#"
         if (e.hadRecentInput) continue;
         window.__web_vitals.cls += e.value;
         if (window.__web_vitals.cls_entries.length < MAX_CLS_ENTRIES) {
+          // Each source carries `previousRect` / `currentRect` (DOMRectReadOnly).
+          // Capture both so the server can compute Euclidean movement
+          // distance and AI can suggest concrete fixes ("reserve 240px
+          // for #promo-banner" rather than just "fix CLS").
           const sources = (e.sources || [])
-            .map((s) => describeNode(s.node))
+            .map((s) => {
+              const node = describeNode(s.node);
+              if (!node) return null;
+              const pr = s.previousRect || {};
+              const cr = s.currentRect || {};
+              const dx = (cr.x || 0) - (pr.x || 0);
+              const dy = (cr.y || 0) - (pr.y || 0);
+              return {
+                tag: node.tag, id: node.id, class: node.class,
+                previous_rect: {
+                  x: pr.x || 0, y: pr.y || 0,
+                  width: pr.width || 0, height: pr.height || 0,
+                },
+                current_rect: {
+                  x: cr.x || 0, y: cr.y || 0,
+                  width: cr.width || 0, height: cr.height || 0,
+                },
+                distance_px: Math.sqrt(dx * dx + dy * dy),
+              };
+            })
             .filter((x) => x !== null);
           window.__web_vitals.cls_entries.push({
             time_ms: e.startTime,
@@ -1368,11 +2078,35 @@ const WEB_VITALS_SETUP_JS: &str = r#"
       }
     }).observe({ type: 'layout-shift', buffered: true });
   } catch (e) {}
+  // Long Task entries — also fed into the TBT scalar above. We keep a
+  // capped list of per-task records (start / duration / attribution) so
+  // the server can aggregate top offending sources. Attribution comes
+  // from `PerformanceLongTaskTiming.attribution[]`, which lists the
+  // containing frame / object. `containerSrc` is most useful for
+  // cross-frame tasks (iframe src) — for same-frame work the field is
+  // usually empty and `entry.name` (`"self"` etc.) carries the only
+  // signal. We capture both; server-side aggregator falls back gracefully.
+  window.__web_vitals.long_task_entries = [];
+  const MAX_LONGTASKS = 100;
   try {
     new PerformanceObserver((list) => {
       for (const e of list.getEntries()) {
         if (e.duration > 50) window.__web_vitals.tbt += e.duration - 50;
         window.__web_vitals.long_tasks++;
+        if (window.__web_vitals.long_task_entries.length < MAX_LONGTASKS) {
+          const attribution = (e.attribution || []).map((a) => ({
+            container_type: a.containerType || '',
+            container_src: a.containerSrc || '',
+            container_id: a.containerId || '',
+            container_name: a.containerName || '',
+          }));
+          window.__web_vitals.long_task_entries.push({
+            name: e.name || '',
+            start_time: e.startTime,
+            duration: e.duration,
+            attribution: attribution,
+          });
+        }
       }
     }).observe({ type: 'longtask', buffered: true });
   } catch (e) {}
@@ -1428,16 +2162,73 @@ const WEB_VITALS_SETUP_JS: &str = r#"
       }
     }).observe({ type: 'long-animation-frame', buffered: true });
   } catch (e) {}
+  // FPS — rAF-driven frame counter. Streaming aggregation so memory
+  // stays constant regardless of observation window length. Caveats:
+  //   1. The rAF loop itself drives frame production. A page with no
+  //      animation would normally be idle (compositor stopped); our
+  //      loop forces ~60fps even then. So `avg_fps` on a static page
+  //      reads near-target, not zero — meaningful for animation /
+  //      scroll-heavy pages but biased high on static ones.
+  //   2. The most actionable signals are `jank_ratio` (frames slower
+  //      than 16.67ms) and `longest_frame_ms` — those reflect main-
+  //      thread blocking regardless of why the loop is running.
+  //   3. In headless / VM: software rasterization → numbers are not
+  //      comparable to user-device measurements, but consistent for
+  //      regression detection on the same harness.
+  window.__web_vitals.fps_frames = 0;
+  window.__web_vitals.fps_jank = 0;
+  window.__web_vitals.fps_longest_ms = 0;
+  window.__web_vitals.fps_first_ts = 0;
+  window.__web_vitals.fps_last_ts = 0;
+  const FPS_JANK_THRESHOLD_MS = 1000 / 60;  // 16.67ms — 60fps target
+  let __wv_prev_frame_ts = 0;
+  function __wv_fps_tick(ts) {
+    if (__wv_prev_frame_ts > 0) {
+      const dt = ts - __wv_prev_frame_ts;
+      window.__web_vitals.fps_frames++;
+      if (dt > FPS_JANK_THRESHOLD_MS) window.__web_vitals.fps_jank++;
+      if (dt > window.__web_vitals.fps_longest_ms) {
+        window.__web_vitals.fps_longest_ms = dt;
+      }
+      if (window.__web_vitals.fps_first_ts === 0) {
+        window.__web_vitals.fps_first_ts = __wv_prev_frame_ts;
+      }
+      window.__web_vitals.fps_last_ts = ts;
+    }
+    __wv_prev_frame_ts = ts;
+    requestAnimationFrame(__wv_fps_tick);
+  }
+  requestAnimationFrame(__wv_fps_tick);
 })();
 "#;
 
-/// Read accumulated `window.__web_vitals` and enrich with TTFB from
-/// Navigation Timing API.
+/// Read accumulated `window.__web_vitals`, enrich with TTFB from the
+/// Navigation Timing API, and derive FPS scalars from the raw frame
+/// counters maintained by the rAF loop.
 const WEB_VITALS_READ_JS: &str = r#"
 (function() {
   const v = window.__web_vitals || { lcp: 0, cls: 0, tbt: 0, ttfb: 0, long_tasks: 0 };
   const nav = performance.getEntriesByType('navigation')[0];
   if (nav) v.ttfb = nav.responseStart;
+  // FPS derivation. Compute window from the first vs last frame's
+  // timestamps, so we measure during the period frames were actually
+  // observed (not from page nav, which would skew avg with the lead-in
+  // before the first rAF callback fires).
+  const fpsFrames = v.fps_frames || 0;
+  const fpsJank = v.fps_jank || 0;
+  const fpsLongest = v.fps_longest_ms || 0;
+  const fpsWindowMs = (v.fps_last_ts || 0) - (v.fps_first_ts || 0);
+  v.fps_frame_count = fpsFrames;
+  v.fps_avg = fpsWindowMs > 0 ? (fpsFrames * 1000 / fpsWindowMs) : 0;
+  v.fps_jank_ratio = fpsFrames > 0 ? (fpsJank / fpsFrames) : 0;
+  v.fps_longest_frame_ms = fpsLongest;
+  // Strip the raw counters — the public shape only carries the four
+  // derived scalars above. Keeps the JSON envelope tight.
+  delete v.fps_frames;
+  delete v.fps_jank;
+  delete v.fps_longest_ms;
+  delete v.fps_first_ts;
+  delete v.fps_last_ts;
   return v;
 })()
 "#;
@@ -1753,9 +2544,16 @@ pub async fn apply_user_agent(
     accept_language: Option<&str>,
     default_user_agent: &str,
 ) -> Result<(), Error> {
-    if user_agent.is_none() && accept_language.is_none() {
-        return Ok(());
-    }
+    // Always apply — even when the caller didn't override anything —
+    // because the `default_user_agent` we hold (see `DEFAULT_USER_AGENT`)
+    // is a WAF-safe pinned string that intentionally differs from the
+    // raw Chromium binary UA (which contains `HeadlessChrome` and trips
+    // most production WAFs). Skipping the CDP call here would leave the
+    // page on the raw binary UA, defeating the whole point.
+    //
+    // Cost: one extra `Network.setUserAgentOverride` CDP RTT per page
+    // when both fields are absent (~5ms over local loopback, absorbed
+    // into the parallel apply-stage `try_join!`). Cheap insurance.
     let ua = user_agent
         .map(String::from)
         .unwrap_or_else(|| default_user_agent.to_string());
@@ -2064,6 +2862,19 @@ pub struct WebPageStat {
     /// `SummaryRequest.image_sizing = true`. Sorted by `waste_ratio` desc
     /// (worst offenders first), with unknown ratios trailing.
     pub image_sizing: Option<Vec<ImageSizing>>,
+    /// Image-audit roll-up — Lighthouse-aligned "image" four-pack:
+    /// `oversized` (natural / effective-display > 2×), `missing_dimensions`
+    /// (no `width`/`height` attr → CLS), `missing_lazy` (below-the-fold
+    /// fetched eagerly), `missing_srcset` (no responsive variants).
+    /// Populated alongside `image_sizing` (derived from the same data,
+    /// no extra browser interaction). `None` when `image_sizing` is off.
+    pub image_audit: Option<ImageAudit>,
+    /// Font-loading audit: `font-display` distribution, FOIT-risk
+    /// `@font-face` list, preload coverage scalar, CORS blind-spot count.
+    /// Populated only when `SummaryRequest.font_audit = true` (OR-merged
+    /// with `all_metrics`). One extra `page.evaluate` over CSSOM (~3–8ms
+    /// depending on stylesheet count).
+    pub font_audit: Option<FontAudit>,
     /// DOM mutation hotspot summary captured via pre-navigation
     /// `MutationObserver`. Populated only when
     /// `SummaryRequest.dom_mutations = true`. Useful for diagnosing
@@ -2498,6 +3309,24 @@ pub struct ImageSizing {
     pub in_viewport: bool,
     /// True when `<img>` has no `alt` attribute — quick a11y signal.
     pub alt_missing: bool,
+    /// True iff the `<img>` tag has a literal `width="..."` attribute
+    /// (CSS-set width does NOT count). Missing both `width` and
+    /// `height` attrs is what causes CLS — the browser can't reserve
+    /// layout space until the bytes decode.
+    #[serde(default)]
+    pub has_width_attr: bool,
+    #[serde(default)]
+    pub has_height_attr: bool,
+    /// True iff the `<img>` carries a non-empty `srcset` attribute.
+    /// Missing srcset = no responsive variants, same source ships to
+    /// every viewport / DPR. The `<picture>` parent's source-set
+    /// counts: when a `<picture>` wraps the img, the browser writes
+    /// the chosen candidate's URL back to `img.currentSrc` and we
+    /// see `srcset` on the `<source>` not the `<img>` — that case
+    /// is correctly handled by Chrome populating srcset on the
+    /// inner img too in the "no picture, no srcset attr" sense.
+    #[serde(default)]
+    pub has_srcset: bool,
     /// Bytes actually downloaded for `url`, joined from the `resources` map
     /// server-side. `None` when no matching resource entry exists (data:
     /// URLs, cached without a fresh request, cross-context).
@@ -2507,6 +3336,122 @@ pub struct ImageSizing {
     /// the image is using device-pixel scaling that makes the ratio
     /// misleading (DPR > 1 with reasonable oversize).
     pub waste_ratio: Option<f64>,
+}
+
+/// Image-audit roll-up. Lighthouse-aligned "image" four-pack — each
+/// list maps directly to one AI suggestion. Populated only when
+/// `SummaryRequest.image_sizing = true`; derived from the same
+/// `image_sizing` data so there's no extra browser interaction.
+/// All four lists capped at 20 entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageAudit {
+    /// Natural pixels / effective display pixels (display × DPR) > 2.0.
+    /// The browser decoded much more than it needed to draw. Sorted by
+    /// `ratio` desc so the worst offenders surface first. AI suggestion:
+    /// "serve a smaller variant" / "add `srcset`".
+    pub oversized: Vec<ImageIssue>,
+    /// `<img>` without BOTH `width` AND `height` attributes set on the
+    /// tag. CLS contributor. Sorted by display area desc — larger
+    /// missing-dimensions images cause bigger shifts. AI suggestion:
+    /// "set explicit width/height to reserve layout space".
+    pub missing_dimensions: Vec<ImageIssue>,
+    /// Below-the-fold images (`in_viewport=false`) fetched eagerly —
+    /// `loading != "lazy"`. Wasted bytes during initial load. Sorted
+    /// by display area desc as a proxy for "how much they cost to
+    /// fetch and decode". AI suggestion: `loading="lazy"`.
+    pub missing_lazy: Vec<ImageIssue>,
+    /// `<img>` without `srcset`. No responsive variants. Sorted by
+    /// display area desc — larger images benefit most from
+    /// device-tailored variants. AI suggestion: add `srcset` (and
+    /// `sizes` for art direction).
+    pub missing_srcset: Vec<ImageIssue>,
+}
+
+/// One image-audit entry. Compact subset of `ImageSizing` carrying
+/// just the fields needed to triage the issue.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageIssue {
+    pub url: String,
+    /// Display size in CSS pixels (what the user actually sees).
+    pub display_width: u32,
+    pub display_height: u32,
+    /// True if any part of the image overlaps the initial viewport.
+    /// Above-the-fold issues matter more than below-the-fold.
+    pub in_viewport: bool,
+    /// Issue-specific numeric. For `oversized`: natural / effective-
+    /// display ratio (always > 2.0 when listed here, so the AI can
+    /// say "image is 3.4× the display size"). For other categories:
+    /// `0.0` (the issue is categorical — the URL is the answer).
+    pub ratio: f64,
+}
+
+/// Font-loading audit. Walks `@font-face` rules across all readable
+/// stylesheets and the `document.fonts` FontFaceSet to surface the
+/// signal AI optimisation cares about most:
+/// **which fonts will cause FOIT** (Flash of Invisible Text — the
+/// "blank text for 3 seconds during load" UX bug). Populated only
+/// when `SummaryRequest.font_audit = true` (OR-merged with
+/// `all_metrics`).
+///
+/// **CORS blind spot**: cross-origin stylesheets without
+/// `crossorigin` + matching CORS headers raise on `cssRules` access.
+/// `unreadable_stylesheets` is non-zero when the audit was incomplete;
+/// treat the rest of the data as "of what's visible".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FontAudit {
+    /// Total number of FontFace entries the browser knows about
+    /// (`document.fonts.size`). Includes both `@font-face`-declared
+    /// fonts and any added programmatically via `document.fonts.add`.
+    pub font_count: u32,
+    /// Of `font_count`, how many reached `status === "loaded"` by
+    /// the time the audit ran. Unloaded ones may still be in flight
+    /// (lazy fonts not yet used) — not necessarily an error.
+    pub loaded_count: u32,
+    /// Distribution of `font-display` descriptor values across all
+    /// observed `@font-face` rules. Keys: `"auto"` / `"swap"` /
+    /// `"block"` / `"fallback"` / `"optional"`. Missing
+    /// `font-display` defaults to `"auto"` per CSS spec. A healthy
+    /// page has `swap` dominating.
+    pub display_distribution: HashMap<String, u32>,
+    /// `@font-face` declarations with `font-display` set to anything
+    /// other than `swap` / `optional` — i.e. likely to cause FOIT.
+    /// Each entry names the family + resolved source URL so the AI
+    /// can suggest the literal fix (`font-display: swap;`).
+    pub missing_swap: Vec<FontIssue>,
+    /// Count of `<link rel="preload" as="font">` declarations in
+    /// `<head>`. Single scalar — per-font preload gap analysis
+    /// would require above-the-fold font usage detection and is
+    /// **intentionally not done** (preloading every font is itself
+    /// an anti-pattern). Tells "did you bother to preload any
+    /// fonts at all" — `0` is the common case and is itself a
+    /// finding when the page uses critical web fonts.
+    pub declared_preload_count: u32,
+    /// Count of stylesheets the audit could NOT read due to CORS.
+    /// Non-zero means the rest of the data is incomplete — the
+    /// page's third-party fonts (Google Fonts, Adobe Fonts, etc.)
+    /// often live in cross-origin sheets without the `crossorigin`
+    /// attribute set on `<link>`. AI suggestion: "add `crossorigin`
+    /// to the `<link>` so the audit can see your font config".
+    pub unreadable_stylesheets: u32,
+}
+
+/// One `@font-face` finding in `FontAudit.missing_swap`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FontIssue {
+    /// CSS font-family name from the `@font-face` block (quotes
+    /// stripped). Empty when the declaration was malformed.
+    pub family: String,
+    /// Resolved absolute URL of the first `url(...)` in the `src:`
+    /// descriptor — what the browser would actually fetch when
+    /// local fallbacks miss. `None` when only `local()` sources
+    /// were declared, or `src:` couldn't be parsed.
+    pub source_url: Option<String>,
+    /// Current `font-display` value verbatim from the declaration.
+    /// `None` when the descriptor was absent — defaults to `"auto"`
+    /// per CSS spec, which is what `missing_swap` would have been
+    /// keyed off. The AI suggestion is the same either way:
+    /// `font-display: swap;`.
+    pub display: Option<String>,
 }
 
 /// Comparison-friendly aggregates over `resources`. All counts/bytes are
@@ -2620,6 +3565,40 @@ pub struct ResourceSummary {
     /// data isn't captured); `Some(0)` when every resource was
     /// initiated by the parser at depth 1 (flat dependency graph).
     pub max_initiator_chain_depth: Option<u32>,
+    /// Per-MIME-bucket "top largest resources" ranking. Keys are the
+    /// same MIME buckets used in `bytes_by_type` but restricted to the
+    /// four optimisation-relevant types: `"javascript"`, `"css"`,
+    /// `"image"`, `"font"`. Each Vec is sorted by `bytes` desc and
+    /// capped at 5 entries. Empty map when no resources matched any
+    /// of those types.
+    pub top_largest_by_type: HashMap<String, Vec<LargestResource>>,
+    /// Compressible-text resources served WITHOUT `Content-Encoding`,
+    /// the actual offender list (vs. the existing
+    /// `uncompressed_text_count` / `_bytes` scalars). Sorted by `bytes`
+    /// desc, capped at 20 — pins down which files to fix first.
+    pub uncompressed_text_resources: Vec<UncompressedResource>,
+    /// Cache-policy anti-patterns on **static assets only** (JS / CSS /
+    /// image / font). Two reason codes:
+    ///
+    /// - `"short_max_age"` — `max-age` parsed below 60s on a static
+    ///   asset. Usually a deploy-time misconfiguration; static files
+    ///   should ship `max-age` in the hours-to-year range.
+    /// - `"missing_immutable"` — URL looks fingerprinted (contains a
+    ///   `[a-f0-9]{8,}` token) AND `Cache-Control` is present but
+    ///   missing the `immutable` directive. Without `immutable`,
+    ///   browsers still revalidate on hard refresh — pure waste.
+    ///
+    /// Capped at 20 entries (worst-first). HTML / JSON / API responses
+    /// are excluded — their cache headers reflect business rules,
+    /// not asset misconfiguration.
+    pub cache_policy_issues: Vec<CachePolicyIssue>,
+    /// Resource-hint audit (preconnect / dns-prefetch gaps vs the hot
+    /// third-party hosts the page actually fetched from). `None` when
+    /// the caller didn't request `resource_hints` (no head scrape
+    /// performed); `Some(_)` otherwise — `declared_*` and `gap` may
+    /// still be empty if the page either declares no hints or every
+    /// hot third party is already covered.
+    pub resource_hints: Option<ResourceHints>,
 }
 
 /// Mixed-content finding — HTTPS pages must not fetch sub-resources
@@ -2654,6 +3633,85 @@ pub struct MixedContentResource {
 /// Per-host byte/count tuple for the `top_third_party_domains` ranking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DomainBytes {
+    pub host: String,
+    pub bytes: u64,
+    pub count: u32,
+}
+
+/// One entry of the per-type "largest resources" ranking. Used by
+/// `ResourceSummary.top_largest_by_type` to surface, for each MIME
+/// bucket (`javascript` / `css` / `image` / `font`), the few biggest
+/// individual files. AI can use these as targeted "split this bundle"
+/// or "compress this image" suggestions without having to scan the
+/// full `resources[]` list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LargestResource {
+    pub url: String,
+    pub bytes: u64,
+    pub mime_type: String,
+    /// True if this entry was served from cache (`content_size` came from
+    /// the cached response — no fresh wire transfer). Cached copies are
+    /// still listed because they reflect what the page actually loaded;
+    /// callers who want "wasted bandwidth" should filter by `!from_cache`.
+    pub from_cache: bool,
+}
+
+/// One entry of the "compressible text resource served uncompressed"
+/// list. `ResourceSummary` already exposes the count + total bytes for
+/// the cohort; this list pins down *which* files to fix first (sorted
+/// by size desc, top 20). MIME filter follows `is_text_compressible`
+/// so binary types (images / video / fonts / wasm) never appear.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UncompressedResource {
+    pub url: String,
+    pub mime_type: String,
+    pub bytes: u64,
+}
+
+/// One cache-policy finding. Detected against static-asset MIME types
+/// (JS / CSS / image / font) only; HTML / JSON / XHR endpoints have
+/// legitimate reasons to use `no-store` / short max-age and are
+/// excluded so the list stays actionable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachePolicyIssue {
+    pub url: String,
+    pub mime_type: String,
+    /// Verbatim `Cache-Control` header — useful when the issue is
+    /// `missing_immutable` (so the AI can suggest the augmented value).
+    pub cache_control: String,
+    /// Short tag — `"short_max_age"` (max-age < 60s on a static asset)
+    /// or `"missing_immutable"` (hashed/fingerprinted URL without the
+    /// `immutable` directive — every revalidation is pure waste).
+    pub reason: String,
+}
+
+/// Resource-hint audit. Compares the page's declared
+/// `<link rel="preconnect">` / `<link rel="dns-prefetch">` hints
+/// against the set of third-party origins actually hit during load.
+/// Always populated when `resource_hints=true` (or when subsumed by
+/// `all_metrics=true`); the `declared_*` lists may be empty if the
+/// page declared no hints, and `gap` may be empty if every hot
+/// third party is already covered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceHints {
+    /// Origins (or hosts, for dns-prefetch) the page explicitly
+    /// declared via `<link rel="preconnect">`. Stored as the link's
+    /// `href` resolved — typically `https://example.com`.
+    pub declared_preconnect: Vec<String>,
+    /// Origins (or hosts) declared via `<link rel="dns-prefetch">`.
+    /// These only resolve DNS, not connection setup; useful but
+    /// strictly weaker than preconnect.
+    pub declared_dns_prefetch: Vec<String>,
+    /// Third-party hosts that were actually loaded with non-trivial
+    /// bytes but have neither a preconnect nor a dns-prefetch hint.
+    /// Each gap = one DNS lookup + TLS handshake of pure latency
+    /// (typically 100-300ms on a cold connection). Ranked by bytes
+    /// desc so the highest-impact fix surfaces first.
+    pub gap: Vec<ResourceHintGap>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceHintGap {
     pub host: String,
     pub bytes: u64,
     pub count: u32,
@@ -2817,6 +3875,58 @@ pub struct WebVitals {
     /// scripts (LoAF API unsupported on older Chromium).
     #[serde(default)]
     pub loaf_top_offenders: Vec<LoafOffender>,
+    /// Server-side aggregated top offending longtask sources, grouped
+    /// from `PerformanceLongTaskTiming.attribution[].container_src`
+    /// (or `container_name` / task name when src is empty). Up to 5
+    /// entries, ranked desc by `total_duration_ms`. Lets the AI say
+    /// "3 longtasks, 800ms total, all from gtm.js" instead of just
+    /// "long_tasks: 3". Empty when no longtasks observed OR every
+    /// observed task lacked any attribution detail (rare).
+    ///
+    /// `long_tasks` (scalar count) and `tbt` (scalar blocking time)
+    /// stay as the headline numbers; this list is the **why**.
+    #[serde(default)]
+    pub long_task_top_offenders: Vec<LongTaskOffender>,
+    /// **FPS** — frames observed by a `requestAnimationFrame` loop
+    /// installed pre-navigation, aggregated over the same observation
+    /// window as the rest of `WebVitals`. `0` when `web_vitals=false`
+    /// or when no frames were produced (window too short / page
+    /// crashed before paint).
+    ///
+    /// Caveat: the rAF loop itself drives frame production. A page
+    /// with no animation would normally be idle (compositor parked);
+    /// the loop forces frames at the engine's natural cadence (~60Hz
+    /// in headless, ~display refresh rate when headed). So `fps_avg`
+    /// on a fully static page reads near-60 rather than zero. The
+    /// most actionable signal for animation pages is `fps_jank_ratio`
+    /// and `fps_longest_frame_ms` — those reflect real main-thread
+    /// blocking regardless of why the loop is producing frames.
+    ///
+    /// Headless + VM caveat: headless Chrome uses software
+    /// rasterization, so absolute numbers don't match user-device
+    /// (GPU) performance. Comparable for **regression detection**
+    /// on the same harness; not comparable across host setups.
+    #[serde(default)]
+    pub fps_avg: f64,
+    /// Fraction of observed frames slower than 16.67ms (60fps target),
+    /// `0.0 .. 1.0`. The headline jank signal for marketing pages —
+    /// a value above `0.10` typically means visibly stuttery animation
+    /// or scroll. `0.0` when `fps_frame_count == 0`.
+    #[serde(default)]
+    pub fps_jank_ratio: f64,
+    /// Slowest single frame observed, in ms. Marks the worst-case
+    /// pause the user could have perceived during the window. Values
+    /// above ~100ms usually pair with a `loaf_top_offenders[]` entry
+    /// that explains the source.
+    #[serde(default)]
+    pub fps_longest_frame_ms: f64,
+    /// Total number of frames observed. `0` when `web_vitals=false`
+    /// or the observation window closed before the second rAF
+    /// callback (the first sets the baseline timestamp, the second
+    /// is needed to measure a `dt`). Useful for sanity-checking
+    /// `fps_avg` (very low frame count → small sample, noisy signal).
+    #[serde(default)]
+    pub fps_frame_count: u32,
 }
 
 /// Per-script contribution aggregated across all observed LoAF entries.
@@ -2864,6 +3974,59 @@ struct LoafRawScript {
     forced_style_and_layout_duration: f64,
 }
 
+/// Raw `PerformanceLongTaskTiming` entry as captured browser-side.
+/// Internal — receives the JSON before server-side aggregation; not
+/// in the `WebVitals` output (we expose the aggregated
+/// `long_task_top_offenders` + the scalar `long_tasks` count).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LongTaskRawEntry {
+    /// `"self"` for same-frame tasks, otherwise the cross-frame
+    /// container's name. Used as the fallback grouping key when no
+    /// `attribution.container_src` is reported.
+    name: String,
+    #[allow(dead_code)]
+    start_time: f64,
+    duration: f64,
+    attribution: Vec<LongTaskRawAttribution>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LongTaskRawAttribution {
+    /// `"iframe"` / `"embed"` / `"object"` / etc. Empty for same-page.
+    #[allow(dead_code)]
+    container_type: String,
+    /// URL of the embedded frame (iframe `src`). Most actionable —
+    /// when present, names the third-party iframe responsible.
+    container_src: String,
+    #[allow(dead_code)]
+    container_id: String,
+    /// Human-readable name from `frame.name` / etc. Used as a
+    /// fallback grouping key when `container_src` is empty.
+    container_name: String,
+}
+
+/// One aggregated longtask offender: a single "source" (best-effort
+/// derivation — `container_src` when available, else `container_name`,
+/// else the task's `name`) and its total contribution across all
+/// observed tasks. Ranked desc by `total_duration_ms` for AI scan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LongTaskOffender {
+    /// Best-effort source identifier. In priority order: the first
+    /// `attribution[].container_src` if non-empty (iframe URL), else
+    /// the first non-empty `container_name`, else the task's
+    /// `name` (typically `"self"` for in-page tasks). When the result
+    /// would be empty, falls back to `"(same-page)"` so the bucket is
+    /// at least labeled.
+    pub source: String,
+    /// Sum of task durations (ms) attributed to this source.
+    pub total_duration_ms: f64,
+    /// Longest single task duration observed for this source. Lets
+    /// AI distinguish "many small tasks" from "one giant task".
+    pub max_duration_ms: f64,
+    /// Number of distinct longtask entries grouped into this bucket.
+    pub task_count: u32,
+}
+
 /// One aggregated CLS offender: a single element identity (tag + id /
 /// class) and its total shift contribution across all observed shifts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2876,6 +4039,14 @@ pub struct ClsTopSource {
     pub fraction: f64,
     /// Number of distinct shift entries this element appeared in.
     pub shift_count: u32,
+    /// Largest single movement (Euclidean distance in CSS px between
+    /// `previous_rect` and `current_rect`) observed for this element.
+    /// Useful for the "reserve N px of vertical space" suggestion:
+    /// if an element shifted 240px once, the fix needs ≥240px of
+    /// reserved height. `0.0` when no source-level geometry was
+    /// available (older Chromium without `LayoutShiftAttribution`).
+    #[serde(default)]
+    pub max_distance_px: f64,
 }
 
 /// Identifying details of the element that triggered Largest Contentful Paint.
@@ -2888,6 +4059,33 @@ pub struct LcpElement {
     pub url: Option<String>,
     /// For text elements: first 120 chars of `textContent`. None for non-text.
     pub text_preview: Option<String>,
+    /// LCP entry's computed `size` — the area in CSS px² that the browser
+    /// used to pick this element as the "largest contentful paint". Lets
+    /// the AI rank LCP candidates by visual prominence.
+    #[serde(default)]
+    pub size: f64,
+    /// For image LCP: ms from navigation start to when the image
+    /// resource finished loading. `0` for text LCP (no resource).
+    /// Useful split with `render_time` — if `load_time` is small but
+    /// `render_time` is large, the bottleneck is render, not network.
+    #[serde(default)]
+    pub load_time: f64,
+    /// Ms from navigation start to when the element was actually
+    /// painted to the screen. May be `0` for cross-origin images
+    /// without `Timing-Allow-Origin` — browser hides paint time as a
+    /// side-channel mitigation. When `0` but `load_time > 0`, treat
+    /// LCP as bounded by `load_time` + some unknown paint cost.
+    #[serde(default)]
+    pub render_time: f64,
+    /// For `<img>`: `naturalWidth` (decoded pixel width). For `<video>`:
+    /// `videoWidth`. `0` for text LCP or when the resource hasn't
+    /// decoded yet. Combined with display size from
+    /// `image_sizing` (when that feature is on), the AI can flag
+    /// "image is N× the display size — serve a smaller variant".
+    #[serde(default)]
+    pub natural_width: u32,
+    #[serde(default)]
+    pub natural_height: u32,
 }
 
 /// One layout-shift entry — when it happened and which elements moved.
@@ -2906,6 +4104,30 @@ pub struct ClsSourceElement {
     pub tag: String,
     pub id: String,
     pub class: String,
+    /// Bounding box of the element BEFORE the shift, in CSS pixels.
+    /// `None` only when the browser didn't expose
+    /// `LayoutShiftAttribution.previousRect` (older Chromium).
+    #[serde(default)]
+    pub previous_rect: Option<ShiftRect>,
+    /// Bounding box AFTER the shift. Pairs with `previous_rect`.
+    #[serde(default)]
+    pub current_rect: Option<ShiftRect>,
+    /// Euclidean movement distance between `previous_rect.{x,y}` and
+    /// `current_rect.{x,y}`, in CSS pixels. Server-side derive — the
+    /// raw rects are kept too for downstream visualization. `0.0`
+    /// when geometry wasn't captured.
+    #[serde(default)]
+    pub distance_px: f64,
+}
+
+/// Bounding box of a CLS source element, in CSS pixels relative to
+/// the viewport. Mirrors `DOMRect.{x, y, width, height}` semantics.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ShiftRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3222,6 +4444,26 @@ pub async fn collect_summary(
     let mut http_final_url: String = url.to_string();
     let mut http_redirect_count: u32 = 0;
     let mut http_network_failures: Vec<NetworkFailure> = Vec::new();
+    // Diagnostic-only: maps request_id → loadingFailed error text. Used
+    // by the end-of-summary status=0 walker (see after the event loop)
+    // to attribute ghost stubs to their failure reason. Always populated
+    // regardless of `captures.http_errors` so debugging works even when
+    // the http_errors output is opted-out. Cheap (tiny map per page).
+    let mut failed_loading: HashMap<String, String> = HashMap::new();
+    // Per-request_id timestamp of the `requestWillBeSent` event (CDP
+    // MonotonicTime, seconds). Paired with the `loadingFailed`
+    // timestamp to compute how quickly a request was aborted.
+    let mut request_sent_at: HashMap<String, f64> = HashMap::new();
+    // request_ids whose `loadingFailed` had `canceled=true` AND fired
+    // within `QUICK_ABORT_THRESHOLD_S` of the matching
+    // `requestWillBeSent`. These are framework-driven aborts (React
+    // component unmount mid-fetch, route change AbortController, fetch
+    // racing a navigation) — they aren't actionable errors, just noise
+    // in `resources[]` and `http_network_failures[]`. Filtered out
+    // before either is finalised.
+    let mut quick_abort_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    const QUICK_ABORT_THRESHOLD_S: f64 = 0.1;
     // Document-timing state. Captured on the LAST Document response
     // with status <400 (so redirects don't win — we want the actual
     // landing page). Always tracked, no gate: it's a trivial
@@ -3357,6 +4599,21 @@ pub async fn collect_summary(
                 entry.has_source_map = lookup_header(&ev.response.headers, "sourcemap").is_some()
                     || lookup_header(&ev.response.headers, "x-sourcemap").is_some();
 
+                // Diagnostic log (debug level). Pairs with the
+                // `request_will_be_sent` log on the same request_id —
+                // when investigating status=0 ghosts, the presence /
+                // absence of a matching `response_received` line tells
+                // you whether the request completed at the HTTP layer.
+                tracing::debug!(
+                    target: DIAG_RESOURCE,
+                    request_id = %id,
+                    url = %entry.url,
+                    status = entry.status,
+                    mime = %entry.mime_type,
+                    from_cache = entry.from_cache,
+                    "response_received",
+                );
+
                 // HTTP error bookkeeping. All gated — when off, the
                 // `if captures.http_errors` branch is a single bool test
                 // and nothing else runs.
@@ -3478,33 +4735,115 @@ pub async fn collect_summary(
                 console_messages.push(format_console(&ev));
             }
             Some(ev) = request_stream.next() => {
+                // Skip pseudo-schemes (data: / blob: / about: / extensions)
+                // for parity with the response arm — otherwise this arm
+                // would create stubs for resources the response arm will
+                // never bother with, leaving permanent "ghosts" in the
+                // output.
+                if !is_real_resource(&ev.request.url) {
+                    continue;
+                }
                 let id = ev.request_id.inner().clone();
                 let mapped = map_initiator(&ev.initiator);
+                // Diagnostic log (debug level — enable via
+                // `RUST_LOG=browser_headless=debug` when investigating
+                // why a resource ended up with status=0).
+                tracing::debug!(
+                    target: DIAG_RESOURCE,
+                    request_id = %id,
+                    url = %ev.request.url,
+                    method = %ev.request.method,
+                    initiator_type = %mapped.r#type,
+                    initiator_url = ?mapped.url,
+                    "request_will_be_sent",
+                );
                 // Attach to the matching resource entry. Create a stub if
                 // the response hasn't been seen yet — response_stream arm
-                // will fill the rest of the fields later.
+                // will fill the rest of the fields later. Pre-fill `url`
+                // from the request itself so that if the response NEVER
+                // arrives (request canceled mid-flight, page navigated
+                // away, blocked by extension / CSP without a loadingFailed
+                // event), the stub still carries the intended URL for
+                // diagnostics. The response arm overwrites unconditionally,
+                // so a real response always wins over the request URL when
+                // both arrive (matters for redirects: response.url is the
+                // resolved final URL after each hop).
                 let entry = resources.entry(id.clone()).or_insert_with(|| WebPageResource {
                     request_id: id.clone(),
                     ..Default::default()
                 });
+                if entry.url.is_empty() {
+                    entry.url = ev.request.url.clone();
+                    entry.parsed_url = url::Url::parse(&ev.request.url).ok();
+                }
                 entry.initiator = Some(mapped);
+                // Record the send timestamp for quick-abort detection.
+                // CDP redirects share a request_id across hops; last-
+                // write-wins is correct (we care about the abort window
+                // from the most recent attempt, not the original).
+                request_sent_at.insert(id.clone(), *ev.timestamp.inner());
             }
             Some(ev) = loading_failed_stream.next() => {
                 // Filter pseudo-schemes for parity with the response arm
                 // (data:/blob:/about: never make it into `resources`, so
                 // their failures wouldn't be actionable either).
+                let request_id = ev.request_id.inner().clone();
                 let failed_url = resources
-                    .get(ev.request_id.inner())
+                    .get(&request_id)
                     .map(|r| r.url.clone())
                     .unwrap_or_default();
                 if !failed_url.is_empty() && !is_real_resource(&failed_url) {
                     continue;
                 }
+                // Quick-abort suppression. `canceled=true` is necessary
+                // but not sufficient (user navigation away mid-fetch is
+                // also `canceled=true` and might be meaningful) — we
+                // additionally require the abort to fire within 100ms of
+                // the request being sent, which is the classic signature
+                // of a framework-driven cancellation (React unmount,
+                // route change AbortController, fetch racing a route
+                // hash change). Slower aborts are kept so user-initiated
+                // cancels or timeout-driven aborts remain visible.
+                let failed_ts = *ev.timestamp.inner();
+                let canceled = ev.canceled.unwrap_or(false);
+                let abort_duration_s = request_sent_at
+                    .get(&request_id)
+                    .map(|sent| failed_ts - sent);
+                let is_quick_abort = canceled
+                    && abort_duration_s
+                        .map(|d| d < QUICK_ABORT_THRESHOLD_S)
+                        .unwrap_or(false);
+                if is_quick_abort {
+                    quick_abort_ids.insert(request_id.clone());
+                    tracing::debug!(
+                        target: DIAG_RESOURCE,
+                        request_id = %request_id,
+                        url = %failed_url,
+                        duration_ms = abort_duration_s.unwrap_or(0.0) * 1000.0,
+                        "quick_abort_suppressed",
+                    );
+                    continue;
+                }
+                // Diagnostic: always record into the failed_loading map
+                // regardless of `captures.http_errors`, so the end-of-
+                // summary status=0 walker can attribute ghost stubs to
+                // their failure even when the caller didn't opt into
+                // http_errors capture.
+                failed_loading.insert(request_id.clone(), ev.error_text.clone());
+                tracing::debug!(
+                    target: DIAG_RESOURCE,
+                    request_id = %request_id,
+                    url = %failed_url,
+                    error_text = %ev.error_text,
+                    resource_type = ?ev.r#type,
+                    canceled,
+                    "loading_failed",
+                );
                 http_network_failures.push(NetworkFailure {
                     url: failed_url,
                     error_text: ev.error_text.clone(),
                     resource_type: format!("{:?}", ev.r#type).to_lowercase(),
-                    canceled: ev.canceled.unwrap_or(false),
+                    canceled,
                 });
             }
             Some(ev) = stylesheet_stream.next() => {
@@ -3554,6 +4893,41 @@ pub async fn collect_summary(
         None
     };
 
+    // Defensive: drop stubs that never got a URL. With the request_stream
+    // arm pre-filling `entry.url` from `ev.request.url`, this should now
+    // be empty in practice — but keep the filter as a backstop so any
+    // future code path that inserts a default entry without setting URL
+    // can't leak a `status=0, url=""` ghost into the output (which would
+    // render as the confusing `请求 ``` 状态码 0 (未知类型, 0 B).` line).
+    resources.retain(|_, r| !r.url.is_empty() && !quick_abort_ids.contains(&r.request_id));
+    // Diagnostic: scan for resources where the response never arrived
+    // (`status == 0`) and emit a `warn!` per occurrence with the URL,
+    // initiator, and — when available — the matching `loadingFailed`
+    // error text. These are the entries that render as the confusing
+    // `请求 \`URL\` 状态码 0 ...` markdown line; the log makes the
+    // attribution obvious without grepping `http_errors.network_failures`.
+    // Warn level so it shows up at the default log level (these ARE
+    // anomalies). Silent on a clean page (no log emitted).
+    for r in resources.values() {
+        if r.status != 0 {
+            continue;
+        }
+        let error_text = failed_loading.get(&r.request_id).cloned();
+        let initiator_summary = r.initiator.as_ref().map(|i| {
+            format!(
+                "type={} url={:?} line={:?}",
+                i.r#type, i.url, i.line_number,
+            )
+        });
+        tracing::warn!(
+            target: DIAG_RESOURCE,
+            request_id = %r.request_id,
+            url = %r.url,
+            initiator = ?initiator_summary,
+            loading_failed_error = ?error_text,
+            "resource has status=0 — request initiated but no response observed",
+        );
+    }
     let total_size: u64 = resources.values().map(|r| r.content_size).sum();
     let resources_vec: Vec<WebPageResource> = resources.into_values().collect();
     let resource_count = resources_vec.len() as u64;
@@ -3765,6 +5139,8 @@ pub async fn collect_summary(
             v
         },
         image_sizing: None,
+        image_audit: None,
+        font_audit: None,
         dom_mutations: None,
         http_errors,
         coverage,
@@ -3791,28 +5167,53 @@ impl WebPageStat {
     /// context. Each resource becomes a short prose sentence (cache hit /
     /// success / failure framed differently), exceptions are listed, and the
     /// page content goes in a fenced block at the end.
-    pub fn to_markdown(&self) -> String {
+    ///
+    /// `lang` controls the natural-language strings only — section
+    /// headings, prose templates, warning labels. URLs, numbers, and
+    /// enum-tag values (e.g. `missing_immutable`) are emitted verbatim
+    /// regardless.
+    pub fn to_markdown(&self, lang: Lang) -> String {
         use std::fmt::Write;
         let mut s = String::new();
+        // Tiny translation helper: takes the English and Chinese versions
+        // of a literal, returns whichever matches the request's `lang`.
+        // Closure form (not a top-level fn) so we can use it inside this
+        // method without ceremony, and because every call site supplies
+        // both arms as `&'static str` literals.
+        let tr = |en: &'static str, zh: &'static str| -> &'static str {
+            match lang {
+                Lang::En => en,
+                Lang::Zh => zh,
+            }
+        };
 
-        let _ = writeln!(s, "# Page Summary");
+        let _ = writeln!(s, "{}", tr("# Page Summary", "# 页面摘要"));
         let _ = writeln!(s);
         let _ = writeln!(
             s,
-            "Load completed in **{}ms** (FCP {}ms, DCL {}ms). Transferred **{}** across **{}** resources.",
+            "{} **{}ms** (FCP {}ms, DCL {}ms). {} **{}** {} **{}** {}.",
+            tr("Load completed in", "加载完成于"),
             self.load_time,
             self.fcp_time,
             self.dcl_time,
+            tr("Transferred", "传输"),
             format_bytes(self.total_size),
+            tr("across", "经由"),
             self.resource_count,
+            tr("resources", "个资源"),
         );
         let _ = writeln!(s);
 
         if !self.exceptions.is_empty() {
-            let _ = writeln!(s, "## JavaScript Exceptions ({})", self.exceptions.len());
+            let _ = writeln!(
+                s,
+                "{} ({})",
+                tr("## JavaScript Exceptions", "## JavaScript 异常"),
+                self.exceptions.len(),
+            );
             let _ = writeln!(s);
             if !self.js_exceptions.by_name.is_empty() {
-                let _ = writeln!(s, "By class:");
+                let _ = writeln!(s, "{}", tr("By class:", "按类型："));
                 for entry in &self.js_exceptions.by_name {
                     match entry.sample_message.as_deref() {
                         Some(msg) => {
@@ -3824,7 +5225,7 @@ impl WebPageStat {
                     }
                 }
                 let _ = writeln!(s);
-                let _ = writeln!(s, "Full list:");
+                let _ = writeln!(s, "{}", tr("Full list:", "完整列表："));
             }
             for ex in &self.exceptions {
                 let _ = writeln!(s, "- {ex}");
@@ -3833,7 +5234,12 @@ impl WebPageStat {
         }
 
         if !self.console_messages.is_empty() {
-            let _ = writeln!(s, "## Console Messages ({})", self.console_messages.len());
+            let _ = writeln!(
+                s,
+                "{} ({})",
+                tr("## Console Messages", "## 控制台输出"),
+                self.console_messages.len(),
+            );
             let _ = writeln!(s);
             for msg in &self.console_messages {
                 let _ = writeln!(s, "- {msg}");
@@ -3848,13 +5254,49 @@ impl WebPageStat {
         // page from a few short sections before scrolling past long lists.
 
         if let Some(v) = &self.web_vitals {
-            let _ = writeln!(s, "## Web Vitals");
+            let _ = writeln!(s, "{}", tr("## Web Vitals", "## 网页关键性能指标"));
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "- LCP **{:.0}ms** · CLS **{:.3}** · TBT **{:.0}ms** · TTFB **{:.0}ms** · long tasks **{}**",
-                v.lcp, v.cls, v.tbt, v.ttfb, v.long_tasks
+                "- LCP **{:.0}ms** · CLS **{:.3}** · TBT **{:.0}ms** · TTFB **{:.0}ms** · {} **{}**",
+                v.lcp,
+                v.cls,
+                v.tbt,
+                v.ttfb,
+                tr("long tasks", "长任务"),
+                v.long_tasks,
             );
+            // FPS — only render when frames were actually observed
+            // (`fps_frame_count > 0`). Otherwise the values are all 0
+            // and would mislead. `jank_ratio` rendered as percent and
+            // tagged with ⚠️ above the visibly-stuttery 10% threshold.
+            if v.fps_frame_count > 0 {
+                let jank_pct = v.fps_jank_ratio * 100.0;
+                let jank_warn = if v.fps_jank_ratio > 0.10 {
+                    " ⚠️"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    s,
+                    "- FPS **{:.1}** ({} {}) · {} **{:.0}%**{} · {} **{:.0}ms**",
+                    v.fps_avg,
+                    v.fps_frame_count,
+                    tr(
+                        if v.fps_frame_count == 1 {
+                            "frame"
+                        } else {
+                            "frames"
+                        },
+                        "帧",
+                    ),
+                    tr("jank", "卡顿率"),
+                    jank_pct,
+                    jank_warn,
+                    tr("longest frame", "最长一帧"),
+                    v.fps_longest_frame_ms,
+                );
+            }
             if let Some(el) = &v.lcp_element {
                 let mut desc = format!("`<{}", el.tag);
                 if !el.id.is_empty() {
@@ -3869,27 +5311,87 @@ impl WebPageStat {
                 } else if let Some(t) = &el.text_preview {
                     desc.push_str(&format!(" — \"{t}\""));
                 }
-                let _ = writeln!(s, "- LCP element: {desc}");
+                let _ = writeln!(s, "- {}: {desc}", tr("LCP element", "LCP 元素"));
+                // Size + load/render-time split, only when populated.
+                // Cross-origin images often report `render_time=0` — we
+                // suppress the field then so the markdown doesn't lie.
+                if el.size > 0.0 {
+                    let mut detail =
+                        format!("  - {}: **{:.0}** CSS px²", tr("Size", "面积"), el.size,);
+                    if el.natural_width > 0 && el.natural_height > 0 {
+                        detail.push_str(&format!(
+                            " · {} **{}×{}**",
+                            tr("natural", "原生"),
+                            el.natural_width,
+                            el.natural_height,
+                        ));
+                    }
+                    let _ = writeln!(s, "{detail}");
+                }
+                if el.load_time > 0.0 || el.render_time > 0.0 {
+                    let mut detail = String::from("  - ");
+                    if el.load_time > 0.0 {
+                        detail.push_str(&format!(
+                            "{} **{:.0}ms**",
+                            tr("Load", "加载"),
+                            el.load_time,
+                        ));
+                    }
+                    if el.render_time > 0.0 {
+                        if el.load_time > 0.0 {
+                            detail.push_str(" · ");
+                        }
+                        detail.push_str(&format!(
+                            "{} **{:.0}ms**",
+                            tr("Render", "绘制"),
+                            el.render_time,
+                        ));
+                    }
+                    let _ = writeln!(s, "{detail}");
+                }
             }
             if !v.cls_top_sources.is_empty() {
-                let _ = writeln!(s, "- Top CLS offenders:");
+                let _ = writeln!(s, "- {}", tr("Top CLS offenders:", "CLS 主要肇事元素："));
                 for (i, src) in v.cls_top_sources.iter().take(3).enumerate() {
+                    // Optional "moved Npx" tail — only when source-level
+                    // geometry was captured (`max_distance_px > 0`).
+                    // Carries the concrete "reserve N px" actionable.
+                    let moved = if src.max_distance_px > 0.0 {
+                        format!(
+                            " · {} **{:.0}px**",
+                            tr("max move", "最大位移"),
+                            src.max_distance_px,
+                        )
+                    } else {
+                        String::new()
+                    };
                     let _ = writeln!(
                         s,
-                        "  {}. **{}** — {:.3} ({:.0}%) across {} shift{}",
+                        "  {}. **{}** — {:.3} ({:.0}%) {} {} {}{}",
                         i + 1,
                         src.selector,
                         src.total_shift,
                         src.fraction * 100.0,
+                        tr("across", "共"),
                         src.shift_count,
-                        if src.shift_count == 1 { "" } else { "s" }
+                        tr(
+                            if src.shift_count == 1 {
+                                "shift"
+                            } else {
+                                "shifts"
+                            },
+                            "次抖动",
+                        ),
+                        moved,
                     );
                 }
                 if v.cls_top_sources.len() > 3 {
                     let _ = writeln!(
                         s,
-                        "  …and {} more (see `cls_top_sources` / `cls_entries` in JSON).",
-                        v.cls_top_sources.len() - 3
+                        "  {} {} {} (`cls_top_sources` / `cls_entries`).",
+                        tr("…and", "……还有"),
+                        v.cls_top_sources.len() - 3,
+                        tr("more — see JSON for full list", "项更多，详见 JSON"),
                     );
                 }
             }
@@ -3898,22 +5400,60 @@ impl WebPageStat {
             if v.interaction_count > 0 {
                 let _ = writeln!(
                     s,
-                    "- INP **{:.0}ms** across **{}** interaction{}",
+                    "- INP **{:.0}ms** {} **{}** {}",
                     v.inp,
+                    tr("across", "共"),
                     v.interaction_count,
-                    if v.interaction_count == 1 { "" } else { "s" }
+                    tr(
+                        if v.interaction_count == 1 {
+                            "interaction"
+                        } else {
+                            "interactions"
+                        },
+                        "次交互",
+                    ),
                 );
+            }
+            // Long Task attribution — render only when offender data
+            // was produced (raw entries captured AND at least one had
+            // something to group on). The `long_tasks` headline number
+            // is already in the top-line vitals row above.
+            if !v.long_task_top_offenders.is_empty() {
+                let _ = writeln!(s, "- {}", tr("Top long-task sources:", "长任务主要来源："),);
+                for (i, o) in v.long_task_top_offenders.iter().take(3).enumerate() {
+                    let src = if o.source.len() > 70 {
+                        format!("…{}", &o.source[o.source.len() - 67..])
+                    } else {
+                        o.source.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  {}. `{}` — **{:.0}ms** {} {} {} ({} **{:.0}ms**)",
+                        i + 1,
+                        src,
+                        o.total_duration_ms,
+                        tr("across", "共"),
+                        o.task_count,
+                        tr(if o.task_count == 1 { "task" } else { "tasks" }, "次任务",),
+                        tr("max", "最长"),
+                        o.max_duration_ms,
+                    );
+                }
             }
             // LoAF — only render when something was observed (older
             // Chromium without the API returns count=0).
             if v.loaf_count > 0 {
                 let _ = writeln!(
                     s,
-                    "- Long Animation Frames: **{}** (blocking **{:.0}ms** total)",
-                    v.loaf_count, v.loaf_total_blocking_duration,
+                    "- {}: **{}** ({} **{:.0}ms** {})",
+                    tr("Long Animation Frames", "长动画帧"),
+                    v.loaf_count,
+                    tr("blocking", "阻塞"),
+                    v.loaf_total_blocking_duration,
+                    tr("total", "总计"),
                 );
                 if !v.loaf_top_offenders.is_empty() {
-                    let _ = writeln!(s, "- Top LoAF offenders:");
+                    let _ = writeln!(s, "- {}", tr("Top LoAF offenders:", "LoAF 主要肇事脚本："));
                     for (i, o) in v.loaf_top_offenders.iter().take(3).enumerate() {
                         let src = if o.source_url.is_empty() {
                             "(inline / unknown)".to_string()
@@ -3929,21 +5469,30 @@ impl WebPageStat {
                         };
                         let reflow_note = if o.total_forced_style_layout_ms > 5.0 {
                             format!(
-                                " ⚠️ forced reflow **{:.0}ms**",
-                                o.total_forced_style_layout_ms
+                                " ⚠️ {} **{:.0}ms**",
+                                tr("forced reflow", "强制重排"),
+                                o.total_forced_style_layout_ms,
                             )
                         } else {
                             String::new()
                         };
                         let _ = writeln!(
                             s,
-                            "  {}. `{}`{} — **{:.0}ms** over {} call{}{}",
+                            "  {}. `{}`{} — **{:.0}ms** {} {} {}{}",
                             i + 1,
                             src,
                             fn_note,
                             o.total_duration_ms,
+                            tr("over", "共"),
                             o.invocation_count,
-                            if o.invocation_count == 1 { "" } else { "s" },
+                            tr(
+                                if o.invocation_count == 1 {
+                                    "call"
+                                } else {
+                                    "calls"
+                                },
+                                "次调用",
+                            ),
                             reflow_note,
                         );
                     }
@@ -3953,7 +5502,7 @@ impl WebPageStat {
         }
 
         if let Some(dt) = &self.document_timing {
-            let _ = writeln!(s, "## Document Timing");
+            let _ = writeln!(s, "{}", tr("## Document Timing", "## 主文档时序"));
             let _ = writeln!(s);
             let url_display = if dt.url.len() > 80 {
                 format!("…{}", &dt.url[dt.url.len() - 77..])
@@ -3966,11 +5515,15 @@ impl WebPageStat {
                 url_display,
                 dt.status,
                 if dt.protocol.is_empty() {
-                    "(no protocol)"
+                    tr("(no protocol)", "(未知协议)")
                 } else {
                     &dt.protocol
                 },
-                if dt.from_cache { " · cached" } else { "" },
+                if dt.from_cache {
+                    tr(" · cached", " · 来自缓存")
+                } else {
+                    ""
+                },
             );
             let _ = writeln!(
                 s,
@@ -3980,9 +5533,89 @@ impl WebPageStat {
             let _ = writeln!(s);
         }
 
+        // HTTP errors — placed right after Document Timing because the
+        // two answer the same "did navigation actually succeed" question.
+        // Section is silent on the trivial happy path (no 4xx/5xx, no
+        // network failures, no redirects) so clean pages don't add
+        // noise.
+        if let Some(he) = &self.http_errors
+            && (he.failed_count > 0 || he.redirect_count > 0)
+        {
+            let _ = writeln!(s, "{}", tr("## HTTP Errors", "## HTTP 错误"));
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- {}: **{}** ({} 4xx · {} 5xx · {} {})",
+                tr("Failed requests", "失败请求"),
+                he.failed_count,
+                he.failed_4xx.len(),
+                he.failed_5xx.len(),
+                he.network_failures.len(),
+                tr("network failures", "网络层失败"),
+            );
+            if he.redirect_count > 0 {
+                let _ = writeln!(
+                    s,
+                    "- {}: **{}** {} → `{}`",
+                    tr("Redirects", "重定向"),
+                    he.redirect_count,
+                    tr(
+                        if he.redirect_count == 1 {
+                            "hop"
+                        } else {
+                            "hops"
+                        },
+                        "跳",
+                    ),
+                    he.final_url,
+                );
+            }
+            for r in he.failed_4xx.iter().take(5) {
+                let display = if r.url.len() > 80 {
+                    format!("…{}", &r.url[r.url.len() - 77..])
+                } else {
+                    r.url.clone()
+                };
+                let _ = writeln!(
+                    s,
+                    "  - **{}** [{}] `{}`",
+                    r.status, r.resource_type, display,
+                );
+            }
+            for r in he.failed_5xx.iter().take(5) {
+                let display = if r.url.len() > 80 {
+                    format!("…{}", &r.url[r.url.len() - 77..])
+                } else {
+                    r.url.clone()
+                };
+                let _ = writeln!(
+                    s,
+                    "  - **{}** [{}] `{}`",
+                    r.status, r.resource_type, display,
+                );
+            }
+            // Network failures — separate sub-list because they're a
+            // different failure class (no response at all). Skip
+            // `canceled=true` entries (typical: navigation supersession,
+            // block_urls policy) so the reader sees real findings first.
+            for f in he.network_failures.iter().filter(|f| !f.canceled).take(5) {
+                let display = if f.url.len() > 80 {
+                    format!("…{}", &f.url[f.url.len() - 77..])
+                } else {
+                    f.url.clone()
+                };
+                let _ = writeln!(
+                    s,
+                    "  - ⚠️ [{}] `{}` — `{}`",
+                    f.resource_type, display, f.error_text,
+                );
+            }
+            let _ = writeln!(s);
+        }
+
         if !self.resource_summary.bytes_by_type.is_empty() {
             let rs = &self.resource_summary;
-            let _ = writeln!(s, "## Resource Summary");
+            let _ = writeln!(s, "{}", tr("## Resource Summary", "## 资源汇总"));
             let _ = writeln!(s);
             // Sort by bytes desc for stable readable output.
             let mut by_type: Vec<(&String, &u64)> = rs.bytes_by_type.iter().collect();
@@ -3995,7 +5628,7 @@ impl WebPageStat {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ");
-            let _ = writeln!(s, "- By type: {type_line}");
+            let _ = writeln!(s, "- {}: {type_line}", tr("By type", "按类型"));
             let mut status: Vec<(&String, &u32)> = rs.status_distribution.iter().collect();
             status.sort_by_key(|x| x.0.clone());
             let status_line = status
@@ -4003,35 +5636,54 @@ impl WebPageStat {
                 .map(|(k, v)| format!("{k} {v}"))
                 .collect::<Vec<_>>()
                 .join(" · ");
-            let _ = writeln!(s, "- Status: {status_line}");
+            let _ = writeln!(s, "- {}: {status_line}", tr("Status", "状态码"));
             let _ = writeln!(
                 s,
-                "- Cache hit ratio **{:.0}%** (saved {})",
+                "- {} **{:.0}%** ({} {})",
+                tr("Cache hit ratio", "缓存命中率"),
                 rs.cache_hit_ratio * 100.0,
-                format_bytes(rs.cached_bytes)
+                tr("saved", "节省"),
+                format_bytes(rs.cached_bytes),
             );
             let _ = writeln!(
                 s,
-                "- Third-party bytes: **{}**",
-                format_bytes(rs.third_party_bytes)
+                "- {}: **{}**",
+                tr("Third-party bytes", "第三方字节数"),
+                format_bytes(rs.third_party_bytes),
             );
             // Top third-party domains by bytes — ranks the heaviest
             // external dependencies for an AI-scannable view.
             if !rs.top_third_party_domains.is_empty() {
-                let _ = writeln!(s, "- Top third-party domains:");
+                let _ = writeln!(
+                    s,
+                    "- {}",
+                    tr("Top third-party domains:", "第三方域名 TOP："),
+                );
                 for d in rs.top_third_party_domains.iter().take(5) {
                     let _ = writeln!(
                         s,
-                        "  - `{}` — {} ({} resource{})",
+                        "  - `{}` — {} ({} {})",
                         d.host,
                         format_bytes(d.bytes),
                         d.count,
-                        if d.count == 1 { "" } else { "s" }
+                        tr(
+                            if d.count == 1 {
+                                "resource"
+                            } else {
+                                "resources"
+                            },
+                            "个资源",
+                        ),
                     );
                 }
             }
             if let Some((url, sz)) = &rs.largest_resource {
-                let _ = writeln!(s, "- Largest: `{url}` ({})", format_bytes(*sz));
+                let _ = writeln!(
+                    s,
+                    "- {}: `{url}` ({})",
+                    tr("Largest", "最大资源"),
+                    format_bytes(*sz),
+                );
             }
             // HTTP version distribution — sort by count desc so the
             // dominant protocol leads. Adjacent line shows the modern-
@@ -4046,8 +5698,10 @@ impl WebPageStat {
                     .join(" · ");
                 let _ = writeln!(
                     s,
-                    "- HTTP versions: {line} (HTTP/2+3 share **{:.0}%**)",
-                    rs.modern_protocol_share * 100.0
+                    "- {}: {line} ({} **{:.0}%**)",
+                    tr("HTTP versions", "HTTP 版本"),
+                    tr("HTTP/2+3 share", "HTTP/2+3 占比"),
+                    rs.modern_protocol_share * 100.0,
                 );
             }
             // Connection reuse + DNS approximation. Skip if no real
@@ -4057,19 +5711,34 @@ impl WebPageStat {
                 let reuse_pct = (rs.connections_reused as f64) * 100.0 / (real_conns as f64);
                 let _ = writeln!(
                     s,
-                    "- Connections: **{}** reused · **{}** new (**{:.0}%** reuse) · **{}** unique hosts",
-                    rs.connections_reused, rs.connections_new, reuse_pct, rs.unique_hosts,
+                    "- {}: **{}** {} · **{}** {} (**{:.0}%** {}) · **{}** {}",
+                    tr("Connections", "连接"),
+                    rs.connections_reused,
+                    tr("reused", "复用"),
+                    rs.connections_new,
+                    tr("new", "新建"),
+                    reuse_pct,
+                    tr("reuse", "复用率"),
+                    rs.unique_hosts,
+                    tr("unique hosts", "个独立主机"),
                 );
             }
             // Compression audit. Only render when there's either
             // compression in use or a miss to flag.
             if rs.compressed_count > 0 || rs.uncompressed_text_count > 0 {
-                let mut line = format!("- Compression: **{}** compressed", rs.compressed_count);
+                let mut line = format!(
+                    "- {}: **{}** {}",
+                    tr("Compression", "压缩"),
+                    rs.compressed_count,
+                    tr("compressed", "已压缩"),
+                );
                 if rs.uncompressed_text_count > 0 {
                     line.push_str(&format!(
-                        " · **{}** uncompressed text resources (**{}** could be compressed) ⚠️",
+                        " · **{}** {} (**{}** {}) ⚠️",
                         rs.uncompressed_text_count,
+                        tr("uncompressed text resources", "个未压缩的文本资源",),
                         format_bytes(rs.uncompressed_text_bytes),
+                        tr("could be compressed", "本可压缩"),
                     ));
                 }
                 let _ = writeln!(s, "{line}");
@@ -4084,7 +5753,11 @@ impl WebPageStat {
                     .map(|(k, v)| format!("{k} {v}"))
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let _ = writeln!(s, "- Compression breakdown: {line}");
+                let _ = writeln!(
+                    s,
+                    "- {}: {line}",
+                    tr("Compression breakdown", "压缩算法分布"),
+                );
             }
             // Cache-Control coverage — single ratio so monitors can
             // alert when a deploy drops headers from static assets.
@@ -4093,8 +5766,13 @@ impl WebPageStat {
                 let cov = (rs.cache_control_present as f64) * 100.0 / (cc_total as f64);
                 let _ = writeln!(
                     s,
-                    "- Cache-Control coverage: **{:.0}%** ({} present · {} missing)",
-                    cov, rs.cache_control_present, rs.cache_control_missing
+                    "- {}: **{:.0}%** ({} {} · {} {})",
+                    tr("Cache-Control coverage", "Cache-Control 覆盖率"),
+                    cov,
+                    rs.cache_control_present,
+                    tr("present", "已设置"),
+                    rs.cache_control_missing,
+                    tr("missing", "未设置"),
                 );
             }
             // Image-format modernisation — Lighthouse "Serve images
@@ -4104,10 +5782,14 @@ impl WebPageStat {
                 let modern_pct = (rs.modern_image_bytes as f64) * 100.0 / (img_total as f64);
                 let _ = writeln!(
                     s,
-                    "- Image formats: **{}** legacy (JPEG/PNG/GIF) · **{}** modern (WebP/AVIF) — **{:.0}%** modern",
+                    "- {}: **{}** {} (JPEG/PNG/GIF) · **{}** {} (WebP/AVIF) — **{:.0}%** {}",
+                    tr("Image formats", "图片格式"),
                     format_bytes(rs.legacy_image_bytes),
+                    tr("legacy", "传统格式"),
                     format_bytes(rs.modern_image_bytes),
+                    tr("modern", "现代格式"),
                     modern_pct,
+                    tr("modern", "现代格式占比"),
                 );
             }
             // Source-map coverage across JS / CSS.
@@ -4116,8 +5798,14 @@ impl WebPageStat {
                 let cov = (rs.source_maps_present as f64) * 100.0 / (sm_total as f64);
                 let _ = writeln!(
                     s,
-                    "- Source maps: **{:.0}%** of JS/CSS resources ({} present · {} missing)",
-                    cov, rs.source_maps_present, rs.source_maps_missing,
+                    "- {}: **{:.0}%** {} ({} {} · {} {})",
+                    tr("Source maps", "Source map"),
+                    cov,
+                    tr("of JS/CSS resources", "JS/CSS 资源覆盖"),
+                    rs.source_maps_present,
+                    tr("present", "已发布"),
+                    rs.source_maps_missing,
+                    tr("missing", "未发布"),
                 );
             }
             // Duplicate-resource findings — only render when something
@@ -4127,16 +5815,28 @@ impl WebPageStat {
             if dr.wasted_bytes > 0 || !dr.exact_url.is_empty() || !dr.likely_same_file.is_empty() {
                 let _ = writeln!(
                     s,
-                    "- Duplicate resources: **{}** wasted across {} exact-URL group{}, {} likely-same-file group{} ⚠️",
+                    "- {}: **{}** {} {} {}, {} {} ⚠️",
+                    tr("Duplicate resources", "重复资源"),
                     format_bytes(dr.wasted_bytes),
+                    tr("wasted across", "浪费，分布于"),
                     dr.exact_url.len(),
-                    if dr.exact_url.len() == 1 { "" } else { "s" },
+                    tr(
+                        if dr.exact_url.len() == 1 {
+                            "exact-URL group"
+                        } else {
+                            "exact-URL groups"
+                        },
+                        "组同 URL 重复",
+                    ),
                     dr.likely_same_file.len(),
-                    if dr.likely_same_file.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
+                    tr(
+                        if dr.likely_same_file.len() == 1 {
+                            "likely-same-file group"
+                        } else {
+                            "likely-same-file groups"
+                        },
+                        "组疑似同文件",
+                    ),
                 );
                 for e in dr.exact_url.iter().take(3) {
                     let display = if e.key.len() > 80 {
@@ -4146,19 +5846,24 @@ impl WebPageStat {
                     };
                     let _ = writeln!(
                         s,
-                        "  - exact: `{}` ×{} ({} wasted)",
+                        "  - {}: `{}` ×{} ({} {})",
+                        tr("exact", "同 URL"),
                         display,
                         e.count,
                         format_bytes(e.wasted_bytes),
+                        tr("wasted", "浪费"),
                     );
                 }
                 for e in dr.likely_same_file.iter().take(3) {
                     let _ = writeln!(
                         s,
-                        "  - same-file: `{}` across {} URLs ({} wasted)",
+                        "  - {}: `{}` {} {} URLs ({} {})",
+                        tr("same-file", "同文件"),
                         e.key,
+                        tr("across", "分布于"),
                         e.count,
                         format_bytes(e.wasted_bytes),
+                        tr("wasted", "浪费"),
                     );
                 }
             }
@@ -4168,9 +5873,17 @@ impl WebPageStat {
             if mc.detected {
                 let _ = writeln!(
                     s,
-                    "- Mixed content: **{}** plain-HTTP resource{} on HTTPS page ⚠️",
+                    "- {}: **{}** {} ⚠️",
+                    tr("Mixed content", "混合内容"),
                     mc.total_count,
-                    if mc.total_count == 1 { "" } else { "s" },
+                    tr(
+                        if mc.total_count == 1 {
+                            "plain-HTTP resource on HTTPS page"
+                        } else {
+                            "plain-HTTP resources on HTTPS page"
+                        },
+                        "个明文 HTTP 资源出现在 HTTPS 页面",
+                    ),
                 );
                 for r in mc.resources.iter().take(3) {
                     let display = if r.url.len() > 80 {
@@ -4192,34 +5905,188 @@ impl WebPageStat {
             // meaningless). `0` is a real signal too: every resource
             // was parser-initiated, no JS-driven secondary fetches.
             if let Some(depth) = rs.max_initiator_chain_depth {
-                let _ = writeln!(s, "- Max initiator chain depth: **{depth}**");
+                let _ = writeln!(
+                    s,
+                    "- {}: **{depth}**",
+                    tr("Max initiator chain depth", "最深请求依赖链",),
+                );
+            }
+            // Per-type "largest resources" leaderboards. Stable bucket
+            // order so the markdown diffs cleanly across captures.
+            if !rs.top_largest_by_type.is_empty() {
+                for bucket in ["javascript", "css", "image", "font"] {
+                    let Some(list) = rs.top_largest_by_type.get(bucket) else {
+                        continue;
+                    };
+                    if list.is_empty() {
+                        continue;
+                    }
+                    let _ = writeln!(s, "- {} {bucket}:", tr("Largest", "最大"),);
+                    for e in list.iter().take(5) {
+                        let display = if e.url.len() > 80 {
+                            format!("…{}", &e.url[e.url.len() - 77..])
+                        } else {
+                            e.url.clone()
+                        };
+                        let cache_tag = if e.from_cache {
+                            tr(" (cached)", "（来自缓存）")
+                        } else {
+                            ""
+                        };
+                        let _ = writeln!(
+                            s,
+                            "  - `{}` — {}{}",
+                            display,
+                            format_bytes(e.bytes),
+                            cache_tag,
+                        );
+                    }
+                }
+            }
+            // Uncompressed-text offenders — already summarised in the
+            // compression line above; this section drills into specific
+            // URLs so the AI can suggest concrete fixes.
+            if !rs.uncompressed_text_resources.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "- {} ({} {}):",
+                    tr("Uncompressed text resources", "未压缩的文本资源",),
+                    tr("top", "前"),
+                    rs.uncompressed_text_resources.len().min(5),
+                );
+                for e in rs.uncompressed_text_resources.iter().take(5) {
+                    let display = if e.url.len() > 80 {
+                        format!("…{}", &e.url[e.url.len() - 77..])
+                    } else {
+                        e.url.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  - `{}` — {} ({})",
+                        display,
+                        format_bytes(e.bytes),
+                        e.mime_type,
+                    );
+                }
+            }
+            // Cache-policy anti-patterns on static assets — surfaces
+            // the actionable subset (short max-age + missing-immutable
+            // on fingerprinted URLs) without paging through resources.
+            if !rs.cache_policy_issues.is_empty() {
+                let short_count = rs
+                    .cache_policy_issues
+                    .iter()
+                    .filter(|i| i.reason == "short_max_age")
+                    .count();
+                let immut_count = rs
+                    .cache_policy_issues
+                    .iter()
+                    .filter(|i| i.reason == "missing_immutable")
+                    .count();
+                let _ = writeln!(
+                    s,
+                    "- {}: **{}** {} · **{}** {} ⚠️",
+                    tr("Cache-policy issues", "缓存策略问题"),
+                    short_count,
+                    tr("short max-age", "max-age 过短"),
+                    immut_count,
+                    tr("missing immutable", "未加 immutable"),
+                );
+                for e in rs.cache_policy_issues.iter().take(5) {
+                    let display = if e.url.len() > 80 {
+                        format!("…{}", &e.url[e.url.len() - 77..])
+                    } else {
+                        e.url.clone()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  - [{}] `{}` — `{}`",
+                        e.reason, display, e.cache_control,
+                    );
+                }
+            }
+            // Resource-hint audit — only rendered when the caller
+            // opted in (`resource_hints=true` / `all_metrics=true`).
+            // `gap` empty AND both declared lists empty → silent;
+            // otherwise show the gap (highest priority for the AI)
+            // and a one-line summary of declared coverage.
+            if let Some(rh) = &rs.resource_hints {
+                let declared_total = rh.declared_preconnect.len() + rh.declared_dns_prefetch.len();
+                if !rh.gap.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** {} ⚠️",
+                        tr("Resource-hint gaps", "资源提示遗漏"),
+                        rh.gap.len(),
+                        tr(
+                            if rh.gap.len() == 1 {
+                                "third-party host hit without preconnect/dns-prefetch"
+                            } else {
+                                "third-party hosts hit without preconnect/dns-prefetch"
+                            },
+                            "个第三方主机命中但未声明 preconnect/dns-prefetch",
+                        ),
+                    );
+                    for g in rh.gap.iter().take(5) {
+                        let _ = writeln!(
+                            s,
+                            "  - `{}` — {} ({} {})",
+                            g.host,
+                            format_bytes(g.bytes),
+                            g.count,
+                            tr(
+                                if g.count == 1 {
+                                    "resource"
+                                } else {
+                                    "resources"
+                                },
+                                "个资源",
+                            ),
+                        );
+                    }
+                }
+                if declared_total > 0 {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** preconnect · **{}** dns-prefetch",
+                        tr("Declared resource hints", "已声明的资源提示"),
+                        rh.declared_preconnect.len(),
+                        rh.declared_dns_prefetch.len(),
+                    );
+                }
             }
             let _ = writeln!(s);
         }
 
         if let Some(cov) = &self.coverage {
-            let _ = writeln!(s, "## CSS / JS Coverage");
+            let _ = writeln!(s, "{}", tr("## CSS / JS Coverage", "## CSS / JS 覆盖率"));
             let _ = writeln!(s);
             if cov.js_total_bytes > 0 {
                 let _ = writeln!(
                     s,
-                    "- JS: **{}** unused / {} total (**{:.0}%** unused)",
+                    "- JS: **{}** {} / {} {} (**{:.0}%** {})",
                     format_bytes(cov.js_unused_bytes),
+                    tr("unused", "未使用"),
                     format_bytes(cov.js_total_bytes),
-                    cov.js_unused_ratio * 100.0
+                    tr("total", "总计"),
+                    cov.js_unused_ratio * 100.0,
+                    tr("unused", "未使用"),
                 );
             }
             if cov.css_total_bytes > 0 {
                 let _ = writeln!(
                     s,
-                    "- CSS: **{}** unused / {} total (**{:.0}%** unused)",
+                    "- CSS: **{}** {} / {} {} (**{:.0}%** {})",
                     format_bytes(cov.css_unused_bytes),
+                    tr("unused", "未使用"),
                     format_bytes(cov.css_total_bytes),
-                    cov.css_unused_ratio * 100.0
+                    tr("total", "总计"),
+                    cov.css_unused_ratio * 100.0,
+                    tr("unused", "未使用"),
                 );
             }
             if !cov.top_unused.is_empty() {
-                let _ = writeln!(s, "- Top wasteful files:");
+                let _ = writeln!(s, "- {}", tr("Top wasteful files:", "最浪费的文件："));
                 for e in cov.top_unused.iter().take(5) {
                     let display_url = if e.url.len() > 80 {
                         format!("…{}", &e.url[e.url.len() - 77..])
@@ -4228,11 +6095,12 @@ impl WebPageStat {
                     };
                     let _ = writeln!(
                         s,
-                        "  - [{}] `{}` — {} unused ({:.0}%)",
+                        "  - [{}] `{}` — {} {} ({:.0}%)",
                         e.kind,
                         display_url,
                         format_bytes(e.unused_bytes),
-                        e.unused_ratio * 100.0
+                        tr("unused", "未使用"),
+                        e.unused_ratio * 100.0,
                     );
                 }
             }
@@ -4240,22 +6108,42 @@ impl WebPageStat {
         }
 
         if let Some(tls) = &self.tls_info {
-            let _ = writeln!(s, "## TLS / Certificate (main document)");
-            let _ = writeln!(s);
-            let _ = writeln!(s, "- Host: `{}`{}", tls.host, format_remote_ip(tls));
             let _ = writeln!(
                 s,
-                "- Protocol: **{}** · cipher: `{}`{}",
+                "{}",
+                tr(
+                    "## TLS / Certificate (main document)",
+                    "## TLS / 主文档证书",
+                ),
+            );
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- {}: `{}`{}",
+                tr("Host", "主机"),
+                tls.host,
+                format_remote_ip(tls),
+            );
+            let _ = writeln!(
+                s,
+                "- {}: **{}** · {}: `{}`{}",
+                tr("Protocol", "协议"),
                 tls.protocol,
+                tr("cipher", "加密套件"),
                 tls.cipher,
                 match &tls.key_exchange {
-                    Some(k) => format!(" · key exchange: `{k}`"),
+                    Some(k) => format!(" · {}: `{k}`", tr("key exchange", "密钥交换"),),
                     None => String::new(),
-                }
+                },
             );
-            let _ = writeln!(s, "- Subject: `{}`", tls.subject_name);
-            let _ = writeln!(s, "- Issuer: `{}`", tls.issuer);
-            let _ = writeln!(s, "- Validity: {}", format_tls_expiry(tls.days_remaining));
+            let _ = writeln!(s, "- {}: `{}`", tr("Subject", "签发对象"), tls.subject_name);
+            let _ = writeln!(s, "- {}: `{}`", tr("Issuer", "颁发机构"), tls.issuer);
+            let _ = writeln!(
+                s,
+                "- {}: {}",
+                tr("Validity", "有效期"),
+                format_tls_expiry(tls.days_remaining),
+            );
             if !tls.san_list.is_empty() {
                 let sans = tls
                     .san_list
@@ -4269,7 +6157,7 @@ impl WebPageStat {
                     "- SANs ({}): {}{}",
                     tls.san_list.len(),
                     sans,
-                    if tls.san_list.len() > 8 { ", …" } else { "" }
+                    if tls.san_list.len() > 8 { ", …" } else { "" },
                 );
             }
             let _ = writeln!(s);
@@ -4278,11 +6166,19 @@ impl WebPageStat {
         if !self.tls_certificates.is_empty() {
             let _ = writeln!(
                 s,
-                "## TLS Certificates by Host ({})",
-                self.tls_certificates.len()
+                "{} ({})",
+                tr("## TLS Certificates by Host", "## 按主机分组的 TLS 证书",),
+                self.tls_certificates.len(),
             );
             let _ = writeln!(s);
-            let _ = writeln!(s, "| Host | IP | Protocol | Issuer | Validity |");
+            let _ = writeln!(
+                s,
+                "{}",
+                tr(
+                    "| Host | IP | Protocol | Issuer | Validity |",
+                    "| 主机 | IP | 协议 | 颁发机构 | 有效期 |",
+                ),
+            );
             let _ = writeln!(s, "|---|---|---|---|---|");
             for tls in &self.tls_certificates {
                 let ip_cell = match (&tls.remote_ip, tls.remote_port) {
@@ -4310,23 +6206,30 @@ impl WebPageStat {
         // always populated).
         {
             let a = &self.security_audit;
-            let _ = writeln!(s, "## Security Audit");
+            let _ = writeln!(s, "{}", tr("## Security Audit", "## 安全审计"));
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "- Headers: **{}/{}** core present{}",
+                "- {}: **{}/{}** {}{}",
+                tr("Headers", "响应头"),
                 a.headers.present_count,
                 CORE_SECURITY_HEADERS.len(),
+                tr("core present", "核心头已配置"),
                 if a.headers.missing.is_empty() {
                     String::new()
                 } else {
-                    format!(" — missing: {}", a.headers.missing.join(", "))
-                }
+                    format!(
+                        " — {}: {}",
+                        tr("missing", "缺失"),
+                        a.headers.missing.join(", "),
+                    )
+                },
             );
             if a.cookies.total > 0 {
                 let pct = |n: u32| (n as f64) * 100.0 / (a.cookies.total as f64);
                 let mut line = format!(
-                    "- Cookies ({}): Secure **{:.0}%** · HttpOnly **{:.0}%** · SameSite **{:.0}%**",
+                    "- {} ({}): Secure **{:.0}%** · HttpOnly **{:.0}%** · SameSite **{:.0}%**",
+                    tr("Cookies", "Cookie"),
                     a.cookies.total,
                     pct(a.cookies.secure),
                     pct(a.cookies.http_only),
@@ -4334,8 +6237,12 @@ impl WebPageStat {
                 );
                 if a.cookies.same_site_none_without_secure > 0 {
                     line.push_str(&format!(
-                        " ⚠️ {} cookie(s) `SameSite=None` without `Secure`",
-                        a.cookies.same_site_none_without_secure
+                        " ⚠️ {} {}",
+                        a.cookies.same_site_none_without_secure,
+                        tr(
+                            "cookie(s) `SameSite=None` without `Secure`",
+                            "个 Cookie 标了 `SameSite=None` 却没加 `Secure`",
+                        ),
                     ));
                 }
                 let _ = writeln!(s, "{line}");
@@ -4346,20 +6253,40 @@ impl WebPageStat {
                 if hdr >= 4096 {
                     let _ = writeln!(
                         s,
-                        "- Cookie header size: **{}** ⚠️ (≥ 4 KB — every request pays this tax)",
+                        "- {}: **{}** ⚠️ {}",
+                        tr("Cookie header size", "Cookie 请求头大小"),
                         format_bytes(hdr),
+                        tr(
+                            "(≥ 4 KB — every request pays this tax)",
+                            "(≥ 4 KB —— 每个请求都要带这么多)",
+                        ),
                     );
                 } else if hdr > 0 {
-                    let _ = writeln!(s, "- Cookie header size: **{}**", format_bytes(hdr));
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}**",
+                        tr("Cookie header size", "Cookie 请求头大小"),
+                        format_bytes(hdr),
+                    );
                 }
             } else {
-                let _ = writeln!(s, "- Cookies: (none)");
+                let _ = writeln!(
+                    s,
+                    "- {}: {}",
+                    tr("Cookies", "Cookie"),
+                    tr("(none)", "（无）")
+                );
             }
             let _ = writeln!(s);
         }
 
         if let Some(sh) = &self.security_headers {
-            let _ = writeln!(s, "## Security Headers ({})", sh.len());
+            let _ = writeln!(
+                s,
+                "{} ({})",
+                tr("## Security Headers", "## 安全响应头"),
+                sh.len(),
+            );
             let _ = writeln!(s);
             let mut items: Vec<(&String, &String)> = sh.iter().collect();
             items.sort_by_key(|(k, _)| k.as_str());
@@ -4376,35 +6303,59 @@ impl WebPageStat {
         }
 
         if let Some(sw) = &self.service_worker {
-            let _ = writeln!(s, "## Service Worker");
+            let _ = writeln!(s, "{}", tr("## Service Worker", "## Service Worker"));
             let _ = writeln!(s);
-            let _ = writeln!(s, "- Controlled: **{}**", sw.controlled);
+            let _ = writeln!(
+                s,
+                "- {}: **{}**",
+                tr("Controlled", "已接管页面"),
+                sw.controlled,
+            );
             if let Some(scope) = &sw.scope {
-                let _ = writeln!(s, "- Scope: `{scope}`");
+                let _ = writeln!(s, "- {}: `{scope}`", tr("Scope", "作用域"));
             }
             if let Some(script) = &sw.active_script {
-                let _ = writeln!(s, "- Active script: `{script}`");
+                let _ = writeln!(s, "- {}: `{script}`", tr("Active script", "激活的脚本"));
             }
             if sw.waiting {
-                let _ = writeln!(s, "- Update **waiting** for activation");
+                let _ = writeln!(
+                    s,
+                    "- {}",
+                    tr("Update **waiting** for activation", "有更新**等待**激活",),
+                );
             }
             if sw.installing {
-                let _ = writeln!(s, "- A SW is **installing**");
+                let _ = writeln!(
+                    s,
+                    "- {}",
+                    tr("A SW is **installing**", "正在**安装** Service Worker"),
+                );
             }
             let _ = writeln!(s);
         }
 
         if let Some(rb) = &self.render_blocking_resources {
-            let _ = writeln!(s, "## Render-Blocking Resources ({})", rb.len());
+            let _ = writeln!(
+                s,
+                "{} ({})",
+                tr("## Render-Blocking Resources", "## 阻塞渲染的资源",),
+                rb.len(),
+            );
             let _ = writeln!(s);
             if rb.is_empty() {
-                let _ = writeln!(s, "- None detected.");
+                let _ = writeln!(s, "- {}", tr("None detected.", "未发现。"));
             } else {
                 for r in rb.iter().take(10) {
                     let _ = writeln!(s, "- `<{}>` `{}` — {}", r.tag, r.url, r.why);
                 }
                 if rb.len() > 10 {
-                    let _ = writeln!(s, "- …and {} more.", rb.len() - 10);
+                    let _ = writeln!(
+                        s,
+                        "- {} {} {}.",
+                        tr("…and", "……还有"),
+                        rb.len() - 10,
+                        tr("more", "项更多"),
+                    );
                 }
             }
             let _ = writeln!(s);
@@ -4422,11 +6373,14 @@ impl WebPageStat {
                 .filter(|i| i.loading == "lazy" && !i.in_viewport)
                 .count();
             let alt_missing = imgs.iter().filter(|i| i.alt_missing).count();
-            let _ = writeln!(s, "## Image Sizing ({total})");
+            let _ = writeln!(s, "{} ({total})", tr("## Image Sizing", "## 图片尺寸审计"),);
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "- {loaded} loaded · {lazy_offscreen} lazy/off-screen · {alt_missing} without alt"
+                "- {loaded} {} · {lazy_offscreen} {} · {alt_missing} {}",
+                tr("loaded", "已加载"),
+                tr("lazy/off-screen", "懒加载/首屏外"),
+                tr("without alt", "缺 alt"),
             );
             // Top offenders: significant waste OR meaningful bytes.
             let top: Vec<&ImageSizing> = imgs
@@ -4439,10 +6393,24 @@ impl WebPageStat {
                 .take(10)
                 .collect();
             if top.is_empty() {
-                let _ = writeln!(s, "- No significantly oversized images detected.");
+                let _ = writeln!(
+                    s,
+                    "- {}",
+                    tr(
+                        "No significantly oversized images detected.",
+                        "未发现明显过大的图片。",
+                    ),
+                );
             } else {
                 let _ = writeln!(s);
-                let _ = writeln!(s, "| URL | Natural | Display | Waste | Bytes | Viewport |");
+                let _ = writeln!(
+                    s,
+                    "{}",
+                    tr(
+                        "| URL | Natural | Display | Waste | Bytes | Viewport |",
+                        "| URL | 原生尺寸 | 显示尺寸 | 浪费 | 字节 | 首屏 |",
+                    ),
+                );
                 let _ = writeln!(s, "|---|---|---|---|---|---|");
                 for i in &top {
                     let waste = i
@@ -4453,7 +6421,11 @@ impl WebPageStat {
                         .transferred_bytes
                         .map(format_bytes)
                         .unwrap_or_else(|| "?".into());
-                    let vp = if i.in_viewport { "**yes**" } else { "no" };
+                    let vp = if i.in_viewport {
+                        tr("**yes**", "**是**")
+                    } else {
+                        tr("no", "否")
+                    };
                     // Trim long URLs to keep the table readable.
                     let short_url = if i.url.len() > 60 {
                         format!("…{}", &i.url[i.url.len() - 57..])
@@ -4474,78 +6446,318 @@ impl WebPageStat {
                     );
                 }
             }
+            // Lighthouse "image" four-pack — one short subsection per
+            // category, each silent when its list is empty. Showing the
+            // top URL + key numbers (display W×H, oversize ratio) keeps
+            // the markdown skimmable while still pinning down which
+            // file is the worst offender.
+            if let Some(audit) = &self.image_audit {
+                let trim_url = |u: &str| -> String {
+                    if u.len() > 60 {
+                        format!("…{}", &u[u.len() - 57..])
+                    } else {
+                        u.to_string()
+                    }
+                };
+                if !audit.oversized.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** {}",
+                        tr("Oversized (>2× display)", "过大（> 显示尺寸 2 倍）",),
+                        audit.oversized.len(),
+                        tr(
+                            if audit.oversized.len() == 1 {
+                                "image"
+                            } else {
+                                "images"
+                            },
+                            "张图片",
+                        ),
+                    );
+                    for i in audit.oversized.iter().take(5) {
+                        let _ = writeln!(
+                            s,
+                            "  - `{}` — **{:.1}×** {} {}×{}",
+                            trim_url(&i.url),
+                            i.ratio,
+                            tr("at", "显示为"),
+                            i.display_width,
+                            i.display_height,
+                        );
+                    }
+                }
+                if !audit.missing_dimensions.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** {}",
+                        tr(
+                            "Missing `width`/`height` attrs (CLS risk)",
+                            "缺 `width`/`height` 属性（CLS 风险）",
+                        ),
+                        audit.missing_dimensions.len(),
+                        tr(
+                            if audit.missing_dimensions.len() == 1 {
+                                "image"
+                            } else {
+                                "images"
+                            },
+                            "张图片",
+                        ),
+                    );
+                    for i in audit.missing_dimensions.iter().take(5) {
+                        let _ = writeln!(
+                            s,
+                            "  - `{}` — {}×{}",
+                            trim_url(&i.url),
+                            i.display_width,
+                            i.display_height,
+                        );
+                    }
+                }
+                if !audit.missing_lazy.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}**",
+                        tr(
+                            "Below-fold images NOT marked `loading=\"lazy\"`",
+                            "首屏外图片未加 `loading=\"lazy\"`",
+                        ),
+                        audit.missing_lazy.len(),
+                    );
+                    for i in audit.missing_lazy.iter().take(5) {
+                        let _ = writeln!(
+                            s,
+                            "  - `{}` — {}×{}",
+                            trim_url(&i.url),
+                            i.display_width,
+                            i.display_height,
+                        );
+                    }
+                }
+                if !audit.missing_srcset.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** {}",
+                        tr(
+                            "Missing `srcset` (no responsive variants)",
+                            "缺 `srcset`（没有响应式变体）",
+                        ),
+                        audit.missing_srcset.len(),
+                        tr(
+                            if audit.missing_srcset.len() == 1 {
+                                "image"
+                            } else {
+                                "images"
+                            },
+                            "张图片",
+                        ),
+                    );
+                    for i in audit.missing_srcset.iter().take(5) {
+                        let _ = writeln!(
+                            s,
+                            "  - `{}` — {}×{}",
+                            trim_url(&i.url),
+                            i.display_width,
+                            i.display_height,
+                        );
+                    }
+                }
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(fa) = &self.font_audit {
+            let _ = writeln!(s, "{}", tr("## Font Audit", "## 字体审计"));
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- {}: **{}** {} · **{}** {} · **{}** {}",
+                tr("Fonts", "字体"),
+                fa.font_count,
+                tr("declared", "已声明"),
+                fa.loaded_count,
+                tr("loaded", "已加载"),
+                fa.declared_preload_count,
+                tr("preloaded", "已预加载"),
+            );
+            // font-display distribution — sort desc by count so the
+            // dominant value leads, ties broken alphabetically for
+            // stable diffs across captures.
+            if !fa.display_distribution.is_empty() {
+                let mut dist: Vec<(&String, &u32)> = fa.display_distribution.iter().collect();
+                dist.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                let line = dist
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let _ = writeln!(s, "- `font-display`: {line}");
+            }
+            if !fa.missing_swap.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "- {}: **{}** {} ⚠️",
+                    tr(
+                        "FOIT risk (no `font-display: swap`)",
+                        "FOIT 风险（未声明 `font-display: swap`）",
+                    ),
+                    fa.missing_swap.len(),
+                    tr(
+                        if fa.missing_swap.len() == 1 {
+                            "face"
+                        } else {
+                            "faces"
+                        },
+                        "个字体",
+                    ),
+                );
+                for f in fa.missing_swap.iter().take(5) {
+                    let url_part = match &f.source_url {
+                        Some(u) => {
+                            let trimmed = if u.len() > 70 {
+                                format!("…{}", &u[u.len() - 67..])
+                            } else {
+                                u.clone()
+                            };
+                            format!(" — `{trimmed}`")
+                        }
+                        None => String::new(),
+                    };
+                    let display_part = match &f.display {
+                        Some(d) if !d.is_empty() => format!(" (`{d}`)"),
+                        _ => " (`auto`)".to_string(),
+                    };
+                    let family = if f.family.is_empty() {
+                        tr("(unnamed)", "（未命名）").to_string()
+                    } else {
+                        f.family.clone()
+                    };
+                    let _ = writeln!(s, "  - **{family}**{display_part}{url_part}",);
+                }
+            }
+            // CORS blind-spot honesty signal — only render when
+            // non-zero so clean audits stay quiet.
+            if fa.unreadable_stylesheets > 0 {
+                let _ = writeln!(
+                    s,
+                    "- ⚠️ **{}** {} {}",
+                    fa.unreadable_stylesheets,
+                    tr(
+                        if fa.unreadable_stylesheets == 1 {
+                            "stylesheet"
+                        } else {
+                            "stylesheets"
+                        },
+                        "个样式表",
+                    ),
+                    tr(
+                        "unreadable (cross-origin without `crossorigin`) — audit may be incomplete",
+                        "无法读取（跨域且未加 `crossorigin`） — 审计可能不完整",
+                    ),
+                );
+            }
             let _ = writeln!(s);
         }
 
         if let Some(md) = &self.metadata {
-            let _ = writeln!(s, "## Page Metadata");
+            let _ = writeln!(s, "{}", tr("## Page Metadata", "## 页面元数据"));
             let _ = writeln!(s);
-            let _ = writeln!(s, "- Title: **{}**", md.title);
+            let _ = writeln!(s, "- {}: **{}**", tr("Title", "标题"), md.title);
             if let Some(d) = &md.description {
-                let _ = writeln!(s, "- Description: {d}");
+                let _ = writeln!(s, "- {}: {d}", tr("Description", "描述"));
             }
             if let Some(c) = &md.canonical {
-                let _ = writeln!(s, "- Canonical: `{c}`");
+                let _ = writeln!(s, "- {}: `{c}`", tr("Canonical", "Canonical URL"));
             }
             if let Some(r) = &md.robots {
-                let _ = writeln!(s, "- Robots: `{r}`");
+                let _ = writeln!(s, "- {}: `{r}`", tr("Robots", "Robots 指令"));
             }
             if let Some(l) = &md.lang {
-                let _ = writeln!(s, "- Lang: `{l}`");
+                let _ = writeln!(s, "- {}: `{l}`", tr("Lang", "语言"));
             }
             if let Some(v) = &md.viewport {
                 let _ = writeln!(s, "- Viewport: `{v}`");
             }
             if let Some(ch) = &md.charset {
-                let _ = writeln!(s, "- Charset: `{ch}`");
+                let _ = writeln!(s, "- {}: `{ch}`", tr("Charset", "字符集"));
             }
             if let Some(tc) = &md.theme_color {
-                let _ = writeln!(s, "- Theme color: `{tc}`");
+                let _ = writeln!(s, "- {}: `{tc}`", tr("Theme color", "主题色"));
             }
             if !md.og.is_empty() {
-                let _ = writeln!(s, "- Open Graph ({} tags):", md.og.len());
+                let _ = writeln!(
+                    s,
+                    "- Open Graph ({} {}):",
+                    md.og.len(),
+                    tr("tags", "个标签"),
+                );
                 let mut og: Vec<(&String, &String)> = md.og.iter().collect();
                 og.sort_by_key(|x| x.0.clone());
                 for (k, v) in og.iter().take(8) {
                     let _ = writeln!(s, "  - `og:{k}` = {v}");
                 }
                 if md.og.len() > 8 {
-                    let _ = writeln!(s, "  - …and {} more.", md.og.len() - 8);
+                    let _ = writeln!(
+                        s,
+                        "  - {} {} {}.",
+                        tr("…and", "……还有"),
+                        md.og.len() - 8,
+                        tr("more", "项"),
+                    );
                 }
             }
             if !md.twitter.is_empty() {
-                let _ = writeln!(s, "- Twitter ({} tags):", md.twitter.len());
+                let _ = writeln!(
+                    s,
+                    "- Twitter ({} {}):",
+                    md.twitter.len(),
+                    tr("tags", "个标签"),
+                );
                 let mut tw: Vec<(&String, &String)> = md.twitter.iter().collect();
                 tw.sort_by_key(|x| x.0.clone());
                 for (k, v) in tw.iter().take(8) {
                     let _ = writeln!(s, "  - `twitter:{k}` = {v}");
                 }
                 if md.twitter.len() > 8 {
-                    let _ = writeln!(s, "  - …and {} more.", md.twitter.len() - 8);
+                    let _ = writeln!(
+                        s,
+                        "  - {} {} {}.",
+                        tr("…and", "……还有"),
+                        md.twitter.len() - 8,
+                        tr("more", "项"),
+                    );
                 }
             }
             let _ = writeln!(s);
         }
 
         if let Some(m) = &self.metrics {
-            let _ = writeln!(s, "## Page Metrics");
+            let _ = writeln!(s, "{}", tr("## Page Metrics", "## 页面性能指标"));
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "- JS heap **{} / {}** · nodes **{}** · frames **{}** · documents **{}** · event listeners **{}**",
+                "- JS heap **{} / {}** · {} **{}** · {} **{}** · {} **{}** · {} **{}**",
                 format_bytes(m.js_heap_used),
                 format_bytes(m.js_heap_total),
+                tr("nodes", "节点"),
                 m.nodes,
+                tr("frames", "frame"),
                 m.frames,
+                tr("documents", "document"),
                 m.documents,
+                tr("event listeners", "事件监听器"),
                 m.js_event_listeners,
             );
             let _ = writeln!(
                 s,
-                "- CPU: script **{:.1}ms** · layout **{:.1}ms** · style **{:.1}ms** · total task **{:.1}ms**",
+                "- CPU: {} **{:.1}ms** · {} **{:.1}ms** · {} **{:.1}ms** · {} **{:.1}ms**",
+                tr("script", "脚本"),
                 m.script_duration_ms,
+                tr("layout", "布局"),
                 m.layout_duration_ms,
+                tr("style", "样式"),
                 m.recalc_style_duration_ms,
+                tr("total task", "总任务"),
                 m.task_duration_ms,
             );
             let _ = writeln!(s);
@@ -4558,15 +6770,20 @@ impl WebPageStat {
             } else {
                 0.0
             };
-            let _ = writeln!(s, "## DOM Mutations");
+            let _ = writeln!(s, "{}", tr("## DOM Mutations", "## DOM 变更"));
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "- Total **{total}** over {}ms (~**{:.0}/sec**) — added **{}** · removed **{}** · attribute **{}**",
+                "- {} **{total}** {} {}ms (~**{:.0}/sec**) — {} **{}** · {} **{}** · {} **{}**",
+                tr("Total", "共"),
+                tr("over", "记录于"),
                 dm.observation_window_ms,
                 rate,
+                tr("added", "新增"),
                 dm.total_added_nodes,
+                tr("removed", "移除"),
                 dm.total_removed_nodes,
+                tr("attribute", "属性变更"),
                 dm.total_attribute_changes,
             );
             if !dm.top_tags_by_mutation_count.is_empty() {
@@ -4577,7 +6794,7 @@ impl WebPageStat {
                     .map(|c| format!("`<{}>` {}", c.name, c.count))
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let _ = writeln!(s, "- Top tags: {line}");
+                let _ = writeln!(s, "- {}: {line}", tr("Top tags", "热点标签"));
             }
             if !dm.top_attributes_changed.is_empty() {
                 let line = dm
@@ -4587,7 +6804,7 @@ impl WebPageStat {
                     .map(|c| format!("`{}` {}", c.name, c.count))
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let _ = writeln!(s, "- Top attributes: {line}");
+                let _ = writeln!(s, "- {}: {line}", tr("Top attributes", "热点属性"));
             }
             let _ = writeln!(s);
         }
@@ -4595,10 +6812,15 @@ impl WebPageStat {
         // ─── Details / raw enumerations ─────────────────────────────────
 
         if !self.resources.is_empty() {
-            let _ = writeln!(s, "## Resources ({})", self.resources.len());
+            let _ = writeln!(
+                s,
+                "{} ({})",
+                tr("## Resources", "## 资源清单"),
+                self.resources.len(),
+            );
             let _ = writeln!(s);
             for r in &self.resources {
-                let _ = writeln!(s, "- {}", describe_resource(r));
+                let _ = writeln!(s, "- {}", describe_resource(r, lang));
             }
             let _ = writeln!(s);
         }
@@ -4606,7 +6828,12 @@ impl WebPageStat {
         if !self.cookies.is_empty() {
             // Name + domain only — values may contain session tokens. Use the
             // JSON response if you need the actual values.
-            let _ = writeln!(s, "## Cookies ({})", self.cookies.len());
+            let _ = writeln!(
+                s,
+                "{} ({})",
+                tr("## Cookies", "## Cookie"),
+                self.cookies.len(),
+            );
             let _ = writeln!(s);
             for c in &self.cookies {
                 let _ = writeln!(s, "- `{}` on `{}`", c.name, c.domain);
@@ -4617,16 +6844,30 @@ impl WebPageStat {
         // ─── Binary attachments ─────────────────────────────────────────
 
         if self.screenshot.is_some() {
-            let _ = writeln!(s, "## Screenshot");
+            let _ = writeln!(s, "{}", tr("## Screenshot", "## 截图"));
             let _ = writeln!(s);
-            let _ = writeln!(s, "Base64 PNG captured (omitted from markdown body).");
+            let _ = writeln!(
+                s,
+                "{}",
+                tr(
+                    "Base64 PNG captured (omitted from markdown body).",
+                    "已采集 Base64 PNG（不在 markdown 正文里输出）。",
+                ),
+            );
             let _ = writeln!(s);
         }
 
         if self.pdf.is_some() {
-            let _ = writeln!(s, "## PDF");
+            let _ = writeln!(s, "{}", tr("## PDF", "## PDF"));
             let _ = writeln!(s);
-            let _ = writeln!(s, "Base64 PDF captured (omitted from markdown body).");
+            let _ = writeln!(
+                s,
+                "{}",
+                tr(
+                    "Base64 PDF captured (omitted from markdown body).",
+                    "已采集 Base64 PDF（不在 markdown 正文里输出）。",
+                ),
+            );
             let _ = writeln!(s);
         }
 
@@ -4637,11 +6878,16 @@ impl WebPageStat {
                 .and_then(|e| e.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            let _ = writeln!(s, "## HAR");
+            let _ = writeln!(s, "{}", tr("## HAR", "## HAR"));
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "HAR 1.2 archive included ({entries} entries; omitted from markdown body)."
+                "{} ({entries} {}).",
+                tr("HAR 1.2 archive included", "已包含 HAR 1.2 归档",),
+                tr(
+                    "entries; omitted from markdown body",
+                    "条记录；不在 markdown 正文里输出",
+                ),
             );
             let _ = writeln!(s);
         }
@@ -4657,16 +6903,25 @@ impl WebPageStat {
                 .and_then(|s| s.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            let _ = writeln!(s, "## DOM Snapshot");
+            let _ = writeln!(s, "{}", tr("## DOM Snapshot", "## DOM 快照"));
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "DOMSnapshot included ({docs} document(s), {strings} interned strings; omitted from markdown body)."
+                "{} ({docs} {}, {strings} {}).",
+                tr("DOMSnapshot included", "已包含 DOMSnapshot"),
+                tr(
+                    if docs == 1 { "document" } else { "documents" },
+                    "个 document",
+                ),
+                tr(
+                    "interned strings; omitted from markdown body",
+                    "条 interned 字符串；不在 markdown 正文里输出",
+                ),
             );
             let _ = writeln!(s);
         }
 
-        let _ = writeln!(s, "## Page Content");
+        let _ = writeln!(s, "{}", tr("## Page Content", "## 页面内容"));
         let _ = writeln!(s);
         let _ = writeln!(s, "```");
         s.push_str(&self.data);
@@ -4679,17 +6934,28 @@ impl WebPageStat {
     }
 }
 
-fn describe_resource(r: &WebPageResource) -> String {
+fn describe_resource(r: &WebPageResource, lang: Lang) -> String {
+    let tr = |en: &'static str, zh: &'static str| -> &'static str {
+        match lang {
+            Lang::En => en,
+            Lang::Zh => zh,
+        }
+    };
     let mime = if r.mime_type.is_empty() {
-        "unknown type"
+        tr("unknown type", "未知类型")
     } else {
         r.mime_type.as_str()
     };
 
     if r.from_cache {
         return format!(
-            "Served `{}` from browser cache ({}, status {}).",
-            r.url, mime, r.status,
+            "{} `{}` {} ({}, {} {}).",
+            tr("Served", "从浏览器缓存提供"),
+            r.url,
+            tr("from browser cache", ""),
+            mime,
+            tr("status", "状态码"),
+            r.status,
         );
     }
 
@@ -4703,28 +6969,58 @@ fn describe_resource(r: &WebPageResource) -> String {
 
     let size = format_bytes(r.content_size);
     let conn = if r.connection_reused {
-        ", connection reused"
+        tr(", connection reused", "，连接复用")
     } else {
         ""
     };
 
     match r.status {
         200..=299 => format!(
-            "Loaded `{}` as {} ({}, status {}{}{}).",
-            r.url, mime, size, r.status, ttfb, conn,
+            "{} `{}` {} {} ({}, {} {}{}{}).",
+            tr("Loaded", "加载"),
+            r.url,
+            tr("as", "为"),
+            mime,
+            size,
+            tr("status", "状态码"),
+            r.status,
+            ttfb,
+            conn,
         ),
-        300..=399 => format!("Redirected (status {}) from `{}`{}.", r.status, r.url, ttfb,),
+        300..=399 => format!(
+            "{} ({} {}) {} `{}`{}.",
+            tr("Redirected", "重定向"),
+            tr("status", "状态码"),
+            r.status,
+            tr("from", "自"),
+            r.url,
+            ttfb,
+        ),
         400..=499 => format!(
-            "Client error fetching `{}` (status {}, {}).",
-            r.url, r.status, mime,
+            "{} `{}` ({} {}, {}).",
+            tr("Client error fetching", "请求客户端错误"),
+            r.url,
+            tr("status", "状态码"),
+            r.status,
+            mime,
         ),
         500..=599 => format!(
-            "Server error fetching `{}` (status {}, {}).",
-            r.url, r.status, mime,
+            "{} `{}` ({} {}, {}).",
+            tr("Server error fetching", "请求服务端错误"),
+            r.url,
+            tr("status", "状态码"),
+            r.status,
+            mime,
         ),
         _ => format!(
-            "Fetched `{}` with status {} ({}, {}).",
-            r.url, r.status, mime, size,
+            "{} `{}` {} {} {} ({}, {}).",
+            tr("Fetched", "请求"),
+            r.url,
+            tr("with status", "状态码"),
+            r.status,
+            "",
+            mime,
+            size,
         ),
     }
 }
@@ -4755,6 +7051,20 @@ pub enum DataFormat {
     /// Computed-style-aware DOM walker, inserts newlines between block-like
     /// elements. Better than `innerText` for flex/grid pages.
     Text,
+}
+
+/// Language used for the **markdown rendering** of the response
+/// (section headings, prose, warning labels). The JSON envelope is
+/// unaffected — all field names, enum tag values (`"missing_immutable"`,
+/// `"short_max_age"`, etc.), and machine-readable strings stay English
+/// regardless of `lang`, so downstream code that branches on those
+/// values keeps working across languages.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Lang {
+    #[default]
+    En,
+    Zh,
 }
 
 /// All knobs `capture` accepts. Owned fields so callers don't juggle
@@ -4901,6 +7211,21 @@ pub struct SummaryRequest {
     /// **not** enabled by `all_metrics=true`, so callers must opt in
     /// per request.
     pub coverage: bool,
+    /// Audit the page's declared `<link rel="preconnect">` /
+    /// `<link rel="dns-prefetch">` hints against the third-party hosts
+    /// actually loaded. Populates `resource_summary.resource_hints`
+    /// with the declared origins and a `gap` list of hot third-party
+    /// hosts that were missed. One extra `page.evaluate` (~5ms) over
+    /// `<head>`. OR-merged with `all_metrics`.
+    pub resource_hints: bool,
+    /// Audit `@font-face` declarations + `document.fonts` for FOIT
+    /// risk (`font-display` distribution, missing-`swap` list,
+    /// preload coverage). Populates `stat.font_audit`. One extra
+    /// `page.evaluate` over CSSOM (~3–8ms). OR-merged with
+    /// `all_metrics`. Cross-origin stylesheets without CORS are
+    /// reported as `unreadable_stylesheets` rather than silently
+    /// skipped — the audit is honest about its blind spots.
+    pub font_audit: bool,
 }
 
 /// End-to-end browser-side orchestration for `/summary`:
@@ -5092,6 +7417,8 @@ pub async fn capture(
         render_blocking,
         service_worker,
         image_sizing,
+        resource_hints_raw,
+        font_audit,
     ) = tokio::try_join!(
         // data — html / text / markdown extraction, scoped to capture_element.
         async {
@@ -5160,8 +7487,9 @@ pub async fn capture(
         },
         // Web Vitals — drain the pre-navigation observer accumulator. By
         // now observers have had stages 2 + 3 to fill up. Inline decode
-        // peels off the raw `loaf_entries` (private to this layer) before
-        // deserialising into the public `WebVitals` shape.
+        // peels off the raw `loaf_entries` and `long_task_entries`
+        // (private to this layer) before deserialising into the public
+        // `WebVitals` shape.
         async {
             if req.web_vitals {
                 let eval = page.evaluate(WEB_VITALS_READ_JS).await?;
@@ -5172,10 +7500,15 @@ pub async fn capture(
                     .get_mut("loaf_entries")
                     .and_then(|v| serde_json::from_value(v.take()).ok())
                     .unwrap_or_default();
+                let longtask_raw: Vec<LongTaskRawEntry> = value
+                    .get_mut("long_task_entries")
+                    .and_then(|v| serde_json::from_value(v.take()).ok())
+                    .unwrap_or_default();
                 let mut vitals: WebVitals = serde_json::from_value(value)
                     .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
                 aggregate_cls_sources(&mut vitals);
                 aggregate_loaf(&mut vitals, &loaf_raw);
+                aggregate_long_tasks(&mut vitals, &longtask_raw);
                 Ok(Some(vitals))
             } else {
                 Ok(None)
@@ -5231,6 +7564,26 @@ pub async fn capture(
                 Ok(None)
             }
         },
+        // Resource-hint scrape — small `<head>` query for declared
+        // preconnect / dns-prefetch links. The gap derive against
+        // `top_third_party_domains` runs in Phase B (needs the
+        // server-derived third-party ranking from `build_resource_summary`).
+        async {
+            if req.resource_hints {
+                collect_resource_hints(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        // Font audit — walks CSSOM for `@font-face` rules + reads
+        // `document.fonts`. Self-contained (no Phase B derive needed).
+        async {
+            if req.font_audit {
+                collect_font_audit(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
     )?;
 
     // Phase B — assignment + pure server-side derives. All operate on
@@ -5246,12 +7599,16 @@ pub async fn capture(
     stat.metadata = metadata;
     stat.render_blocking_resources = render_blocking;
     stat.service_worker = service_worker;
+    stat.font_audit = font_audit;
     if let Some(mut imgs) = image_sizing {
         // Server-side enrichment: join transferred_bytes from resources by
         // URL (currentSrc is the actual fetched URL), compute waste_ratio,
         // then sort worst-waste-first so the top of the list is actionable.
-        enrich_image_sizing(&mut imgs, &stat.resources);
+        // Same pass derives the Lighthouse "image four-pack" audit
+        // (oversized / missing_dimensions / missing_lazy / missing_srcset).
+        let audit = enrich_image_sizing(&mut imgs, &stat.resources);
         stat.image_sizing = Some(imgs);
+        stat.image_audit = Some(audit);
     }
 
     if req.har {
@@ -5260,6 +7617,17 @@ pub async fn capture(
 
     // Always compute — free derive from already-collected `resources`.
     stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
+
+    // Resource-hint audit Phase B: combine the raw `<head>` scrape
+    // (from Phase A) with the now-built `top_third_party_domains`
+    // ranking to compute the gap list. `None` when `resource_hints`
+    // wasn't requested — Phase A skipped the evaluate entirely.
+    if let Some(raw) = resource_hints_raw {
+        stat.resource_summary.resource_hints = Some(build_resource_hints(
+            raw,
+            &stat.resource_summary.top_third_party_domains,
+        ));
+    }
 
     // Drop the detailed array unless explicitly requested. `resource_count`
     // and `total_size` (scalars) plus `resource_summary` (aggregates) are

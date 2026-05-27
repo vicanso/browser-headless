@@ -155,28 +155,31 @@ curl -X POST http://localhost:3000/summary \
 | `pdf` | bool | false | Capture PDF via `Page.printToPDF` into `stat.pdf`. |
 | `har` | bool | false | Emit HAR 1.2 archive into `stat.har` (importable into Chrome DevTools). |
 | `save_dom_snapshot` | bool | false | Capture `DOMSnapshot.captureSnapshot` into `stat.dom_snapshot`. |
-| `web_vitals` | bool | false | Collect Core Web Vitals (LCP / CLS / TBT / TTFB / long-task count) into `stat.web_vitals` via `PerformanceObserver` installed pre-navigation. Also records `lcp_element` (tag / id / class / url / text), `cls_entries[]` + server-aggregated `cls_top_sources[]`, **INP** (max interaction duration — 2024 Core Web Vital; `0` in non-interactive scrapes, meaningful when `script` simulates clicks), and **Long Animation Frames** (Chrome 123+: `loaf_count` + `loaf_total_blocking_duration` + server-aggregated `loaf_top_offenders[]` ranked by attributable script source — pinpoints which JS file is causing jank, with forced-reflow flag). |
+| `web_vitals` | bool | false | Collect Core Web Vitals (LCP / CLS / TBT / TTFB / long-task count) into `stat.web_vitals` via `PerformanceObserver` installed pre-navigation. Also records `lcp_element` (tag / id / class / url / text **plus `size` / `load_time` / `render_time` / `natural_width` / `natural_height`** — lets the AI say "LCP is a 3840×2160 image rendered at 1920×1080, loaded at 980ms, paint at 1023ms; serve a smaller variant"), `cls_entries[]` with per-source movement geometry (`previous_rect` / `current_rect` / `distance_px`) + server-aggregated `cls_top_sources[]` (now carries `max_distance_px` — the biggest single jump, which is the lower bound for `min-height` / layout reservation), **`long_task_top_offenders[]`** (server-aggregated by `PerformanceLongTaskTiming.attribution[].container_src` — turns "long_tasks: 3" into "3 longtasks, 800ms total, all from gtm.js"), **INP** (max interaction duration — 2024 Core Web Vital; `0` in non-interactive scrapes, meaningful when `script` simulates clicks), **Long Animation Frames** (Chrome 123+: `loaf_count` + `loaf_total_blocking_duration` + server-aggregated `loaf_top_offenders[]` ranked by attributable script source — pinpoints which JS file is causing jank, with forced-reflow flag), and **FPS** (`fps_avg` / `fps_jank_ratio` / `fps_longest_frame_ms` / `fps_frame_count` — rAF-driven frame counter against a 60fps target; the `jank_ratio` and `longest_frame_ms` are the actionable signals for animation / scroll-heavy pages, and complement LoAF by catching sub-jank-threshold smoothness loss like a steady 45fps banner. Headless + VM uses software rasterization so absolute numbers aren't user-device-comparable — fine for regression detection on the same harness). |
 | `metrics` | bool | false | V8 heap + DOM counts + CPU time breakdown (`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms` / `task_duration_ms`) into `stat.metrics` via `Performance.getMetrics`. Gold for "LCP unchanged but script time +30%" regressions. |
 | `metadata` | bool | false | Page `<head>` metadata (title / description / canonical / robots / lang / viewport / charset / theme-color / OG / Twitter) into `stat.metadata`. Catches SEO regressions instantly. |
 | `render_blocking` | bool | false | Scan `<head>` for render-blocking sync stylesheets and scripts without `async`/`defer`/`module`; result in `stat.render_blocking_resources[]`. |
 | `service_worker` | bool | false | Snapshot `navigator.serviceWorker` registration into `stat.service_worker` (controlled / scope / active_script / waiting / installing). |
 | `initiators` | bool | false | Subscribe to `Network.requestWillBeSent` and attach per-resource `initiator` (type / url / line_number) — answers "what code triggered this request". |
 | `console_messages` | bool | false | Collect `console.log/info/warn/error/debug` lines into `stat.console_messages`. Default off — console output is noisy (framework warnings, analytics, large object dumps); enable only when actually auditing console. When off the CDP `Runtime.consoleAPICalled` stream is never subscribed (zero cost). |
-| `image_sizing` | bool | false | Per-`<img>` audit: decoded natural dimensions vs laid-out display dimensions (DPR-corrected so retina-tuned images aren't false-flagged), `loading` mode, viewport overlap, missing alt, server-joined `transferred_bytes` and computed `waste_ratio`. Output sorted worst-first into `stat.image_sizing`. One `evaluate` call, ~2ms even for 100+ images. |
+| `image_sizing` | bool | false | Per-`<img>` audit: decoded natural dimensions vs laid-out display dimensions (DPR-corrected so retina-tuned images aren't false-flagged), `loading` mode, viewport overlap, missing alt, **`has_width_attr` / `has_height_attr` / `has_srcset`** attribute presence, server-joined `transferred_bytes`, computed `waste_ratio`. Output sorted worst-first into `stat.image_sizing`. Same pass derives `stat.image_audit` — the Lighthouse "image four-pack" (`oversized` / `missing_dimensions` / `missing_lazy` / `missing_srcset`), each pre-sorted top-20 lists with concrete URLs + display dims so the AI can give one-line actionable suggestions per category. One `evaluate` call, ~2ms even for 100+ images. |
 | `dom_mutations` | bool | false | Install a pre-navigation `MutationObserver` and count DOM mutations (childList adds/removes + attribute changes) during the full render window. Output: `stat.dom_mutations` with totals + observation duration + top tags + top attributes. ≤5ms overhead even on heavy SPAs (counter-only, never stores raw records, `characterData` skipped). |
 | `resources` | bool | false | Include the full per-resource list (`stat.resources[]`) in the response. Default off — for "did the page load OK" validation, scalar `total_size` + `resource_count` + aggregated `resource_summary` (bytes & count by MIME bucket, status distribution, cache hit ratio, third-party bytes + top third-party domains, modern-protocol share, compression breakdown by algorithm, Cache-Control coverage, largest resource) cover the signal at a fraction of the payload. Enable only when you need per-entry forensics (timing / mime / cache flag / cache_control header value / initiator). Internal collection is always on, so dependent features (HAR, `image_sizing.transferred_bytes`, `resource_summary`) keep working regardless. |
 | `http_errors` | bool | false | Emit `stat.http_errors`: `failed_4xx[]` / `failed_5xx[]` lists, `network_failures[]` (DNS / TLS / connection-refused / blocked — sourced from CDP `Network.loadingFailed`), `final_url` after redirects, and `redirect_count`. Built for periodic health checks where the caller wants one focused "is this page broken / hijacked / redirected somewhere weird" signal without parsing `resources[]`. Subscribes to one extra CDP event stream when on; zero overhead when off. |
 | `coverage` | bool | false | Capture CSS / JS coverage into `stat.coverage` — Lighthouse "Reduce unused CSS / JS" feed (per-file used / unused bytes + top-10 wasteful files). Enables CDP `Profiler.startPreciseCoverage` + `CSS.startRuleUsageTracking` pre-navigation; takes / stops both after load. **Explicitly NOT enabled by `all_metrics=true`** — coverage disables some V8 script optimisations and keeps style-engine state for the full load, so it stays per-request opt-in even when the caller asks for "every analytical signal". Set `coverage=true` explicitly. |
-| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
+| `resource_hints` | bool | false | Audit declared `<link rel="preconnect">` / `<link rel="dns-prefetch">` against actually-loaded third-party hosts. Populates `resource_summary.resource_hints` with `declared_preconnect[]` / `declared_dns_prefetch[]` and a `gap[]` list of hot third parties hit without a hint (each = avoidable 100–300ms DNS+TLS per origin). One extra `<head>` evaluate (~5ms). OR-merged with `all_metrics`. |
+| `font_audit` | bool | false | Audit `@font-face` declarations + `document.fonts` for FOIT (Flash of Invisible Text) risk. Populates `stat.font_audit` with `font-display` distribution, `missing_swap[]` (per-face FOIT offenders — each gets `font-display: swap;` as the AI fix), `declared_preload_count` (scalar — "did you preload any fonts at all"), and `unreadable_stylesheets` (CORS blind-spot count, so the audit is honest about what it couldn't see). One `page.evaluate` over CSSOM (~3–8ms). OR-merged with `all_metrics`. |
+| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
+| `lang` | `en`\|`zh` | `en` | Language for the **markdown rendering** (section headings, prose, warning labels). The JSON envelope is **never** translated — all field names, enum tag values (`missing_immutable`, `short_max_age`, etc.), and machine-readable strings stay English so downstream code that branches on them keeps working across languages. Ignored when `format=json`. |
 | `normalize_custom_elements` | bool | true | (Markdown only) Rewrite custom elements (`taro-view-core`, etc.) to `<div>`/`<span>` based on computed `display`. |
 | `width` / `height` | u32 | 1920 / 1080 | Viewport size (any of width/height/DPR triggers override). |
 | `device_scale_factor` | f64 | 1.0 | Device pixel ratio. |
 | `touch` | bool | false | Enable mobile-style touch event emulation (`navigator.maxTouchPoints=5`, `ontouchstart` dispatchable). Pair with small viewport for full mobile sim. |
 | `cpu_throttle` | f64 | — | CPU slowdown multiplier (1.0 = native, 4.0 = 4× slower). Values ≤ 1.0 ignored. |
-| `user_agent` | string | — | UA override. |
-| `accept_language` | string | — | `Accept-Language` header override. Falls back to cached browser UA when set without `user_agent`. |
+| `user_agent` | string | — | UA override. **Default UA** (when omitted) is a pinned mainline Chrome string — `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36` — chosen to avoid the literal `HeadlessChrome` token that most WAFs (Cloudflare / Akamai / enterprise gateways) blanket-block. The actual Chromium binary version still appears in the `chromium launched` log as `binary_user_agent` for diagnostics. |
+| `accept_language` | string | — | `Accept-Language` header override. Independent of `user_agent`; can be set without specifying UA (the default Chrome UA above is used). |
 | `cookie` | string | — | Standard HTTP `Cookie` header format (`name=v; name2=v2`). Set before navigation. |
 | `headers` | `{ string: string }` | `{}` | Extra HTTP request headers. Best supplied via POST JSON. |
 | `timezone` | string | — | IANA tz id (`Asia/Shanghai`). |
@@ -190,6 +193,7 @@ curl -X POST http://localhost:3000/summary \
 | `wait_for_element` | string | — | CSS selector — block until element appears. |
 | `wait_for_function` | string | — | JS expression polled until truthy. |
 | `wait_for_request` | `[string]` | `[]` | URL substrings — block until **all** matching responses arrive (4xx/5xx → 502). |
+| `wait_until_load` | bool | false | Wait-gate strategy for the collect stage. `true` returns shortly after the `load` (onload) lifecycle event — faster + more deterministic on pages with long-tail analytics / WebSocket traffic that never reach `networkIdle`. `false` (default) returns shortly after Chrome's `networkIdle` (≥500ms with zero in-flight requests) — needed when you must record every late-firing response in `resources[]`. Independent of `wait_for_element` / `wait_for_function` / `wait_for_request`, which run / match regardless of which gate is active. Pair with `settle_ms` if late JS still needs to run before capture. |
 | `settle_ms` | u64 | — | Fixed delay after all waits, before data capture. |
 | `script` | string | — | JS evaluated after settle, before data capture. Use to dismiss modals, trigger lazy-load, etc. |
 | `capture_element` | string | — | CSS selector — return only this element's content in `data`. |
@@ -211,6 +215,9 @@ Each stage logs `duration_ms` at debug level so slow requests are
 trivially attributable.
 
 #### Response shape (JSON envelope)
+
+<details>
+<summary>Click to expand the full JSON example (~300 lines, every analytical field present)</summary>
 
 ```json
 {
@@ -238,6 +245,8 @@ trivially attributable.
       "connection_reused": true,
       "protocol": "h2",
       "content_encoding": "br",
+      "cache_control": "public, max-age=31536000, immutable",
+      "has_source_map": true,
       "from_cache": false,
       "timing": { "request_time": 5.123, "dns_start": 0.1 }
     }
@@ -262,13 +271,21 @@ trivially attributable.
     "lcp": 1234.5, "cls": 0.045, "tbt": 182.3, "ttfb": 156.0, "long_tasks": 3,
     "lcp_element": {
       "tag": "img", "id": "hero", "class": "hero-image",
-      "url": "https://cdn.example.com/hero.webp", "text_preview": null
+      "url": "https://cdn.example.com/hero.webp", "text_preview": null,
+      "size": 384000.0, "load_time": 980.4, "render_time": 1023.7,
+      "natural_width": 1920, "natural_height": 1080
     },
     "cls_entries": [
-      { "time_ms": 850, "value": 0.032, "sources": [{"tag":"div","id":"","class":"ad-banner"}] }
+      { "time_ms": 850, "value": 0.032, "sources": [
+        { "tag": "div", "id": "", "class": "ad-banner",
+          "previous_rect": { "x": 0, "y": 200, "width": 1280, "height": 90 },
+          "current_rect":  { "x": 0, "y": 440, "width": 1280, "height": 90 },
+          "distance_px": 240.0 }
+      ] }
     ],
     "cls_top_sources": [
-      { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71, "shift_count": 1 }
+      { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71,
+        "shift_count": 1, "max_distance_px": 240.0 }
     ],
     "inp": 0, "interaction_count": 0,
     "loaf_count": 5, "loaf_total_blocking_duration": 312.5,
@@ -281,7 +298,15 @@ trivially attributable.
         "total_forced_style_layout_ms": 42.1,
         "invocation_count": 3
       }
-    ]
+    ],
+    "long_task_top_offenders": [
+      { "source": "https://www.googletagmanager.com/gtm.js?id=GTM-XYZ",
+        "total_duration_ms": 412.0, "max_duration_ms": 187.5, "task_count": 3 },
+      { "source": "self", "total_duration_ms": 96.4,
+        "max_duration_ms": 96.4, "task_count": 1 }
+    ],
+    "fps_avg": 58.7, "fps_jank_ratio": 0.04,
+    "fps_longest_frame_ms": 42.0, "fps_frame_count": 178
   },
   "metrics": {
     "js_heap_used": 12582912, "js_heap_total": 18874368,
@@ -317,6 +342,41 @@ trivially attributable.
     "modern_image_bytes": 65000,
     "source_maps_present": 2,
     "source_maps_missing": 9,
+    "top_largest_by_type": {
+      "javascript": [
+        { "url": "https://cdn.example.com/vendors.js",
+          "bytes": 712600, "mime_type": "application/javascript",
+          "from_cache": false }
+      ],
+      "image": [
+        { "url": "https://example.com/hero.png",
+          "bytes": 184000, "mime_type": "image/png",
+          "from_cache": false }
+      ]
+    },
+    "uncompressed_text_resources": [
+      { "url": "https://example.com/static/legacy.js",
+        "mime_type": "application/javascript", "bytes": 62000 },
+      { "url": "https://example.com/static/styles.css",
+        "mime_type": "text/css", "bytes": 22200 }
+    ],
+    "cache_policy_issues": [
+      { "url": "https://cdn.example.com/app.4f7c2a91.js",
+        "mime_type": "application/javascript",
+        "cache_control": "public, max-age=31536000",
+        "reason": "missing_immutable" },
+      { "url": "https://example.com/static/logo.svg",
+        "mime_type": "image/svg+xml",
+        "cache_control": "public, max-age=30",
+        "reason": "short_max_age" }
+    ],
+    "resource_hints": {
+      "declared_preconnect": ["https://cdn.example.com"],
+      "declared_dns_prefetch": [],
+      "gap": [
+        { "host": "analytics.example", "bytes": 5800, "count": 2 }
+      ]
+    },
     "duplicate_resources": {
       "exact_url": [
         { "key": "https://example.com/static/app.js",
@@ -385,6 +445,24 @@ trivially attributable.
         "unused_bytes": 514600, "unused_ratio": 0.722 }
     ]
   },
+  "http_errors": {
+    "failed_count": 2,
+    "failed_4xx": [
+      { "url": "https://api.example.com/missing.json",
+        "status": 404, "resource_type": "Fetch" }
+    ],
+    "failed_5xx": [
+      { "url": "https://api.example.com/buggy",
+        "status": 503, "resource_type": "Xhr" }
+    ],
+    "network_failures": [
+      { "url": "https://blocked.example.com/script.js",
+        "error_text": "net::ERR_BLOCKED_BY_CLIENT",
+        "resource_type": "Script", "canceled": false }
+    ],
+    "final_url": "https://example.com/",
+    "redirect_count": 0
+  },
   "service_worker": {
     "controlled": true, "scope": "https://example.com/",
     "active_script": "https://example.com/sw.js",
@@ -419,9 +497,46 @@ trivially attributable.
       "device_pixel_ratio": 2.0,
       "loaded": true, "loading": "eager", "decoding": "auto",
       "in_viewport": true, "alt_missing": false,
+      "has_width_attr": false, "has_height_attr": false, "has_srcset": false,
       "transferred_bytes": 1843200, "waste_ratio": 0.83
     }
   ],
+  "image_audit": {
+    "oversized": [
+      { "url": "https://example.com/hero.jpg",
+        "display_width": 800, "display_height": 450,
+        "in_viewport": true, "ratio": 5.76 }
+    ],
+    "missing_dimensions": [
+      { "url": "https://example.com/hero.jpg",
+        "display_width": 800, "display_height": 450,
+        "in_viewport": true, "ratio": 0.0 }
+    ],
+    "missing_lazy": [
+      { "url": "https://example.com/footer-ad.png",
+        "display_width": 728, "display_height": 90,
+        "in_viewport": false, "ratio": 0.0 }
+    ],
+    "missing_srcset": [
+      { "url": "https://example.com/hero.jpg",
+        "display_width": 800, "display_height": 450,
+        "in_viewport": true, "ratio": 0.0 }
+    ]
+  },
+  "font_audit": {
+    "font_count": 4, "loaded_count": 3,
+    "display_distribution": { "swap": 2, "auto": 2 },
+    "missing_swap": [
+      { "family": "Inter",
+        "source_url": "https://example.com/fonts/inter.woff2",
+        "display": "auto" },
+      { "family": "Roboto Mono",
+        "source_url": "https://fonts.gstatic.com/s/robotomono/v23/...woff2",
+        "display": "block" }
+    ],
+    "declared_preload_count": 1,
+    "unreadable_stylesheets": 0
+  },
   "dom_mutations": {
     "total_added_nodes": 4521, "total_removed_nodes": 1203,
     "total_attribute_changes": 8932,
@@ -437,6 +552,8 @@ trivially attributable.
   }
 }
 ```
+
+</details>
 
 (`resources[].initiator` is also populated when `initiators=true`:
 `{ "type": "parser" | "script" | "preload" | ..., "url": "...", "line_number": 12 }`.)
@@ -704,7 +821,55 @@ metadata, page metrics with CPU time breakdown, DOM mutation hotspots,
 resources list, cookies. Store snapshots over time and diff to catch:
 
 - `lcp_element` changed → image broken → fallback rendered
+- `lcp_element.natural_width / display_width > 2` (display from
+  `image_sizing` or the LCP `size`) → oversized hero image; serve a
+  smaller variant + add `<link rel="preload">` of the right size
+- `lcp_element.load_time` jumped while `render_time` stayed close →
+  network slowed down on the LCP resource (CDN regression, missing
+  preconnect to its origin); inverse pattern (`render_time` up,
+  `load_time` flat) means the bottleneck moved to main-thread paint
 - `cls_top_sources[0].selector` changed → new layout offender
+- `cls_top_sources[0].max_distance_px > 100` → at least one element
+  jumped more than 100px; the value is the lower bound for the
+  `min-height` / reserved space that would have prevented it
+- `web_vitals.fps_jank_ratio > 0.10` → more than 10% of frames missed
+  the 60fps target during the observation window; visibly stuttery for
+  marketing / scroll-heavy pages. Cross-reference `loaf_top_offenders`
+  for attribution (script source). Treat as "regression on same
+  harness" rather than "user-device truth" because headless uses
+  software rasterization
+- `web_vitals.fps_longest_frame_ms > 100` → at least one frame took
+  longer than 100ms; user perceives a perceptible pause. The script
+  causing it is typically in `loaf_top_offenders[0].source_url`
+- `web_vitals.long_task_top_offenders[0].source` names the script
+  URL / iframe / function responsible for the most main-thread
+  blocking time. When `total_duration_ms > 200` and the source is a
+  third-party tag (gtm, segment, analytics), candidate for `async`
+  loading or splitting off the critical path
+- `image_audit.oversized[]` non-empty → each entry's `ratio` is the
+  oversize factor (natural / effective-display); ratio > 4 = serve a
+  smaller variant or add `srcset`
+- `image_audit.missing_dimensions[]` non-empty → CLS contributor
+  (browser can't reserve layout space pre-decode); add explicit
+  `width=` / `height=` attrs equal to the displayed CSS dims
+- `image_audit.missing_lazy[]` non-empty → below-the-fold images
+  fetched eagerly; add `loading="lazy"` to each
+- `image_audit.missing_srcset[]` non-empty → no responsive variants;
+  add `srcset` (and `sizes` for art direction)
+- `font_audit.missing_swap[]` non-empty → `@font-face` declarations
+  with `font-display` not in `{swap, optional}` will cause FOIT
+  (invisible text during load). Per-entry `family` + `source_url`
+  pins down the literal fix: add `font-display: swap;` to that
+  `@font-face` block
+- `font_audit.declared_preload_count == 0` AND `font_count > 0` →
+  page uses web fonts but preloads none of them. If any of those
+  fonts are render-critical (above-the-fold body / heading), add
+  `<link rel="preload" as="font" type="font/woff2" crossorigin>`
+- `font_audit.unreadable_stylesheets > 0` → audit was incomplete
+  due to cross-origin stylesheets without `crossorigin`. AI
+  suggestion: add `crossorigin` to those `<link rel="stylesheet">`
+  tags so the audit can see (and so the browser caches them
+  alongside the rest of the page)
 - `metrics.script_duration_ms` +30% with LCP unchanged → JS regression
 - `security_headers["Content-Security-Policy"]` missing → security regression
 - `security_audit.headers.present_count` dropped vs baseline → a deploy
@@ -773,6 +938,22 @@ resources list, cookies. Store snapshots over time and diff to catch:
   chain (Lighthouse "Avoid chaining critical requests"); preload key
   intermediate resources or flatten the dependency graph. Only emitted
   when `initiators=true`
+- `resource_summary.top_largest_by_type["javascript"][0].bytes > 500_000`
+  (or similar threshold per bucket) → one bundle dominates the type;
+  candidate for code-splitting or compression revisit. Each bucket
+  (`javascript` / `css` / `image` / `font`) gets its own top-5 list
+- `resource_summary.uncompressed_text_resources[]` non-empty → text
+  responses shipped without `Content-Encoding`; each entry names the
+  exact file to fix (already aggregated in `uncompressed_text_bytes`)
+- `resource_summary.cache_policy_issues[]` non-empty → static-asset
+  cache misconfig. `reason="short_max_age"` flags `max-age < 60s` on
+  JS / CSS / image / font; `reason="missing_immutable"` flags
+  fingerprinted URLs (hex token ≥ 8 chars) that ship `Cache-Control`
+  without `immutable` — every revalidation is pure waste
+- `resource_summary.resource_hints.gap[]` non-empty → hot third-party
+  hosts hit without a `<link rel="preconnect">` / `dns-prefetch`. Each
+  gap ≈ one avoidable DNS+TLS round-trip (~100–300ms). Only emitted
+  when `resource_hints=true` (or `all_metrics=true`)
 - `security_audit.cookies.header_bytes ≥ 4096` → cookie header at /
   beyond the typical 4 KB framework limit; every request pays this
   bandwidth tax
