@@ -155,7 +155,7 @@ curl -X POST http://localhost:3000/summary \
 | `pdf` | bool | false | Capture PDF via `Page.printToPDF` into `stat.pdf`. |
 | `har` | bool | false | Emit HAR 1.2 archive into `stat.har` (importable into Chrome DevTools). |
 | `save_dom_snapshot` | bool | false | Capture `DOMSnapshot.captureSnapshot` into `stat.dom_snapshot`. |
-| `web_vitals` | bool | false | Collect Core Web Vitals (LCP / CLS / TBT / TTFB / long-task count) into `stat.web_vitals` via `PerformanceObserver` installed pre-navigation. Also records `lcp_element` (tag / id / class / url / text **plus `size` / `load_time` / `render_time` / `natural_width` / `natural_height`** — lets the AI say "LCP is a 3840×2160 image rendered at 1920×1080, loaded at 980ms, paint at 1023ms; serve a smaller variant"), `cls_entries[]` with per-source movement geometry (`previous_rect` / `current_rect` / `distance_px`) + server-aggregated `cls_top_sources[]` (now carries `max_distance_px` — the biggest single jump, which is the lower bound for `min-height` / layout reservation), **`long_task_top_offenders[]`** (server-aggregated by `PerformanceLongTaskTiming.attribution[].container_src` — turns "long_tasks: 3" into "3 longtasks, 800ms total, all from gtm.js"), **INP** (max interaction duration — 2024 Core Web Vital; `0` in non-interactive scrapes, meaningful when `script` simulates clicks), **Long Animation Frames** (Chrome 123+: `loaf_count` + `loaf_total_blocking_duration` + server-aggregated `loaf_top_offenders[]` ranked by attributable script source — pinpoints which JS file is causing jank, with forced-reflow flag), and **FPS** (`fps_avg` / `fps_jank_ratio` / `fps_longest_frame_ms` / `fps_frame_count` — rAF-driven frame counter against a 60fps target; the `jank_ratio` and `longest_frame_ms` are the actionable signals for animation / scroll-heavy pages, and complement LoAF by catching sub-jank-threshold smoothness loss like a steady 45fps banner. Headless + VM uses software rasterization so absolute numbers aren't user-device-comparable — fine for regression detection on the same harness). |
+| `web_vitals` | bool | false | Collect Core Web Vitals (LCP / CLS / TBT / TTFB / long-task count) into `stat.web_vitals` via `PerformanceObserver` installed pre-navigation. Also records `lcp_element` (tag / id / class / url / text **plus `size` / `load_time` / `render_time` / `natural_width` / `natural_height`** — lets the AI say "LCP is a 3840×2160 image rendered at 1920×1080, loaded at 980ms, paint at 1023ms; serve a smaller variant"), `cls_entries[]` with per-source movement geometry (`previous_rect` / `current_rect` / `distance_px`) + server-aggregated `cls_top_sources[]` (now carries `max_distance_px` — the biggest single jump, which is the lower bound for `min-height` / layout reservation), **`long_task_top_offenders[]`** (server-aggregated by `PerformanceLongTaskTiming.attribution[].container_src` — turns "long_tasks: 3" into "3 longtasks, 800ms total, all from gtm.js"), **INP** (max interaction duration — 2024 Core Web Vital; `null` in non-interactive scrapes where `interaction_count == 0`, a real number only when `script` simulates clicks), **Long Animation Frames** (Chrome 123+: `loaf_count` + `loaf_total_blocking_duration` + server-aggregated `loaf_top_offenders[]` ranked by attributable script source — pinpoints which JS file is causing jank, with forced-reflow flag), and **FPS** (`fps_avg` / `fps_jank_ratio` / `fps_longest_frame_ms` / `fps_frame_count` — rAF-driven frame counter against a 60fps target; the `jank_ratio` and `longest_frame_ms` are the actionable signals for animation / scroll-heavy pages, and complement LoAF by catching sub-jank-threshold smoothness loss like a steady 45fps banner. Headless + VM uses software rasterization so absolute numbers aren't user-device-comparable — fine for regression detection on the same harness). |
 | `metrics` | bool | false | V8 heap + DOM counts + CPU time breakdown (`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms` / `task_duration_ms`) into `stat.metrics` via `Performance.getMetrics`. Gold for "LCP unchanged but script time +30%" regressions. |
 | `metadata` | bool | false | Page `<head>` metadata (title / description / canonical / robots / lang / viewport / charset / theme-color / OG / Twitter) into `stat.metadata`. Catches SEO regressions instantly. |
 | `render_blocking` | bool | false | Scan `<head>` for render-blocking sync stylesheets and scripts without `async`/`defer`/`module`; result in `stat.render_blocking_resources[]`. |
@@ -169,7 +169,8 @@ curl -X POST http://localhost:3000/summary \
 | `coverage` | bool | false | Capture CSS / JS coverage into `stat.coverage` — Lighthouse "Reduce unused CSS / JS" feed (per-file used / unused bytes + top-10 wasteful files). Enables CDP `Profiler.startPreciseCoverage` + `CSS.startRuleUsageTracking` pre-navigation; takes / stops both after load. **Explicitly NOT enabled by `all_metrics=true`** — coverage disables some V8 script optimisations and keeps style-engine state for the full load, so it stays per-request opt-in even when the caller asks for "every analytical signal". Set `coverage=true` explicitly. |
 | `resource_hints` | bool | false | Audit declared `<link rel="preconnect">` / `<link rel="dns-prefetch">` against actually-loaded third-party hosts. Populates `resource_summary.resource_hints` with `declared_preconnect[]` / `declared_dns_prefetch[]` and a `gap[]` list of hot third parties hit without a hint (each = avoidable 100–300ms DNS+TLS per origin). One extra `<head>` evaluate (~5ms). OR-merged with `all_metrics`. |
 | `font_audit` | bool | false | Audit `@font-face` declarations + `document.fonts` for FOIT (Flash of Invisible Text) risk. Populates `stat.font_audit` with `font-display` distribution, `missing_swap[]` (per-face FOIT offenders — each gets `font-display: swap;` as the AI fix), `declared_preload_count` (scalar — "did you preload any fonts at all"), and `unreadable_stylesheets` (CORS blind-spot count, so the audit is honest about what it couldn't see). One `page.evaluate` over CSSOM (~3–8ms). OR-merged with `all_metrics`. |
-| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
+| `security_scan` | bool | false | Deep client-side security scan into `stat.security_scan`: **SRI coverage** on cross-origin `<script>`/`<link>` (missing-`integrity` supply-chain risks), **`target=_blank`** links with an explicit `rel=opener` (high-severity reverse-tabnabbing; bare missing-`noopener` is not flagged since modern browsers imply it), **form security** (cleartext `action` / password fields on non-HTTPS pages), **JS library + version fingerprint** (jQuery / React / Vue / Angular / …, cross-reference against CVE ranges offline), and passively-detected **CORS** `Access-Control-Allow-Origin: *`-with-credentials misconfigurations. One extra `page.evaluate` DOM walk (~2–5ms) plus a pure server-side CORS derive. OR-merged with `all_metrics`. Distinct from the always-on `security_audit` (header/cookie config scorecard). |
+| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
 | `lang` | `en`\|`zh` | `en` | Language for the **markdown rendering** (section headings, prose, warning labels). The JSON envelope is **never** translated — all field names, enum tag values (`missing_immutable`, `short_max_age`, etc.), and machine-readable strings stay English so downstream code that branches on them keeps working across languages. Ignored when `format=json`. |
@@ -287,7 +288,7 @@ trivially attributable.
       { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71,
         "shift_count": 1, "max_distance_px": 240.0 }
     ],
-    "inp": 0, "interaction_count": 0,
+    "inp": null, "interaction_count": 0,
     "loaf_count": 5, "loaf_total_blocking_duration": 312.5,
     "loaf_top_offenders": [
       {
@@ -328,6 +329,11 @@ trivially attributable.
     "top_third_party_domains": [
       { "host": "cdn.vendor.com", "bytes": 12400, "count": 3 },
       { "host": "analytics.example", "bytes": 5800, "count": 2 }
+    ],
+    "third_party_script_bytes": 11200,
+    "third_party_script_origins": [
+      { "host": "cdn.vendor.com", "bytes": 8400, "count": 2 },
+      { "host": "analytics.example", "bytes": 2800, "count": 1 }
     ],
     "largest_resource": ["https://cdn.example.com/vendors.js", 712600],
     "protocol_distribution": { "h2": 18, "h3": 4, "http/1.1": 2 },
@@ -426,7 +432,18 @@ trivially attributable.
       "referrer_policy": false, "permissions_policy": false,
       "coop": false, "coep": false,
       "present_count": 4,
-      "missing": ["Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"]
+      "missing": ["Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"],
+      "csp_analysis": {
+        "directive_count": 5, "unsafe_inline": true, "unsafe_eval": false,
+        "wildcard_directives": ["img-src"],
+        "missing_object_src": false, "missing_base_uri": true,
+        "missing_frame_ancestors": true,
+        "weaknesses": ["unsafe-inline", "wildcard-source", "missing-base-uri", "missing-frame-ancestors"]
+      },
+      "hsts_analysis": {
+        "max_age": 31536000, "include_subdomains": true,
+        "preload": false, "effective": true
+      }
     },
     "cookies": {
       "total": 3, "secure": 3, "http_only": 2,
@@ -537,6 +554,33 @@ trivially attributable.
     "declared_preload_count": 1,
     "unreadable_stylesheets": 0
   },
+  "security_scan": {
+    "sri": {
+      "total_cross_origin": 4, "protected": 1,
+      "missing": [
+        { "tag": "script", "url": "https://cdn.vendor.com/widget.js", "crossorigin": "anonymous" },
+        { "tag": "link", "url": "https://cdn.vendor.com/theme.css", "crossorigin": null }
+      ]
+    },
+    "unsafe_target_blank": [
+      { "href": "https://partner.example/promo", "rel": "opener" }
+    ],
+    "forms": {
+      "total": 2,
+      "insecure_action": [
+        { "action": "http://legacy.example.com/login", "has_password": true }
+      ],
+      "password_on_insecure_page": 0
+    },
+    "libraries": [
+      { "name": "jQuery", "version": "3.6.0", "global": "jQuery" },
+      { "name": "React", "version": "18.2.0", "global": "React" }
+    ],
+    "cors_issues": [
+      { "url": "https://api.vendor.com/data", "allow_origin": "*",
+        "allow_credentials": true, "reason": "wildcard-with-credentials" }
+    ]
+  },
   "dom_mutations": {
     "total_added_nodes": 4521, "total_removed_nodes": 1203,
     "total_attribute_changes": 8932,
@@ -602,6 +646,44 @@ total cookies plus per-flag coverage (`secure` / `http_only` /
 counter (any non-zero value is a finding — modern browsers reject those
 cookies). When the page sets no cookies and serves no security headers
 the whole struct is zeroes/falses, which is itself a real signal.
+
+Two headers carry their real signal in the *value*, not just presence,
+so they're deep-parsed: `security_audit.headers.csp_analysis` (present
+only when an enforcing CSP exists) dissects the policy into
+`unsafe_inline` / `unsafe_eval` / `wildcard_directives` /
+`missing_object_src` / `missing_base_uri` / `missing_frame_ancestors`,
+collapsed into a single `weaknesses[]` list — a present-but-weak CSP is
+the finding `csp: true` alone hides. `security_audit.headers.hsts_analysis`
+parses `max-age` / `includeSubDomains` / `preload` and sets `effective`
+(`false` when `max-age=0`, i.e. HSTS present but disabled — a classic
+botched rollback). Both are `None`/omitted when the underlying header is
+absent.
+
+`resource_summary.third_party_script_origins` is the page's third-party
+**executable-JS** attack surface: external origins that ship code running
+in your origin with full DOM/cookie access (Magecart-style supply-chain
+vector). Ranked by JS bytes, capped at 10; `third_party_script_bytes` is
+the scalar total. Distinct from `third_party_bytes`/`top_third_party_domains`
+(all asset types) — a new origin appearing here after a deploy means a
+new external code dependency was introduced.
+
+`security_scan` (opt-in, `security_scan=true`) is the DOM-level companion
+to the always-on `security_audit` config scorecard. It bundles five
+findings read off the rendered DOM / observed responses: `sri`
+(Subresource-Integrity coverage on cross-origin `<script>`/`<link>` —
+`total_cross_origin` / `protected` / a `missing[]` list of supply-chain
+gaps); `unsafe_target_blank[]` (links with an explicit `rel=opener` —
+the high-severity reverse-tabnabbing case; bare missing-`noopener` links
+are **not** reported since modern browsers imply `noopener` for
+`target=_blank`); `forms` (cleartext `action` endpoints + password
+fields on non-HTTPS pages); `libraries[]` (JS
+framework + version fingerprint from well-known globals, for offline
+CVE cross-referencing — absence is **not** proof of absence since
+bundlers strip globals); and `cors_issues[]` (passively-detected
+`Access-Control-Allow-Origin: *`-with-credentials server bugs — it does
+**not** actively probe for reflected-origin bypasses). One extra DOM
+walk; the CORS portion is a pure server-side derive over the captured
+responses.
 
 #### Markdown envelope (`format=markdown`)
 
@@ -870,6 +952,16 @@ resources list, cookies. Store snapshots over time and diff to catch:
   suggestion: add `crossorigin` to those `<link rel="stylesheet">`
   tags so the audit can see (and so the browser caches them
   alongside the rest of the page)
+- `security_scan.sri.missing[]` non-empty → cross-origin `<script>`/`<link>`
+  without `integrity`; a CDN compromise ships arbitrary code. Add an SRI
+  hash (`integrity="sha384-…"` + `crossorigin`) to each
+- `security_scan.cors_issues[]` non-empty → an API ships
+  `Access-Control-Allow-Origin: *` together with credentials (spec-invalid
+  server bug); set a specific allow-list origin instead of `*`
+- `security_scan.forms.insecure_action[]` non-empty → form posts over
+  plain HTTP (credential leak / mixed content); switch the `action` to HTTPS
+- `security_scan.libraries[]` shows an outdated version → cross-reference
+  the `name` + `version` against known-CVE ranges and upgrade
 - `metrics.script_duration_ms` +30% with LCP unchanged → JS regression
 - `security_headers["Content-Security-Policy"]` missing → security regression
 - `security_audit.headers.present_count` dropped vs baseline → a deploy
@@ -879,6 +971,13 @@ resources list, cookies. Store snapshots over time and diff to catch:
   that modern browsers reject outright; always actionable
 - `security_audit.cookies.secure / total` ratio dropped → a new cookie was
   set without the `Secure` flag (likely a third-party script)
+- `security_audit.headers.csp_analysis.weaknesses[]` grew (or
+  `unsafe_inline` flipped true) → a deploy weakened the CSP; the most
+  common real regression behind a still-`true` `csp` bool
+- `security_audit.headers.hsts_analysis.effective` flipped to false →
+  HSTS present but `max-age=0` (disabled), usually a botched rollback
+- New origin in `resource_summary.third_party_script_origins[]` → a new
+  external code dependency now runs in your origin; review the supplier
 - `metadata.robots` contains `noindex` unexpectedly → SEO catastrophe
 - New entries in `render_blocking_resources` → perf regression
 - `service_worker.controlled` flipped to false → PWA broken

@@ -525,12 +525,114 @@ fn format_tls_expiry(days_remaining: i64) -> String {
 /// `WebPageStat.security_headers`). `cookies` is the page's full jar.
 ///
 /// Pure derive — runs in O(headers + cookies), no IO.
+/// Parse an enforcing `Content-Security-Policy` value into a weakness
+/// report. `value` is the raw header string (e.g.
+/// `"default-src 'self'; script-src 'self' 'unsafe-inline' *"`).
+/// Returns `None` when the value parses to zero directives (blank /
+/// malformed) — the caller treats that the same as "no CSP".
+fn parse_csp(value: &str) -> Option<CspAnalysis> {
+    // directive name (lowercased) -> source tokens (case preserved;
+    // keywords like 'unsafe-inline' are case-insensitive per spec).
+    let mut directives: HashMap<String, Vec<String>> = HashMap::new();
+    for raw in value.split(';') {
+        let mut parts = raw.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let sources: Vec<String> = parts.map(|s| s.to_string()).collect();
+        // A directive can legally appear once; last-wins matches browser
+        // behaviour but for a weakness scan a merge is safer (any unsafe
+        // source anywhere is a finding).
+        directives
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .extend(sources);
+    }
+    if directives.is_empty() {
+        return None;
+    }
+
+    let has_kw = |kw: &str| -> bool {
+        directives
+            .values()
+            .flatten()
+            .any(|src| src.eq_ignore_ascii_case(kw))
+    };
+    let mut a = CspAnalysis {
+        directive_count: directives.len() as u32,
+        unsafe_inline: has_kw("'unsafe-inline'"),
+        unsafe_eval: has_kw("'unsafe-eval'"),
+        ..Default::default()
+    };
+    // Wildcard sources: a bare `*` in a directive's source list. Sorted
+    // for stable output.
+    let mut wildcard: Vec<String> = directives
+        .iter()
+        .filter(|(_, srcs)| srcs.iter().any(|s| s == "*"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    wildcard.sort();
+    a.wildcard_directives = wildcard;
+    // object-src falls back to default-src; base-uri / frame-ancestors
+    // do NOT fall back (frame-specific / standalone directives).
+    a.missing_object_src =
+        !directives.contains_key("object-src") && !directives.contains_key("default-src");
+    a.missing_base_uri = !directives.contains_key("base-uri");
+    a.missing_frame_ancestors = !directives.contains_key("frame-ancestors");
+
+    let mut w = Vec::new();
+    if a.unsafe_inline {
+        w.push("unsafe-inline".to_string());
+    }
+    if a.unsafe_eval {
+        w.push("unsafe-eval".to_string());
+    }
+    if !a.wildcard_directives.is_empty() {
+        w.push("wildcard-source".to_string());
+    }
+    if a.missing_object_src {
+        w.push("missing-object-src".to_string());
+    }
+    if a.missing_base_uri {
+        w.push("missing-base-uri".to_string());
+    }
+    if a.missing_frame_ancestors {
+        w.push("missing-frame-ancestors".to_string());
+    }
+    a.weaknesses = w;
+    Some(a)
+}
+
+/// Parse a `Strict-Transport-Security` value (e.g.
+/// `"max-age=31536000; includeSubDomains; preload"`).
+fn parse_hsts(value: &str) -> HstsAnalysis {
+    let mut a = HstsAnalysis::default();
+    for raw in value.split(';') {
+        let tok = raw.trim();
+        if let Some(rest) = tok
+            .strip_prefix("max-age")
+            .or_else(|| tok.strip_prefix("Max-Age"))
+            .and_then(|r| r.trim_start().strip_prefix('='))
+        {
+            // Value may be quoted (`max-age="31536000"`) per the grammar.
+            let digits = rest.trim().trim_matches('"');
+            a.max_age = digits.parse::<u64>().ok();
+        } else if tok.eq_ignore_ascii_case("includeSubDomains") {
+            a.include_subdomains = true;
+        } else if tok.eq_ignore_ascii_case("preload") {
+            a.preload = true;
+        }
+    }
+    a.effective = a.max_age.is_some_and(|m| m > 0);
+    a
+}
+
 fn build_security_audit(
     headers: Option<&HashMap<String, String>>,
     cookies: &[Cookie],
 ) -> SecurityAudit {
     let mut h = SecurityHeadersCheck::default();
     let has = |name: &str| -> bool { headers.is_some_and(|m| m.contains_key(name)) };
+    let get =
+        |name: &str| -> Option<&str> { headers.and_then(|m| m.get(name)).map(|s| s.as_str()) };
     h.hsts = has("Strict-Transport-Security");
     h.csp = has("Content-Security-Policy");
     h.csp_report_only = has("Content-Security-Policy-Report-Only");
@@ -540,6 +642,12 @@ fn build_security_audit(
     h.permissions_policy = has("Permissions-Policy");
     h.coop = has("Cross-Origin-Opener-Policy");
     h.coep = has("Cross-Origin-Embedder-Policy");
+
+    // Deep-parse the two headers whose *value* carries the real signal.
+    // Presence bools above stay as the headline; these add the "is it
+    // actually any good" layer.
+    h.csp_analysis = get("Content-Security-Policy").and_then(parse_csp);
+    h.hsts_analysis = get("Strict-Transport-Security").map(parse_hsts);
 
     let mut missing = Vec::new();
     for &name in CORE_SECURITY_HEADERS {
@@ -917,6 +1025,139 @@ pub async fn collect_font_audit(page: &Page) -> Result<FontAudit, Error> {
         declared_preload_count: raw.declared_preload_count,
         unreadable_stylesheets: raw.unreadable_stylesheets,
     })
+}
+
+/// Single DOM-walk security scan: SRI coverage on cross-origin
+/// subresources, `target=_blank` reverse-tabnabbing, form security, and
+/// JS-library fingerprinting. All four are read off already-rendered DOM
+/// / `window` globals, so the cost is one `page.evaluate` (~2–5ms). The
+/// CORS portion of `SecurityScan` is filled separately server-side
+/// (`build_cors_issues`) — JS can't read cross-origin response headers,
+/// so it has to come from the CDP-observed responses.
+const SECURITY_SCAN_JS: &str = r#"
+(function() {
+  const loc = window.location;
+  const pageHttps = loc.protocol === 'https:';
+  const pageOrigin = loc.origin;
+  function abs(u) { try { return new URL(u, document.baseURI).href; } catch(e) { return u || ''; } }
+  function isCrossOrigin(u) {
+    try { return new URL(u, document.baseURI).origin !== pageOrigin; } catch(e) { return false; }
+  }
+
+  // ---- SRI: cross-origin <script src> + <link> (stylesheet/preload) ----
+  const sri = { total_cross_origin: 0, protected: 0, missing: [] };
+  const sriNodes = [];
+  for (const s of document.querySelectorAll('script[src]')) {
+    sriNodes.push({ tag: 'script', url: s.src, integrity: s.integrity, crossorigin: s.getAttribute('crossorigin') });
+  }
+  for (const l of document.querySelectorAll('link[rel~="stylesheet"][href], link[rel="modulepreload"][href], link[rel="preload"][as="script"][href]')) {
+    sriNodes.push({ tag: 'link', url: l.href, integrity: l.integrity, crossorigin: l.getAttribute('crossorigin') });
+  }
+  for (const n of sriNodes) {
+    if (!n.url || !isCrossOrigin(n.url)) continue;
+    sri.total_cross_origin++;
+    if (n.integrity && n.integrity.trim()) {
+      sri.protected++;
+    } else if (sri.missing.length < 30) {
+      sri.missing.push({ tag: n.tag, url: n.url, crossorigin: n.crossorigin || null });
+    }
+  }
+
+  // ---- target=_blank without rel=noopener ----
+  // Only flag the high-severity case: an explicit `rel="opener"` that
+  // re-enables `window.opener` on ALL browsers. Modern browsers (Chrome
+  // 88+/FF 79+/Safari 12.1+) imply `noopener` for `target=_blank` by
+  // default, so a bare missing-`noopener` link is no longer a finding.
+  const unsafe_target_blank = [];
+  for (const a of document.querySelectorAll('a[target="_blank"], area[target="_blank"]')) {
+    const rel = (a.getAttribute('rel') || '').toLowerCase();
+    const hasOpener = /\bopener\b/.test(rel); // \b excludes "noopener"
+    if (hasOpener && unsafe_target_blank.length < 30) {
+      unsafe_target_blank.push({ href: a.href || '', rel: a.getAttribute('rel') || null });
+    }
+  }
+
+  // ---- form security ----
+  const forms = { total: 0, insecure_action: [], password_on_insecure_page: 0 };
+  for (const f of document.querySelectorAll('form')) {
+    forms.total++;
+    const action = f.getAttribute('action') ? f.action : loc.href;
+    let actionHttps = true;
+    try { actionHttps = new URL(action, document.baseURI).protocol === 'https:'; } catch(e) {}
+    const hasPassword = !!f.querySelector('input[type="password"]');
+    if (!actionHttps && (hasPassword || pageHttps) && forms.insecure_action.length < 20) {
+      forms.insecure_action.push({ action: abs(action), has_password: hasPassword });
+    }
+    if (hasPassword && !pageHttps) forms.password_on_insecure_page++;
+  }
+
+  // ---- JS library fingerprint (read well-known globals) ----
+  const libraries = [];
+  const add = (name, version, global) => libraries.push({ name, version: version || null, global });
+  const w = window;
+  try { if (w.jQuery && w.jQuery.fn && w.jQuery.fn.jquery) add('jQuery', w.jQuery.fn.jquery, 'jQuery'); } catch(e){}
+  try { if (w.React && w.React.version) add('React', w.React.version, 'React');
+        else if (w.ReactDOM && w.ReactDOM.version) add('React', w.ReactDOM.version, 'ReactDOM'); } catch(e){}
+  try { if (w.Vue && w.Vue.version) add('Vue', w.Vue.version, 'Vue'); } catch(e){}
+  try { if (w.angular && w.angular.version && w.angular.version.full) add('AngularJS', w.angular.version.full, 'angular'); } catch(e){}
+  try { if (w.getAllAngularRootElements || (w.ng && w.ng.coreTokens)) add('Angular', null, 'ng'); } catch(e){}
+  try { if (w._ && w._.VERSION) add('Lodash', w._.VERSION, '_'); } catch(e){}
+  try { if (w.d3 && w.d3.version) add('D3', w.d3.version, 'd3'); } catch(e){}
+  try { if (w.moment && w.moment.version) add('Moment.js', w.moment.version, 'moment'); } catch(e){}
+  try { if (w.bootstrap && w.bootstrap.Tooltip && w.bootstrap.Tooltip.VERSION) add('Bootstrap', w.bootstrap.Tooltip.VERSION, 'bootstrap'); } catch(e){}
+  try { if (w.__NEXT_DATA__ || w.next) add('Next.js', (w.next && w.next.version) || null, 'next'); } catch(e){}
+  try { if (w.__NUXT__) add('Nuxt', null, '__NUXT__'); } catch(e){}
+  try { if (w.Alpine && w.Alpine.version) add('Alpine.js', w.Alpine.version, 'Alpine'); } catch(e){}
+  try { if (w.axios && w.axios.VERSION) add('axios', w.axios.VERSION, 'axios'); } catch(e){}
+
+  return { sri, unsafe_target_blank, forms, libraries };
+})()
+"#;
+
+/// Run the client-side portion of the security scan. `cors_issues` is
+/// left empty here and filled by `build_cors_issues` in Phase B (needs
+/// the server-collected resource list).
+pub async fn collect_security_scan(page: &Page) -> Result<SecurityScan, Error> {
+    let eval = page.evaluate(SECURITY_SCAN_JS).await?;
+    let scan: SecurityScan = eval
+        .into_value()
+        .map_err(|e| Error::Cdp(format!("security_scan decode: {e}")))?;
+    Ok(scan)
+}
+
+/// Derive passive CORS misconfiguration findings from observed responses.
+/// Flags the one unambiguous server bug: `Access-Control-Allow-Origin`
+/// of `*` or `null` together with `Access-Control-Allow-Credentials:
+/// true` (browsers reject the combo, but the server is misconfigured and
+/// it's reportable). Deduplicated by URL, capped at 20.
+fn build_cors_issues(resources: &[WebPageResource]) -> Vec<CorsIssue> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in resources {
+        if !r.cors_allow_credentials {
+            continue;
+        }
+        let Some(acao) = r.cors_allow_origin.as_deref() else {
+            continue;
+        };
+        let acao_trim = acao.trim();
+        if acao_trim != "*" && !acao_trim.eq_ignore_ascii_case("null") {
+            continue;
+        }
+        if !seen.insert(r.url.as_str()) {
+            continue;
+        }
+        out.push(CorsIssue {
+            url: r.url.clone(),
+            allow_origin: acao_trim.to_string(),
+            allow_credentials: true,
+            reason: "wildcard-with-credentials".to_string(),
+        });
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    out
 }
 
 /// Per-image sizing collector. Reads `naturalWidth/Height` (decoded pixel
@@ -1424,6 +1665,9 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
     // populated for hosts that differ from `target_host` so the page's
     // own origin doesn't show up in the third-party list.
     let mut third_party_by_host: HashMap<String, (u64, u32)> = HashMap::new();
+    // Subset of the above restricted to executable-JS resources — the
+    // supply-chain attack surface (`third_party_script_origins`).
+    let mut third_party_scripts_by_host: HashMap<String, (u64, u32)> = HashMap::new();
     let mut modern_protocol_hits: u32 = 0;
     let mut real_network_responses: u32 = 0;
 
@@ -1542,6 +1786,15 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
                 let slot = third_party_by_host.entry(h.to_string()).or_insert((0, 0));
                 slot.0 += r.content_size;
                 slot.1 += 1;
+                // Executable-JS subset: same host bucketing, JS only.
+                if mime_bucket(&r.mime_type) == "javascript" {
+                    summary.third_party_script_bytes += r.content_size;
+                    let js = third_party_scripts_by_host
+                        .entry(h.to_string())
+                        .or_insert((0, 0));
+                    js.0 += r.content_size;
+                    js.1 += 1;
+                }
             }
         }
 
@@ -1570,6 +1823,15 @@ fn build_resource_summary(resources: &[WebPageResource], target_url: &str) -> Re
     by_bytes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.host.cmp(&b.host)));
     by_bytes.truncate(10);
     summary.top_third_party_domains = by_bytes;
+
+    // Third-party executable-JS origins, same ranking convention.
+    let mut script_origins: Vec<DomainBytes> = third_party_scripts_by_host
+        .into_iter()
+        .map(|(host, (bytes, count))| DomainBytes { host, bytes, count })
+        .collect();
+    script_origins.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.host.cmp(&b.host)));
+    script_origins.truncate(10);
+    summary.third_party_script_origins = script_origins;
 
     summary.modern_protocol_share = if real_network_responses > 0 {
         modern_protocol_hits as f64 / real_network_responses as f64
@@ -2875,6 +3137,14 @@ pub struct WebPageStat {
     /// with `all_metrics`). One extra `page.evaluate` over CSSOM (~3–8ms
     /// depending on stylesheet count).
     pub font_audit: Option<FontAudit>,
+    /// Deep client-side security scan: SRI coverage, unsafe
+    /// `target=_blank` links, form security, JS library fingerprint, and
+    /// passively-detected CORS misconfigurations. Populated only when
+    /// `SummaryRequest.security_scan = true` (OR-merged with
+    /// `all_metrics`). One extra `page.evaluate` DOM walk (~2–5ms) plus a
+    /// pure server-side CORS derive. Distinct from the always-on
+    /// `security_audit` (header/cookie config scorecard).
+    pub security_scan: Option<SecurityScan>,
     /// DOM mutation hotspot summary captured via pre-navigation
     /// `MutationObserver`. Populated only when
     /// `SummaryRequest.dom_mutations = true`. Useful for diagnosing
@@ -2950,15 +3220,17 @@ const SECURITY_HEADER_NAMES: &[&str] = &[
     "Cross-Origin-Embedder-Policy",
     "Cross-Origin-Opener-Policy",
     "Cross-Origin-Resource-Policy",
-    "X-XSS-Protection",
 ];
+// `X-XSS-Protection` is intentionally NOT collected: it's deprecated,
+// modern browsers ignore it, and `1; mode=block` has itself been a
+// source of vulnerabilities — surfacing it as a "security header" would
+// mislead more than inform.
 
 /// The "core enforced" subset of the above — headers that actually block
 /// something (clickjacking, MIME sniffing, mixed content, popup-tab
 /// isolation). Absence of any one is treated as a finding by
 /// `SecurityAudit.headers.missing`. Excludes:
 ///   - `Content-Security-Policy-Report-Only` — report-only doesn't block.
-///   - `X-XSS-Protection` — deprecated; modern browsers ignore it.
 ///   - `Cross-Origin-Embedder-Policy` / `Cross-Origin-Resource-Policy` —
 ///     situational (only relevant for cross-origin isolation use cases).
 const CORE_SECURITY_HEADERS: &[&str] = &[
@@ -3030,6 +3302,216 @@ pub struct SecurityHeadersCheck {
     /// Canonical names of the core headers that were missing. Empty
     /// when all 7 are present.
     pub missing: Vec<String>,
+    /// Parsed analysis of the enforcing `Content-Security-Policy` value.
+    /// `None` when no enforcing CSP header was present (`csp=false`) —
+    /// the bool already tells you it's absent; this struct only exists
+    /// when there's a policy worth dissecting. A present-but-weak policy
+    /// (`unsafe-inline`, `*` sources, missing `object-src`/`base-uri`/
+    /// `frame-ancestors`) is the common real-world finding that
+    /// `csp=true` alone hides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csp_analysis: Option<CspAnalysis>,
+    /// Parsed analysis of the `Strict-Transport-Security` value. `None`
+    /// when `hsts=false`. Distinguishes a real policy from a useless one
+    /// (`max-age=0` disables HSTS; short `max-age` weakens it; missing
+    /// `includeSubDomains` leaves subdomains downgradable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hsts_analysis: Option<HstsAnalysis>,
+}
+
+/// Dissection of the enforcing `Content-Security-Policy` header. Pure
+/// string parse — directives split on `;`, each directive is a name
+/// followed by a space-separated source list. All checks are
+/// conservative (a finding means "definitely weak", not "possibly").
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CspAnalysis {
+    /// Number of directives parsed (e.g. `default-src`, `script-src`, …).
+    pub directive_count: u32,
+    /// Any directive allows `'unsafe-inline'` — defeats the primary XSS
+    /// mitigation CSP exists for (inline `<script>` / `onclick=` run).
+    pub unsafe_inline: bool,
+    /// Any directive allows `'unsafe-eval'` — `eval()` / `new Function()`
+    /// / string `setTimeout` permitted, a common XSS sink.
+    pub unsafe_eval: bool,
+    /// Directive names whose source list contains a bare `*` wildcard
+    /// (e.g. `script-src *`). A wildcard `script-src`/`default-src`
+    /// effectively disables source restriction for that resource type.
+    pub wildcard_directives: Vec<String>,
+    /// Neither `object-src` nor `default-src` is declared — `<object>` /
+    /// `<embed>` (legacy plugin / Flash-style injection vectors) are
+    /// unrestricted. Best practice is `object-src 'none'`.
+    pub missing_object_src: bool,
+    /// No `base-uri` directive. `base-uri` does **not** fall back to
+    /// `default-src`, so its absence lets injected `<base>` tags rewrite
+    /// every relative URL on the page (script/CSS hijack).
+    pub missing_base_uri: bool,
+    /// No `frame-ancestors` directive. Also no `default-src` fallback
+    /// (the directive is frame-specific). Absence means CSP provides no
+    /// clickjacking protection — relies entirely on `X-Frame-Options`.
+    pub missing_frame_ancestors: bool,
+    /// Human-scannable weakness codes, any of: `"unsafe-inline"`,
+    /// `"unsafe-eval"`, `"wildcard-source"`, `"missing-object-src"`,
+    /// `"missing-base-uri"`, `"missing-frame-ancestors"`. Empty list =
+    /// a hardened policy. The single field a monitor can alert on.
+    pub weaknesses: Vec<String>,
+}
+
+/// Dissection of the `Strict-Transport-Security` header value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HstsAnalysis {
+    /// Parsed `max-age` seconds. `None` when the directive was malformed
+    /// or absent (a `Strict-Transport-Security` header with no `max-age`
+    /// is invalid and ignored by browsers — `effective=false`).
+    pub max_age: Option<u64>,
+    /// `includeSubDomains` present — without it, subdomains can still be
+    /// downgraded to HTTP even though the apex is protected.
+    pub include_subdomains: bool,
+    /// `preload` present — opts into the browser HSTS preload list
+    /// (protection on the very first visit, before any header is seen).
+    pub preload: bool,
+    /// True when `max-age` is present and > 0. `max-age=0` is the
+    /// documented way to *disable* HSTS — header present but
+    /// `effective=false` is a real finding (often a botched rollback).
+    pub effective: bool,
+}
+
+/// Opt-in deep client-side security scan (`SummaryRequest.security_scan`).
+/// Distinct from the always-on `SecurityAudit` (which derives a config
+/// scorecard purely from response headers + cookies): this performs one
+/// extra `page.evaluate` DOM walk plus a server-side CORS derive, and so
+/// is gated behind its own flag. `None` on `WebPageStat` when not
+/// requested. Bundles five orthogonal findings that all live in the
+/// rendered DOM / observed responses rather than the config headers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityScan {
+    /// Subresource Integrity coverage for cross-origin `<script>` /
+    /// `<link>` (stylesheet / preload / modulepreload).
+    pub sri: SriAudit,
+    /// `<a target="_blank">` / `<area>` links with an explicit
+    /// `rel="opener"` — the high-severity reverse-tabnabbing case that
+    /// re-enables `window.opener` on **all** browsers. Bare
+    /// missing-`noopener` links are intentionally **not** reported:
+    /// Chrome 88+/Firefox 79+/Safari 12.1+ imply `noopener` for
+    /// `target="_blank"` by default, so their absence is no longer a
+    /// finding. Capped at 30. Usually empty.
+    pub unsafe_target_blank: Vec<UnsafeLink>,
+    /// `<form>` security findings — cleartext actions and password
+    /// fields on non-HTTPS pages.
+    pub forms: FormSecurityAudit,
+    /// Detected JS libraries + versions, read from well-known globals
+    /// (`jQuery.fn.jquery`, `React.version`, `Vue.version`, …). Lets the
+    /// caller cross-reference versions against known-CVE ranges offline.
+    /// `version` is `None` when the library exposes no version global.
+    /// Empty when no recognised library is present (SPA bundlers often
+    /// strip globals — absence is not proof of absence).
+    pub libraries: Vec<DetectedLibrary>,
+    /// Cross-Origin Resource Sharing misconfigurations observed on real
+    /// responses. **Passive** detection only — flags the unambiguous
+    /// server bug `Access-Control-Allow-Origin: *` (or `null`) combined
+    /// with `Access-Control-Allow-Credentials: true` (a spec-invalid /
+    /// dangerous combo). Does **not** actively probe for reflected-origin
+    /// bypasses (that needs sending a forged `Origin`, out of scope for a
+    /// read-only capture). Capped at 20. Empty is the common, healthy case.
+    ///
+    /// `#[serde(default)]` — the client-side `SECURITY_SCAN_JS` eval does
+    /// not produce this field; it's filled server-side in Phase B
+    /// (`build_cors_issues`), so the eval-result decode must tolerate its
+    /// absence.
+    #[serde(default)]
+    pub cors_issues: Vec<CorsIssue>,
+}
+
+/// Subresource Integrity coverage over cross-origin subresources.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SriAudit {
+    /// Cross-origin `<script src>` + `<link>` (stylesheet / preload /
+    /// modulepreload) elements found in the DOM. Same-origin subresources
+    /// are excluded — SRI is only meaningful for code you don't control.
+    pub total_cross_origin: u32,
+    /// Of those, how many carry a non-empty `integrity` attribute.
+    pub protected: u32,
+    /// The cross-origin subresources WITHOUT `integrity` — each one a
+    /// supply-chain risk (a CDN compromise ships arbitrary code). Capped
+    /// at 30, with the `crossorigin` attribute value so the caller can
+    /// see whether `integrity` would even be enforceable (SRI needs
+    /// `crossorigin` set for the response to be readable).
+    pub missing: Vec<SriGap>,
+}
+
+/// A cross-origin subresource lacking `integrity`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SriGap {
+    /// `"script"` or `"link"`.
+    pub tag: String,
+    /// Absolute resolved URL of the subresource.
+    pub url: String,
+    /// The element's `crossorigin` attribute value (`"anonymous"` /
+    /// `"use-credentials"`), or `None` when absent. SRI on a `<script>`
+    /// without `crossorigin` can't be enforced for cross-origin URLs.
+    pub crossorigin: Option<String>,
+}
+
+/// A `target="_blank"` link with an explicit `rel="opener"`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UnsafeLink {
+    /// Resolved `href` of the link (empty string when the anchor has none).
+    pub href: String,
+    /// The raw `rel` attribute — always contains `opener` (the reason it
+    /// was flagged: explicitly re-enabling `window.opener` on all browsers).
+    pub rel: Option<String>,
+}
+
+/// `<form>` security findings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FormSecurityAudit {
+    /// Total `<form>` elements on the page.
+    pub total: u32,
+    /// Forms whose resolved `action` targets a plain-`http://` URL while
+    /// the form either carries a password field or sits on an HTTPS page
+    /// (mixed-content credential leak). Capped at 20.
+    pub insecure_action: Vec<FormSecurityIssue>,
+    /// Count of forms containing an `<input type="password">` while the
+    /// page itself was served over plain HTTP — credentials typed here go
+    /// out in cleartext regardless of the form action. Each one is a
+    /// browser "Not Secure" warning trigger.
+    pub password_on_insecure_page: u32,
+}
+
+/// A single offending `<form>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FormSecurityIssue {
+    /// Resolved form `action` URL (falls back to the page URL when the
+    /// form has no `action`, matching browser submit behaviour).
+    pub action: String,
+    /// Whether the form contains a password input.
+    pub has_password: bool,
+}
+
+/// A JS library detected from a well-known global.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetectedLibrary {
+    /// Human name, e.g. `"jQuery"`, `"React"`, `"Vue"`.
+    pub name: String,
+    /// Version string when the library exposes one (`jQuery.fn.jquery`,
+    /// `React.version`, …); `None` when only presence could be confirmed.
+    pub version: Option<String>,
+    /// The `window` global the detection keyed off (`"jQuery"`, `"React"`,
+    /// `"__NUXT__"`, …). Lets the caller audit the detection itself.
+    pub global: String,
+}
+
+/// A CORS misconfiguration on an observed response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CorsIssue {
+    /// URL of the response that carried the misconfigured headers.
+    pub url: String,
+    /// The observed `Access-Control-Allow-Origin` value (`"*"` or `"null"`).
+    pub allow_origin: String,
+    /// Whether `Access-Control-Allow-Credentials: true` accompanied it.
+    pub allow_credentials: bool,
+    /// Machine-readable reason code. Currently always
+    /// `"wildcard-with-credentials"` (the one passively-detectable bug).
+    pub reason: String,
 }
 
 /// Coverage statistics for cookie-security attributes across the page's
@@ -3524,6 +4006,20 @@ pub struct ResourceSummary {
     /// ads, fonts, vendor CDNs) without parsing the per-resource list.
     /// Empty when the page loaded zero third-party content.
     pub top_third_party_domains: Vec<DomainBytes>,
+    /// Total bytes of **executable JavaScript** loaded from third-party
+    /// origins. A focused supply-chain / performance signal distinct
+    /// from `third_party_bytes` (which counts all asset types):
+    /// every byte here is code that runs in the page's origin with
+    /// full DOM/cookie access. A spike after a deploy means a new
+    /// external script dependency was introduced.
+    pub third_party_script_bytes: u64,
+    /// Third-party origins serving executable JS, ranked by JS bytes,
+    /// capped at 10. `count` is the number of distinct script resources
+    /// from that origin. This is the page's third-party-script attack
+    /// surface: each origin is a party that can ship arbitrary code on
+    /// the next page load (Magecart-style compromise vector). Empty when
+    /// the page loaded no third-party JS.
+    pub third_party_script_origins: Vec<DomainBytes>,
     /// Fraction of real-network responses negotiated over HTTP/2 or
     /// HTTP/3 (`0.0 .. 1.0`). Single scalar so monitors can alert on
     /// regressions — e.g. `0.95 → 0.20` typically means a vendor CDN
@@ -3846,13 +4342,13 @@ pub struct WebVitals {
     pub cls_top_sources: Vec<ClsTopSource>,
     /// **INP (Interaction to Next Paint)** — 2024 Core Web Vital, replaces
     /// FID. Longest interaction duration in ms (event-start → next paint).
-    /// In pure headless scraping this is `0` because no user input occurs;
-    /// becomes meaningful when `script` triggers `.click()` / synthetic
-    /// events. `interaction_count` tells you whether the value is
-    /// meaningful — `0` interactions means `inp` is just a default zero,
-    /// not "instant response".
+    /// **`null` whenever no interaction was observed** (`interaction_count
+    /// == 0`) — the normal case for a passive headless scrape, where a
+    /// `0` would falsely read as "instant response". Becomes a real
+    /// number only when `script` triggers `.click()` / synthetic events
+    /// that produce `interactionId` entries.
     #[serde(default)]
-    pub inp: f64,
+    pub inp: Option<f64>,
     /// Number of interaction events observed (events with `interactionId`).
     /// `0` is normal for non-interactive scrapes — treat `inp` as N/A then.
     #[serde(default)]
@@ -4197,6 +4693,17 @@ pub struct WebPageResource {
     /// cache. Cache hits typically have `content_size = 0` and many `timing`
     /// fields = -1 (skipped phases).
     pub from_cache: bool,
+    /// `Access-Control-Allow-Origin` response-header value, captured for
+    /// the `security_scan` CORS derive. `#[serde(skip)]` — internal only,
+    /// never appears in the `resources[]` wire output (would be noise for
+    /// the common case). `None` when the response carried no ACAO header.
+    #[serde(skip)]
+    pub cors_allow_origin: Option<String>,
+    /// True when the response carried `Access-Control-Allow-Credentials:
+    /// true`. Paired with `cors_allow_origin` to detect the spec-invalid
+    /// wildcard-plus-credentials misconfiguration. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub cors_allow_credentials: bool,
     /// What triggered this request. Populated only when
     /// `SummaryRequest.initiators = true` (requires subscribing to
     /// `Network.requestWillBeSent`).
@@ -4461,8 +4968,7 @@ pub async fn collect_summary(
     // racing a navigation) — they aren't actionable errors, just noise
     // in `resources[]` and `http_network_failures[]`. Filtered out
     // before either is finalised.
-    let mut quick_abort_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut quick_abort_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     const QUICK_ABORT_THRESHOLD_S: f64 = 0.1;
     // Document-timing state. Captured on the LAST Document response
     // with status <400 (so redirects don't win — we want the actual
@@ -4598,6 +5104,15 @@ pub async fn collect_summary(
                 // pre-2018 Babel) emitted. Either one counts.
                 entry.has_source_map = lookup_header(&ev.response.headers, "sourcemap").is_some()
                     || lookup_header(&ev.response.headers, "x-sourcemap").is_some();
+                // CORS headers — feed the `security_scan` derive. Two
+                // cheap lookups (matches the unconditional extraction of
+                // content-encoding / cache-control above); the fields are
+                // `#[serde(skip)]` so they cost nothing in the output.
+                entry.cors_allow_origin =
+                    lookup_header(&ev.response.headers, "access-control-allow-origin");
+                entry.cors_allow_credentials =
+                    lookup_header(&ev.response.headers, "access-control-allow-credentials")
+                        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
 
                 // Diagnostic log (debug level). Pairs with the
                 // `request_will_be_sent` log on the same request_id —
@@ -4913,12 +5428,10 @@ pub async fn collect_summary(
             continue;
         }
         let error_text = failed_loading.get(&r.request_id).cloned();
-        let initiator_summary = r.initiator.as_ref().map(|i| {
-            format!(
-                "type={} url={:?} line={:?}",
-                i.r#type, i.url, i.line_number,
-            )
-        });
+        let initiator_summary = r
+            .initiator
+            .as_ref()
+            .map(|i| format!("type={} url={:?} line={:?}", i.r#type, i.url, i.line_number,));
         tracing::warn!(
             target: DIAG_RESOURCE,
             request_id = %r.request_id,
@@ -5141,6 +5654,7 @@ pub async fn collect_summary(
         image_sizing: None,
         image_audit: None,
         font_audit: None,
+        security_scan: None,
         dom_mutations: None,
         http_errors,
         coverage,
@@ -5401,7 +5915,7 @@ impl WebPageStat {
                 let _ = writeln!(
                     s,
                     "- INP **{:.0}ms** {} **{}** {}",
-                    v.inp,
+                    v.inp.unwrap_or(0.0),
                     tr("across", "共"),
                     v.interaction_count,
                     tr(
@@ -5674,6 +6188,29 @@ impl WebPageStat {
                             },
                             "个资源",
                         ),
+                    );
+                }
+            }
+            // Third-party executable-JS origins — the supply-chain attack
+            // surface. Only emitted when the page loaded external JS.
+            if !rs.third_party_script_origins.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "- {} (**{}** {}, {} {}):",
+                    tr("Third-party JS origins", "第三方 JS 来源"),
+                    rs.third_party_script_origins.len(),
+                    tr("origins", "个来源"),
+                    format_bytes(rs.third_party_script_bytes),
+                    tr("total", "合计"),
+                );
+                for d in rs.third_party_script_origins.iter().take(5) {
+                    let _ = writeln!(
+                        s,
+                        "  - `{}` — {} ({} {})",
+                        d.host,
+                        format_bytes(d.bytes),
+                        d.count,
+                        tr(if d.count == 1 { "script" } else { "scripts" }, "个脚本",),
                     );
                 }
             }
@@ -6225,6 +6762,46 @@ impl WebPageStat {
                     )
                 },
             );
+            // CSP strength — only when an enforcing policy exists. A
+            // present-but-weak CSP is the finding the bool hides.
+            if let Some(csp) = &a.headers.csp_analysis {
+                if csp.weaknesses.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** {} ✅ {}",
+                        tr("CSP", "CSP"),
+                        csp.directive_count,
+                        tr("directives", "条指令"),
+                        tr("no obvious weaknesses", "无明显弱点"),
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "- {}: **{}** {} ⚠️ {}: {}",
+                        tr("CSP", "CSP"),
+                        csp.directive_count,
+                        tr("directives", "条指令"),
+                        tr("weaknesses", "弱点"),
+                        csp.weaknesses.join(", "),
+                    );
+                }
+            }
+            // HSTS strength — distinguish a real policy from max-age=0.
+            if let Some(hsts) = &a.headers.hsts_analysis {
+                let age = match hsts.max_age {
+                    Some(m) => format!("max-age={m}"),
+                    None => tr("max-age missing", "缺 max-age").to_string(),
+                };
+                let mut flags = String::new();
+                if hsts.include_subdomains {
+                    flags.push_str(" +includeSubDomains");
+                }
+                if hsts.preload {
+                    flags.push_str(" +preload");
+                }
+                let warn = if hsts.effective { "" } else { " ⚠️" };
+                let _ = writeln!(s, "- {}: {age}{flags}{warn}", tr("HSTS", "HSTS"));
+            }
             if a.cookies.total > 0 {
                 let pct = |n: u32| (n as f64) * 100.0 / (a.cookies.total as f64);
                 let mut line = format!(
@@ -6298,6 +6875,124 @@ impl WebPageStat {
                     v.clone()
                 };
                 let _ = writeln!(s, "- `{k}`: {val}");
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(scan) = &self.security_scan {
+            let _ = writeln!(s, "{}", tr("## Security Scan", "## 安全扫描"));
+            let _ = writeln!(s);
+            // SRI coverage.
+            let sri = &scan.sri;
+            if sri.total_cross_origin > 0 {
+                let _ = writeln!(
+                    s,
+                    "- {}: **{}/{}** {}",
+                    tr("SRI coverage", "SRI 覆盖"),
+                    sri.protected,
+                    sri.total_cross_origin,
+                    tr(
+                        "cross-origin subresources protected",
+                        "个跨域子资源已加 integrity",
+                    ),
+                );
+                for g in sri.missing.iter().take(5) {
+                    let _ = writeln!(s, "  - ⚠️ `<{}>` `{}`", g.tag, g.url);
+                }
+                if sri.missing.len() > 5 {
+                    let _ = writeln!(
+                        s,
+                        "  - {} {} {}",
+                        tr("…and", "……还有"),
+                        sri.missing.len() - 5,
+                        tr("more without integrity", "个缺 integrity"),
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    s,
+                    "- {}: {}",
+                    tr("SRI coverage", "SRI 覆盖"),
+                    tr("no cross-origin subresources", "无跨域子资源"),
+                );
+            }
+            // Unsafe target=_blank.
+            if !scan.unsafe_target_blank.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "- {}: **{}** {}",
+                    tr("Unsafe `target=_blank`", "不安全的 `target=_blank`"),
+                    scan.unsafe_target_blank.len(),
+                    tr(
+                        "link(s) with explicit `rel=opener`",
+                        "个链接显式带 `rel=opener`",
+                    ),
+                );
+            }
+            // Form security.
+            let f = &scan.forms;
+            if f.total > 0 {
+                let mut bits: Vec<String> = Vec::new();
+                if !f.insecure_action.is_empty() {
+                    bits.push(format!(
+                        "{} {}",
+                        f.insecure_action.len(),
+                        tr("cleartext action(s)", "个明文 action"),
+                    ));
+                }
+                if f.password_on_insecure_page > 0 {
+                    bits.push(format!(
+                        "{} {}",
+                        f.password_on_insecure_page,
+                        tr("password field(s) on HTTP", "个 HTTP 页密码框"),
+                    ));
+                }
+                if bits.is_empty() {
+                    let _ = writeln!(
+                        s,
+                        "- {} ({}): {}",
+                        tr("Forms", "表单"),
+                        f.total,
+                        tr("no issues", "无问题"),
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "- {} ({}): ⚠️ {}",
+                        tr("Forms", "表单"),
+                        f.total,
+                        bits.join(" · "),
+                    );
+                }
+            }
+            // CORS issues.
+            if !scan.cors_issues.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "- {}: **{}** {}",
+                    tr("CORS misconfig", "CORS 配置错误"),
+                    scan.cors_issues.len(),
+                    tr(
+                        "response(s) with `ACAO:*` + credentials",
+                        "个响应同时带 `ACAO:*` 和 credentials",
+                    ),
+                );
+                for c in scan.cors_issues.iter().take(5) {
+                    let _ = writeln!(s, "  - ⚠️ `{}` (`{}`)", c.url, c.allow_origin);
+                }
+            }
+            // Library fingerprint.
+            if !scan.libraries.is_empty() {
+                let list = scan
+                    .libraries
+                    .iter()
+                    .map(|l| match &l.version {
+                        Some(v) => format!("{} {}", l.name, v),
+                        None => l.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(s, "- {}: {}", tr("Libraries", "检测到的库"), list);
             }
             let _ = writeln!(s);
         }
@@ -7226,6 +7921,14 @@ pub struct SummaryRequest {
     /// reported as `unreadable_stylesheets` rather than silently
     /// skipped — the audit is honest about its blind spots.
     pub font_audit: bool,
+    /// Deep client-side security scan into `stat.security_scan`: SRI
+    /// coverage on cross-origin subresources, `target=_blank`
+    /// reverse-tabnabbing links, form security (cleartext actions /
+    /// passwords on HTTP), JS library + version fingerprint, and
+    /// passively-detected CORS `*`-with-credentials misconfigurations.
+    /// One extra `page.evaluate` DOM walk (~2–5ms) plus a pure
+    /// server-side CORS derive. OR-merged with `all_metrics`.
+    pub security_scan: bool,
 }
 
 /// End-to-end browser-side orchestration for `/summary`:
@@ -7419,6 +8122,7 @@ pub async fn capture(
         image_sizing,
         resource_hints_raw,
         font_audit,
+        security_scan_raw,
     ) = tokio::try_join!(
         // data — html / text / markdown extraction, scoped to capture_element.
         async {
@@ -7506,6 +8210,12 @@ pub async fn capture(
                     .unwrap_or_default();
                 let mut vitals: WebVitals = serde_json::from_value(value)
                     .map_err(|e| Error::Cdp(format!("web vitals decode: {e}")))?;
+                // INP is only meaningful with real interactions. The JS
+                // always reports a number (0 when idle); null it so the
+                // JSON doesn't show a misleading `0`.
+                if vitals.interaction_count == 0 {
+                    vitals.inp = None;
+                }
                 aggregate_cls_sources(&mut vitals);
                 aggregate_loaf(&mut vitals, &loaf_raw);
                 aggregate_long_tasks(&mut vitals, &longtask_raw);
@@ -7584,6 +8294,16 @@ pub async fn capture(
                 Ok(None)
             }
         },
+        // Security scan — one DOM walk for SRI / target=_blank / form
+        // security / library fingerprint. The CORS portion is derived
+        // server-side in Phase B (needs `stat.resources`).
+        async {
+            if req.security_scan {
+                collect_security_scan(&page).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
     )?;
 
     // Phase B — assignment + pure server-side derives. All operate on
@@ -7600,6 +8320,12 @@ pub async fn capture(
     stat.render_blocking_resources = render_blocking;
     stat.service_worker = service_worker;
     stat.font_audit = font_audit;
+    // Security scan: client-side findings come from Phase A; the CORS
+    // portion is derived here from the now-collected resource list.
+    if let Some(mut scan) = security_scan_raw {
+        scan.cors_issues = build_cors_issues(&stat.resources);
+        stat.security_scan = Some(scan);
+    }
     if let Some(mut imgs) = image_sizing {
         // Server-side enrichment: join transferred_bytes from resources by
         // URL (currentSrc is the actual fetched URL), compute waste_ratio,
@@ -7972,4 +8698,140 @@ fn exception_sample_message(ev: &EventExceptionThrown) -> Option<String> {
     let first_line = raw.lines().next().unwrap_or(raw);
     let trimmed: String = first_line.chars().take(MAX).collect();
     Some(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csp_hardened_has_no_weaknesses() {
+        let a = parse_csp(
+            "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; script-src 'self'",
+        )
+        .expect("non-empty policy");
+        assert_eq!(a.directive_count, 5);
+        assert!(!a.unsafe_inline);
+        assert!(!a.unsafe_eval);
+        assert!(a.wildcard_directives.is_empty());
+        assert!(!a.missing_object_src);
+        assert!(!a.missing_base_uri);
+        assert!(!a.missing_frame_ancestors);
+        assert!(a.weaknesses.is_empty());
+    }
+
+    #[test]
+    fn csp_detects_unsafe_and_missing_directives() {
+        let a =
+            parse_csp("script-src 'self' 'unsafe-inline' *; img-src *").expect("non-empty policy");
+        assert!(a.unsafe_inline);
+        assert!(!a.unsafe_eval);
+        // both script-src and img-src carry a bare `*`
+        assert_eq!(a.wildcard_directives, vec!["img-src", "script-src"]);
+        // no object-src and no default-src fallback
+        assert!(a.missing_object_src);
+        assert!(a.missing_base_uri);
+        assert!(a.missing_frame_ancestors);
+        assert!(a.weaknesses.contains(&"unsafe-inline".to_string()));
+        assert!(a.weaknesses.contains(&"wildcard-source".to_string()));
+        assert!(a.weaknesses.contains(&"missing-object-src".to_string()));
+    }
+
+    #[test]
+    fn csp_object_src_falls_back_to_default_src() {
+        // default-src present → object-src is covered by fallback.
+        let a = parse_csp("default-src 'self'").expect("non-empty");
+        assert!(!a.missing_object_src);
+        // base-uri / frame-ancestors do NOT fall back to default-src.
+        assert!(a.missing_base_uri);
+        assert!(a.missing_frame_ancestors);
+    }
+
+    #[test]
+    fn csp_keyword_match_is_case_insensitive() {
+        let a = parse_csp("script-src 'UNSAFE-EVAL'").expect("non-empty");
+        assert!(a.unsafe_eval);
+    }
+
+    #[test]
+    fn csp_blank_value_is_none() {
+        assert!(parse_csp("").is_none());
+        assert!(parse_csp("   ;  ; ").is_none());
+    }
+
+    #[test]
+    fn hsts_full_directive_is_effective() {
+        let a = parse_hsts("max-age=31536000; includeSubDomains; preload");
+        assert_eq!(a.max_age, Some(31_536_000));
+        assert!(a.include_subdomains);
+        assert!(a.preload);
+        assert!(a.effective);
+    }
+
+    #[test]
+    fn hsts_max_age_zero_is_not_effective() {
+        let a = parse_hsts("max-age=0");
+        assert_eq!(a.max_age, Some(0));
+        assert!(!a.effective);
+        assert!(!a.include_subdomains);
+    }
+
+    #[test]
+    fn hsts_quoted_max_age_and_case_insensitive_flags() {
+        let a = parse_hsts("max-age=\"15552000\"; INCLUDESUBDOMAINS");
+        assert_eq!(a.max_age, Some(15_552_000));
+        assert!(a.include_subdomains);
+        assert!(a.effective);
+    }
+
+    #[test]
+    fn hsts_missing_max_age_is_not_effective() {
+        let a = parse_hsts("includeSubDomains");
+        assert_eq!(a.max_age, None);
+        assert!(!a.effective);
+        assert!(a.include_subdomains);
+    }
+
+    fn res(url: &str, acao: Option<&str>, creds: bool) -> WebPageResource {
+        WebPageResource {
+            url: url.to_string(),
+            cors_allow_origin: acao.map(String::from),
+            cors_allow_credentials: creds,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cors_flags_wildcard_with_credentials() {
+        let resources = vec![
+            res("https://api.example.com/a", Some("*"), true),
+            res("https://api.example.com/b", Some("null"), true),
+        ];
+        let issues = build_cors_issues(&resources);
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|i| i.reason == "wildcard-with-credentials"));
+        assert!(issues.iter().all(|i| i.allow_credentials));
+    }
+
+    #[test]
+    fn cors_ignores_safe_and_credentialless() {
+        let resources = vec![
+            // wildcard but no credentials — the legitimate CDN case.
+            res("https://cdn.example.com/font.woff2", Some("*"), false),
+            // specific origin echoed with credentials — expected/normal.
+            res("https://api.example.com/c", Some("https://app.example.com"), true),
+            // no ACAO at all.
+            res("https://example.com/d", None, true),
+        ];
+        assert!(build_cors_issues(&resources).is_empty());
+    }
+
+    #[test]
+    fn cors_dedups_by_url_and_caps() {
+        let resources = vec![
+            res("https://api.example.com/same", Some("*"), true),
+            res("https://api.example.com/same", Some("*"), true),
+        ];
+        assert_eq!(build_cors_issues(&resources).len(), 1);
+    }
 }

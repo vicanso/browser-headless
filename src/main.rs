@@ -445,6 +445,18 @@ struct SummaryQuery {
     #[serde(default)]
     font_audit: bool,
 
+    /// Deep client-side security scan into `stat.security_scan`:
+    /// Subresource-Integrity coverage on cross-origin `<script>` /
+    /// `<link>`, `target=_blank` links missing `rel=noopener`
+    /// (reverse-tabnabbing), form security (cleartext `action` / password
+    /// fields on non-HTTPS pages), JS library + version fingerprint
+    /// (jQuery / React / Vue / …), and passively-detected CORS
+    /// `Access-Control-Allow-Origin: *`-with-credentials
+    /// misconfigurations. One extra `page.evaluate` DOM walk (~2–5ms)
+    /// plus a pure server-side CORS derive. OR-merged with `all_metrics`.
+    #[serde(default)]
+    security_scan: bool,
+
     /// Convenience switch that turns ON every **analytical** flag:
     /// `web_vitals` / `metrics` / `metadata` / `render_blocking` /
     /// `service_worker` / `initiators` / `console_messages` /
@@ -755,6 +767,7 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         coverage: q.coverage,
         resource_hints: q.resource_hints || q.all_metrics,
         font_audit: q.font_audit || q.all_metrics,
+        security_scan: q.security_scan || q.all_metrics,
     };
 
     // Snapshot the current browser handle out from under the RwLock so the

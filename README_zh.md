@@ -138,7 +138,7 @@ curl -X POST http://localhost:3000/summary \
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |
 | `save_dom_snapshot` | bool | false | `DOMSnapshot.captureSnapshot` 写入 `stat.dom_snapshot`。 |
-| `web_vitals` | bool | false | 收集 Core Web Vitals（LCP / CLS / TBT / TTFB / 长任务计数）写入 `stat.web_vitals`，通过导航前安装的 `PerformanceObserver` 实现。同时记录 `lcp_element`（tag / id / class / url / text **再加 `size` / `load_time` / `render_time` / `natural_width` / `natural_height`** —— AI 能直接说出"LCP 是 3840×2160 图被渲染成 1920×1080，980ms 加载、1023ms 上屏，应该换更小尺寸"），`cls_entries[]` 携带每个 source 的移动几何（`previous_rect` / `current_rect` / `distance_px`），加上服务端聚合的 `cls_top_sources[]`（新增 `max_distance_px` —— 单次最大跳动距离，就是预留 `min-height` 的下限），**`long_task_top_offenders[]`**（服务端按 `PerformanceLongTaskTiming.attribution[].container_src` 归类聚合 —— 把"long_tasks: 3"变成"3 个 longtask 共 800ms，全来自 gtm.js"这种可定位的归因），**INP**（最大交互响应时长，2024 Core Web Vital；纯抓取场景为 `0`，`script` 模拟点击时才有意义），**Long Animation Frames**（Chrome 123+：`loaf_count` + `loaf_total_blocking_duration` + 服务端聚合的 `loaf_top_offenders[]`，按脚本源 URL 归因，标记 forced reflow —— 直接定位是哪个 JS 文件在卡顿），以及 **FPS**（`fps_avg` / `fps_jank_ratio` / `fps_longest_frame_ms` / `fps_frame_count` —— 基于 rAF 循环、对照 60fps 基准；`jank_ratio` 和 `longest_frame_ms` 是动画 / 滚动密集型页面真正可行动的信号，能补 LoAF 漏掉的"亚 jank 阈值"平滑度损失，比如稳定 45fps 的 banner 动画。headless + VM 用软件光栅化，绝对数字不能跟真机比 —— 同 harness 做回归对比是 ok 的）。 |
+| `web_vitals` | bool | false | 收集 Core Web Vitals（LCP / CLS / TBT / TTFB / 长任务计数）写入 `stat.web_vitals`，通过导航前安装的 `PerformanceObserver` 实现。同时记录 `lcp_element`（tag / id / class / url / text **再加 `size` / `load_time` / `render_time` / `natural_width` / `natural_height`** —— AI 能直接说出"LCP 是 3840×2160 图被渲染成 1920×1080，980ms 加载、1023ms 上屏，应该换更小尺寸"），`cls_entries[]` 携带每个 source 的移动几何（`previous_rect` / `current_rect` / `distance_px`），加上服务端聚合的 `cls_top_sources[]`（新增 `max_distance_px` —— 单次最大跳动距离，就是预留 `min-height` 的下限），**`long_task_top_offenders[]`**（服务端按 `PerformanceLongTaskTiming.attribution[].container_src` 归类聚合 —— 把"long_tasks: 3"变成"3 个 longtask 共 800ms，全来自 gtm.js"这种可定位的归因），**INP**（最大交互响应时长，2024 Core Web Vital；纯抓取场景 `interaction_count == 0` 时为 `null`，只有 `script` 模拟点击时才是真实数值），**Long Animation Frames**（Chrome 123+：`loaf_count` + `loaf_total_blocking_duration` + 服务端聚合的 `loaf_top_offenders[]`，按脚本源 URL 归因，标记 forced reflow —— 直接定位是哪个 JS 文件在卡顿），以及 **FPS**（`fps_avg` / `fps_jank_ratio` / `fps_longest_frame_ms` / `fps_frame_count` —— 基于 rAF 循环、对照 60fps 基准；`jank_ratio` 和 `longest_frame_ms` 是动画 / 滚动密集型页面真正可行动的信号，能补 LoAF 漏掉的"亚 jank 阈值"平滑度损失，比如稳定 45fps 的 banner 动画。headless + VM 用软件光栅化，绝对数字不能跟真机比 —— 同 harness 做回归对比是 ok 的）。 |
 | `metrics` | bool | false | V8 heap + DOM 计数 + CPU 时间分解（`script_duration_ms` / `layout_duration_ms` / `recalc_style_duration_ms` / `task_duration_ms`）写入 `stat.metrics`，通过 `Performance.getMetrics`。回归检测的金矿 ——「LCP 没变但 script 时长 +30%」一眼可见。 |
 | `metadata` | bool | false | 抓 `<head>` 元数据（title / description / canonical / robots / lang / viewport / charset / theme-color / OG / Twitter）写入 `stat.metadata`。SEO 回归一眼可见。 |
 | `render_blocking` | bool | false | 扫 `<head>` 找 render-blocking 同步 stylesheet 和 没 `async`/`defer`/`module` 的 script，结果在 `stat.render_blocking_resources[]`。 |
@@ -152,7 +152,8 @@ curl -X POST http://localhost:3000/summary \
 | `coverage` | bool | false | 采集 CSS / JS coverage 输出到 `stat.coverage` —— Lighthouse "Reduce unused CSS / JS" 数据源（按文件统计 used / unused 字节 + top-10 浪费列表）。开启时导航前启用 CDP `Profiler.startPreciseCoverage` + `CSS.startRuleUsageTracking`，加载完后 take / stop。**`all_metrics=true` 也不会自动启用** —— coverage 会让 V8 关掉部分脚本优化、CSS 引擎全程保留 rule-usage 状态，所以即使开了 "所有分析信号" 也保持显式 opt-in。需要时单独设 `coverage=true`。 |
 | `resource_hints` | bool | false | 审计 `<link rel="preconnect">` / `<link rel="dns-prefetch">` 声明与实际命中的第三方主机的差距。结果写入 `resource_summary.resource_hints`，包含 `declared_preconnect[]` / `declared_dns_prefetch[]` 以及 `gap[]` —— 实际加载量大但未声明 hint 的第三方主机列表（每个 = 一次可避免的 100–300ms DNS+TLS 开销）。多一次 `<head>` evaluate（约 5ms）。与 `all_metrics` OR 合并。 |
 | `font_audit` | bool | false | 审计 `@font-face` 声明 + `document.fonts` 的 FOIT（Flash of Invisible Text，"文字加载期间不可见"）风险。结果写入 `stat.font_audit`，包含 `font-display` 取值分布、`missing_swap[]`（FOIT 罪魁列表 —— 每条对应一个 `font-display: swap;` 的具体修复）、`declared_preload_count`（标量 —— "你到底有没有 preload 字体"）、`unreadable_stylesheets`（CORS 盲区计数 —— 跨域 stylesheet 没加 `crossorigin` 就读不到 cssRules，把这部分数据如实暴露而不是默默丢掉）。多一次 CSSOM `page.evaluate`（约 3–8ms）。与 `all_metrics` OR 合并。 |
-| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
+| `security_scan` | bool | false | 深度客户端安全扫描，写入 `stat.security_scan`：**SRI 覆盖**（跨域 `<script>`/`<link>` 缺 `integrity` 的供应链风险）、**`target=_blank`** 显式带 `rel=opener`（高危反向 tabnabbing；现代浏览器已默认隐含 noopener，故单纯缺 noopener 不再上报）、**表单安全**（明文 `action` / 非 HTTPS 页上的密码框）、**JS 库版本指纹**（jQuery / React / Vue / Angular / …，可离线对照 CVE 区间）、以及被动检测的 **CORS** `Access-Control-Allow-Origin: *` 配合 credentials 的配置错误。多一次 `page.evaluate` DOM 遍历（约 2–5ms）+ 一次纯服务端 CORS 派生。与 `all_metrics` OR 合并。与始终输出的 `security_audit`（响应头/cookie 配置 scorecard）互补。 |
+| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
 | `lang` | `en`\|`zh` | `en` | **markdown 渲染**的语言（section 标题、说明文字、警告标签）。JSON 封装**绝不**翻译 —— 字段名、enum 标签值（`missing_immutable` / `short_max_age` 等）以及其它机器可读字符串始终保持英文，让下游基于这些值做分支的代码跨语言依然能工作。`format=json` 时该参数被忽略。 |
@@ -268,7 +269,7 @@ snapshot）→ 关闭 page + 销毁 context。
       { "selector": "div.ad-banner", "total_shift": 0.032, "fraction": 0.71,
         "shift_count": 1, "max_distance_px": 240.0 }
     ],
-    "inp": 0, "interaction_count": 0,
+    "inp": null, "interaction_count": 0,
     "loaf_count": 5, "loaf_total_blocking_duration": 312.5,
     "loaf_top_offenders": [
       {
@@ -309,6 +310,11 @@ snapshot）→ 关闭 page + 销毁 context。
     "top_third_party_domains": [
       { "host": "cdn.vendor.com", "bytes": 12400, "count": 3 },
       { "host": "analytics.example", "bytes": 5800, "count": 2 }
+    ],
+    "third_party_script_bytes": 11200,
+    "third_party_script_origins": [
+      { "host": "cdn.vendor.com", "bytes": 8400, "count": 2 },
+      { "host": "analytics.example", "bytes": 2800, "count": 1 }
     ],
     "largest_resource": ["https://cdn.example.com/vendors.js", 712600],
     "protocol_distribution": { "h2": 18, "h3": 4, "http/1.1": 2 },
@@ -407,7 +413,18 @@ snapshot）→ 关闭 page + 销毁 context。
       "referrer_policy": false, "permissions_policy": false,
       "coop": false, "coep": false,
       "present_count": 4,
-      "missing": ["Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"]
+      "missing": ["Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"],
+      "csp_analysis": {
+        "directive_count": 5, "unsafe_inline": true, "unsafe_eval": false,
+        "wildcard_directives": ["img-src"],
+        "missing_object_src": false, "missing_base_uri": true,
+        "missing_frame_ancestors": true,
+        "weaknesses": ["unsafe-inline", "wildcard-source", "missing-base-uri", "missing-frame-ancestors"]
+      },
+      "hsts_analysis": {
+        "max_age": 31536000, "include_subdomains": true,
+        "preload": false, "effective": true
+      }
     },
     "cookies": {
       "total": 3, "secure": 3, "http_only": 2,
@@ -518,6 +535,33 @@ snapshot）→ 关闭 page + 销毁 context。
     "declared_preload_count": 1,
     "unreadable_stylesheets": 0
   },
+  "security_scan": {
+    "sri": {
+      "total_cross_origin": 4, "protected": 1,
+      "missing": [
+        { "tag": "script", "url": "https://cdn.vendor.com/widget.js", "crossorigin": "anonymous" },
+        { "tag": "link", "url": "https://cdn.vendor.com/theme.css", "crossorigin": null }
+      ]
+    },
+    "unsafe_target_blank": [
+      { "href": "https://partner.example/promo", "rel": "opener" }
+    ],
+    "forms": {
+      "total": 2,
+      "insecure_action": [
+        { "action": "http://legacy.example.com/login", "has_password": true }
+      ],
+      "password_on_insecure_page": 0
+    },
+    "libraries": [
+      { "name": "jQuery", "version": "3.6.0", "global": "jQuery" },
+      { "name": "React", "version": "18.2.0", "global": "React" }
+    ],
+    "cors_issues": [
+      { "url": "https://api.vendor.com/data", "allow_origin": "*",
+        "allow_credentials": true, "reason": "wildcard-with-credentials" }
+    ]
+  },
   "dom_mutations": {
     "total_added_nodes": 4521, "total_removed_nodes": 1203,
     "total_attribute_changes": 8932,
@@ -573,6 +617,37 @@ Cross-Origin-Opener-Policy）有几个存在，`missing` 列出缺失的那些�
 `same_site_none_without_secure`（任意非零都是 finding —— 现代浏览器
 会直接拒收这些 cookie）。页面没有 cookie 也没有安全头时整个 struct
 全是 0 / false，本身就是有意义的信号。
+
+有两个头真正的信号在**值**里而非"有没有"，所以会被深度解析：
+`security_audit.headers.csp_analysis`（仅在存在强制 CSP 时出现）把策略
+拆成 `unsafe_inline` / `unsafe_eval` / `wildcard_directives` /
+`missing_object_src` / `missing_base_uri` / `missing_frame_ancestors`，
+并汇总成一个 `weaknesses[]` 列表 —— "有 CSP 但很弱"正是 `csp: true`
+单独那个 bool 掩盖掉的 finding。`security_audit.headers.hsts_analysis`
+解析 `max-age` / `includeSubDomains` / `preload` 并给出 `effective`
+（`max-age=0` 时为 `false`，即 HSTS 配了但被禁用 —— 典型的回滚事故）。
+底层头不存在时两者都为 `None`/省略。
+
+`resource_summary.third_party_script_origins` 是页面的第三方**可执行
+JS** 攻击面：这些外部来源加载的代码运行在你的 origin 下，拥有完整的
+DOM/cookie 访问权限（Magecart 式供应链攻击向量）。按 JS 字节排序、上限
+10 条；`third_party_script_bytes` 是标量合计。它与 `third_party_bytes` /
+`top_third_party_domains`（统计所有资源类型）不同 —— 某次发布后这里
+冒出一个新来源，意味着引入了新的外部代码依赖。
+
+`security_scan`（opt-in，`security_scan=true`）是始终输出的 `security_audit`
+配置 scorecard 的 DOM 层伴侣，打包五类从渲染后 DOM / 观测响应里读出的
+发现：`sri`（跨域 `<script>`/`<link>` 的 Subresource-Integrity 覆盖 ——
+`total_cross_origin` / `protected` 以及缺 `integrity` 的 `missing[]` 供应链
+缺口列表）；`unsafe_target_blank[]`（显式带 `rel=opener` 的链接 —— 高危
+反向 tabnabbing；单纯缺 `noopener` 的链接**不**上报，因为现代浏览器对
+`target=_blank` 已默认隐含 `noopener`）；`forms`
+（明文 `action` 端点 + 非 HTTPS 页上的密码框）；`libraries[]`（从知名
+全局变量识别的 JS 框架 + 版本，便于离线对照 CVE —— 注意检测不到**不**
+等于不存在，打包器常会剥掉全局变量）；以及 `cors_issues[]`（被动检测的
+`Access-Control-Allow-Origin: *` 配合 credentials 的服务端 bug —— **不会**
+主动探测反射 origin 绕过）。多一次 DOM 遍历；CORS 部分是对已抓响应的
+纯服务端派生。
 
 (`resources[].initiator` 在 `initiators=true` 时也会填充：
 `{ "type": "parser" | "script" | "preload" | ..., "url": "...", "line_number": 12 }`。)
@@ -831,6 +906,16 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
   没加 `crossorigin`，审计本身是不完整的。AI 建议：给那些
   `<link rel="stylesheet">` 加 `crossorigin`，既能让审计看到，
   又能让浏览器一致地缓存它们
+- `security_scan.sri.missing[]` 非空 → 跨域 `<script>`/`<link>` 缺
+  `integrity`，CDN 一旦被攻破就会下发任意代码。给每条加 SRI 哈希
+  （`integrity="sha384-…"` + `crossorigin`）
+- `security_scan.cors_issues[]` 非空 → 某 API 同时下发
+  `Access-Control-Allow-Origin: *` 和 credentials（spec-invalid 的服务端
+  bug）；改成具体的 allow-list origin 而不是 `*`
+- `security_scan.forms.insecure_action[]` 非空 → 表单提交走明文 HTTP
+  （凭证泄露 / 混合内容）；把 `action` 换成 HTTPS
+- `security_scan.libraries[]` 显示某库版本过旧 → 拿 `name` + `version`
+  对照已知 CVE 区间，升级
 - `metrics.script_duration_ms` +30% 而 LCP 没动 → JS 回归
 - `security_headers["Content-Security-Policy"]` 没了 → 安全回归
 - `security_audit.headers.present_count` 比基线下降 → 某次发布
@@ -840,6 +925,13 @@ top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-hos
   cookie 现代浏览器会直接拒收，永远是 actionable 信号
 - `security_audit.cookies.secure / total` 比例下降 → 新增了一个不带
   `Secure` 的 cookie（通常是某个第三方脚本设置的）
+- `security_audit.headers.csp_analysis.weaknesses[]` 变长（或
+  `unsafe_inline` 翻成 true）→ 某次发布削弱了 CSP；这正是 `csp` bool
+  仍为 `true` 时背后最常见的真实回归
+- `security_audit.headers.hsts_analysis.effective` 翻成 false → HSTS
+  虽在但 `max-age=0`（被禁用），通常是回滚事故
+- `resource_summary.third_party_script_origins[]` 出现新来源 → 有新的
+  外部代码依赖开始在你的 origin 下运行，需要审查该供应方
 - `metadata.robots` 意外包含 `noindex` → SEO 灾难
 - `render_blocking_resources` 新增条目 → 性能回归
 - `service_worker.controlled` 变成 false → PWA 坏了
