@@ -153,9 +153,29 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
         "launching chromium",
     );
 
+    // chromiumoxide's per-command/navigation timeout. Its default is 30s,
+    // which silently caps the handler's navigation command-chains below a
+    // raised per-request `timeout_ms`. Lift it to a generous ceiling derived
+    // from the configured per-request default (+30s headroom, floor 120s),
+    // overridable via BROWSER_HEADLESS_REQUEST_TIMEOUT_MS.
+    //
+    // Caveat: chromiumoxide 0.9 hardcodes the timeout for *discrete*
+    // `page.execute` calls (`CommandFuture`) to the 30s const regardless of
+    // this setting; this knob only governs navigation chains + eviction.
+    // Our page-load waiting uses our own event-drain loop (see
+    // `collect_summary`) bounded by `req.timeout`, so slow loads honour
+    // `timeout_ms` independent of this value.
+    let cdp_request_timeout_ms = std::env::var("BROWSER_HEADLESS_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| (crate::default_timeout_ms() + 30_000).max(120_000));
+    tracing::info!(cdp_request_timeout_ms, "cdp request timeout");
+
     let config = BrowserConfig::builder()
         .no_sandbox()
         .arg("disable-dev-shm-usage")
+        .request_timeout(Duration::from_millis(cdp_request_timeout_ms))
         .build()
         .map_err(|e| Error::InvalidInput(format!("browser config: {e}")))?;
     let (browser, mut handler) = Browser::launch(config).await?;
@@ -7929,6 +7949,13 @@ pub struct SummaryRequest {
     /// One extra `page.evaluate` DOM walk (~2–5ms) plus a pure
     /// server-side CORS derive. OR-merged with `all_metrics`.
     pub security_scan: bool,
+    /// Lean content-only mode. When `true`, `capture` skips the server-side
+    /// `build_resource_summary` derive (nothing consumes it — the lean HTTP
+    /// response carries only the content body + status). Every analytical
+    /// flag above is already `false` in this mode (the HTTP layer suppresses
+    /// them), so this only elides the one always-on aggregate. The body
+    /// follows the caller's `data_format` (html / text / markdown).
+    pub content_only: bool,
 }
 
 /// End-to-end browser-side orchestration for `/summary`:
@@ -8341,8 +8368,12 @@ pub async fn capture(
         stat.har = Some(build_har(&stat, &req.url));
     }
 
-    // Always compute — free derive from already-collected `resources`.
-    stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
+    // Free derive from already-collected `resources` — computed for every
+    // normal request. Skipped in `content_only` mode: the lean response
+    // never serialises `resource_summary`, so there's nothing to build.
+    if !req.content_only {
+        stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
+    }
 
     // Resource-hint audit Phase B: combine the raw `<head>` scrape
     // (from Phase A) with the now-built `top_third_party_domains`
@@ -8809,7 +8840,11 @@ mod tests {
         ];
         let issues = build_cors_issues(&resources);
         assert_eq!(issues.len(), 2);
-        assert!(issues.iter().all(|i| i.reason == "wildcard-with-credentials"));
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.reason == "wildcard-with-credentials")
+        );
         assert!(issues.iter().all(|i| i.allow_credentials));
     }
 
@@ -8819,7 +8854,11 @@ mod tests {
             // wildcard but no credentials — the legitimate CDN case.
             res("https://cdn.example.com/font.woff2", Some("*"), false),
             // specific origin echoed with credentials — expected/normal.
-            res("https://api.example.com/c", Some("https://app.example.com"), true),
+            res(
+                "https://api.example.com/c",
+                Some("https://app.example.com"),
+                true,
+            ),
             // no ACAO at all.
             res("https://example.com/d", None, true),
         ];

@@ -14,7 +14,7 @@ use axum::{
 };
 use axum_extra::extract::Query;
 use chromiumoxide::Browser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::Instrument;
@@ -59,8 +59,38 @@ enum ResponseFormat {
     Markdown,
 }
 
-fn default_timeout_ms() -> u64 {
-    30_000
+/// Per-request default for `timeout_ms` (the soft page-wait budget) when the
+/// caller doesn't pass one. Configurable via `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS`
+/// — falls back to 30_000 (30s) when unset, empty, non-numeric, or `0`.
+/// Read once and cached: env is fixed for the process lifetime, and serde
+/// calls this on every deserialize, so we avoid re-parsing per request.
+pub(crate) fn default_timeout_ms() -> u64 {
+    use std::sync::OnceLock;
+    static DEFAULT: OnceLock<u64> = OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        std::env::var("BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(30_000)
+    })
+}
+
+/// Headroom added on top of `timeout_ms` to form the hard request deadline
+/// (`tokio::time::timeout` around the whole capture). It covers chromium
+/// overhead outside the page-wait budget — context create / page open / data
+/// extraction / dispose — so the hard cap fires a bit later than the soft
+/// `timeout_ms`. Configurable via `BROWSER_HEADLESS_DEADLINE_BUFFER_MS`
+/// (default 10_000 = 10s); `0` is allowed (no headroom). Read once + cached.
+pub(crate) fn deadline_buffer_ms() -> u64 {
+    use std::sync::OnceLock;
+    static BUFFER: OnceLock<u64> = OnceLock::new();
+    *BUFFER.get_or_init(|| {
+        std::env::var("BROWSER_HEADLESS_DEADLINE_BUFFER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10_000)
+    })
 }
 
 fn main() {
@@ -91,6 +121,14 @@ async fn run() {
         .unwrap_or(8)
         .max(1);
     tracing::info!(max_pages, "concurrency limit");
+
+    // Surface the resolved per-request default so operators can confirm an
+    // override took effect (set via BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS).
+    tracing::info!(
+        default_timeout_ms = default_timeout_ms(),
+        deadline_buffer_ms = deadline_buffer_ms(),
+        "per-request timeout default"
+    );
 
     let allow_private_ips = std::env::var("BROWSER_HEADLESS_ALLOW_PRIVATE_IPS")
         .ok()
@@ -238,6 +276,26 @@ async fn readyz(State(state): State<AppState>) -> Result<&'static str, (StatusCo
         )
     })?;
     Ok("ok")
+}
+
+/// Compact response for `content_only=true`. Deliberately tiny: just
+/// enough to answer "did the page return content?" — the HTTP `status`
+/// of the final document, the `final_url` after redirects (to catch
+/// unexpected landings), the content size, and the content body itself.
+#[derive(Serialize)]
+struct ContentResponse {
+    /// HTTP status of the final (post-redirect) main document. `0` when no
+    /// Document response carried timing (fully-cached / unusual flow).
+    status: u32,
+    /// Final document URL after redirects. Equal to the requested URL when
+    /// no redirect happened; compare against it to detect hijacks/landings.
+    final_url: String,
+    /// Unicode-scalar length of `data`. A near-zero count on a 200 is the
+    /// signal for a blank / JS-skeleton page that failed to render content.
+    char_count: usize,
+    /// The page content in the caller's chosen `data_format` (`html`
+    /// default / `text` / `markdown`).
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -479,6 +537,27 @@ struct SummaryQuery {
     #[serde(default)]
     all_metrics: bool,
 
+    /// Lean content-only mode. When `true`:
+    /// - the content is returned in the caller's chosen `data_format`
+    ///   (`html` default / `text` / `markdown`) — this flag does NOT force
+    ///   markdown; select the body format with `data_format` as usual;
+    /// - every analytical flag, `all_metrics`, binary captures
+    ///   (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) and
+    ///   `coverage` are suppressed, and `resource_summary` is not built —
+    ///   nothing but the content is collected;
+    /// - the response envelope is ALWAYS a compact JSON object
+    ///   `{ status, final_url, char_count, data }` (the `format` /
+    ///   `lang` params are ignored).
+    ///
+    /// Built for cheap "just give me the content" / render-correctness
+    /// checks: `status` + a non-trivial `char_count` (and `final_url` not
+    /// landing somewhere unexpected) answers "did this page actually return
+    /// content" without shipping the full `WebPageStat`. JS still executes,
+    /// so SPA content is captured; a blank/skeleton page shows up as a
+    /// near-empty `data`.
+    #[serde(default)]
+    content_only: bool,
+
     /// Optional client-supplied request ID for tracing/log correlation.
     /// If absent, falls back to the `X-Request-ID` header; if that's also
     /// missing, an auto-generated UUID v4 is used. Every tracing log
@@ -707,10 +786,17 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         _ => None,
     };
 
+    // Lean content-only mode: keeps the caller's `data_format`, suppresses
+    // every metric / binary capture, and reshapes the response (below).
+    let lean = q.content_only;
+    // Kept for the lean response's `final_url` fallback (q.url is moved into
+    // the request below). `document_timing.url` is preferred when present.
+    let requested_url = q.url.clone();
+
     let req = browser::SummaryRequest {
         url: q.url,
         timeout: Duration::from_millis(q.timeout_ms),
-        screenshot: q.screenshot,
+        screenshot: q.screenshot && !lean,
         wait_for_request: q.wait_for_request,
         wait_until_load: q.wait_until_load,
         width: q.width,
@@ -733,41 +819,50 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         settle: q.settle_ms.map(Duration::from_millis),
         script: q.script,
         capture_element: q.capture_element,
+        // Content-only mode keeps the caller's chosen body format — it's a
+        // "give me the content" switch, not a markdown switch.
         data_format: q.data_format,
         normalize_custom_elements: q.normalize_custom_elements.unwrap_or(true),
         disable_javascript: q.disable_javascript,
+        content_only: lean,
         // Binary captures stay on explicit opt-in (intentionally NOT
         // touched by `all_metrics` — MB-scale payloads). Caller still
         // sets `pdf=true` / `screenshot=true` etc. when they really want
-        // them.
-        pdf: q.pdf,
-        har: q.har,
-        save_dom_snapshot: q.save_dom_snapshot,
+        // them. `content_only` additionally suppresses them — a content
+        // fetch needs the body, not megabytes of PNG/PDF/HAR.
+        pdf: q.pdf && !lean,
+        har: q.har && !lean,
+        save_dom_snapshot: q.save_dom_snapshot && !lean,
         // Analytical flags — `all_metrics` is a convenience OR-mask over
         // every "indicator" feature. Individual `true` stays `true`
         // (already-set flags are unaffected); the only effect is
         // bringing untouched defaults UP to true when the master switch
         // is on. Backwards compatible: `all_metrics=false` (default)
         // leaves every flag exactly as the caller wrote it.
-        web_vitals: q.web_vitals || q.all_metrics,
-        metrics: q.metrics || q.all_metrics,
-        metadata: q.metadata || q.all_metrics,
-        render_blocking: q.render_blocking || q.all_metrics,
-        service_worker: q.service_worker || q.all_metrics,
-        initiators: q.initiators || q.all_metrics,
-        console_messages: q.console_messages || q.all_metrics,
-        image_sizing: q.image_sizing || q.all_metrics,
-        dom_mutations: q.dom_mutations || q.all_metrics,
-        resources: q.resources || q.all_metrics,
-        http_errors: q.http_errors || q.all_metrics,
+        //
+        // `content_only` short-circuits this entire block to `false`: the
+        // lean mode collects nothing but the content body, so every
+        // analytical signal (and the `all_metrics` master switch) is
+        // suppressed even if the caller set it.
+        web_vitals: !lean && (q.web_vitals || q.all_metrics),
+        metrics: !lean && (q.metrics || q.all_metrics),
+        metadata: !lean && (q.metadata || q.all_metrics),
+        render_blocking: !lean && (q.render_blocking || q.all_metrics),
+        service_worker: !lean && (q.service_worker || q.all_metrics),
+        initiators: !lean && (q.initiators || q.all_metrics),
+        console_messages: !lean && (q.console_messages || q.all_metrics),
+        image_sizing: !lean && (q.image_sizing || q.all_metrics),
+        dom_mutations: !lean && (q.dom_mutations || q.all_metrics),
+        resources: !lean && (q.resources || q.all_metrics),
+        http_errors: !lean && (q.http_errors || q.all_metrics),
         // `coverage` is INTENTIONALLY NOT or-merged with `all_metrics`
         // — coverage has real V8 instrumentation cost (precise
         // coverage disables some optimisations) and CSS rule-usage
         // tracking. Keep it strictly per-request opt-in.
-        coverage: q.coverage,
-        resource_hints: q.resource_hints || q.all_metrics,
-        font_audit: q.font_audit || q.all_metrics,
-        security_scan: q.security_scan || q.all_metrics,
+        coverage: q.coverage && !lean,
+        resource_hints: !lean && (q.resource_hints || q.all_metrics),
+        font_audit: !lean && (q.font_audit || q.all_metrics),
+        security_scan: !lean && (q.security_scan || q.all_metrics),
     };
 
     // Snapshot the current browser handle out from under the RwLock so the
@@ -784,11 +879,13 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
     };
 
     // Hard upper bound on the whole capture lifecycle. `timeout_ms` already
-    // caps page-internal waits; the +10s buffer covers chromium overhead
-    // (context create / page open / dispose). When this fires, the future
-    // is dropped, the permit is RAII-released, and we return 504. (A
-    // mid-flight context may leak briefly; the browser GCs it eventually.)
-    let total_deadline = Duration::from_millis(q.timeout_ms) + Duration::from_secs(10);
+    // caps page-internal waits; the buffer (default 10s, overridable via
+    // BROWSER_HEADLESS_DEADLINE_BUFFER_MS) covers chromium overhead (context
+    // create / page open / dispose). When this fires, the future is dropped,
+    // the permit is RAII-released, and we return 504. (A mid-flight context
+    // may leak briefly; the browser GCs it eventually.)
+    let buffer_ms = deadline_buffer_ms();
+    let total_deadline = Duration::from_millis(q.timeout_ms) + Duration::from_millis(buffer_ms);
     let stat = tokio::time::timeout(
         total_deadline,
         browser::capture(&browser_arc, default_ua.as_str(), req),
@@ -798,13 +895,34 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         (
             StatusCode::GATEWAY_TIMEOUT,
             format!(
-                "total request deadline {}ms exceeded (timeout_ms={} + 10s buffer)",
+                "total request deadline {}ms exceeded (timeout_ms={} + {}ms buffer)",
                 total_deadline.as_millis(),
-                q.timeout_ms
+                q.timeout_ms,
+                buffer_ms
             ),
         )
     })?
     .map_err(browser_error)?;
+
+    // Content-only mode ignores `format` / `lang` and returns the compact
+    // content object. `status` / `final_url` come from the always-on
+    // `document_timing` (final post-redirect document); when it's absent
+    // (fully-cached / unusual flow) we fall back to status 0 and the
+    // requested URL. `char_count` counts Unicode scalars so multibyte text
+    // isn't over-counted — a near-zero count flags a blank / skeleton page.
+    if lean {
+        let (status, final_url) = match &stat.document_timing {
+            Some(dt) => (dt.status, dt.url.clone()),
+            None => (0, requested_url),
+        };
+        let body = ContentResponse {
+            status,
+            final_url,
+            char_count: stat.data.chars().count(),
+            data: stat.data,
+        };
+        return Ok(Json(body).into_response());
+    }
 
     let response = match q.format {
         ResponseFormat::Json => Json(stat).into_response(),
