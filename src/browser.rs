@@ -117,12 +117,41 @@ pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_
 /// because warn-level passes any `warn`-or-higher filter.
 const DIAG_RESOURCE: &str = "browser_headless::diag::resource";
 
+/// Owns a per-instance Chromium profile directory, removing it on drop.
+///
+/// chromiumoxide points every `Browser` at a single fixed
+/// `temp/chromiumoxide-runner` profile when `user_data_dir` is unset, so a
+/// second concurrent Chromium aborts on that profile's `SingletonLock`
+/// ("Failed to create a ProcessSingleton"). The pool therefore gives each
+/// instance a unique dir (see [`launch`]); this guard removes it when the
+/// instance is recycled or the pool shuts down. Keep it alive as long as its
+/// `Browser`, and drop it AFTER the browser so the subprocess has released
+/// the profile files first.
+pub struct UserDataDir(std::path::PathBuf);
+
+impl Drop for UserDataDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            tracing::debug!(path = %self.0.display(), error = %e, "failed to remove user-data-dir");
+        }
+    }
+}
+
 /// Launch Chromium, spawn the watcher task that keeps the CDP connection
 /// alive, and return the browser handle, its default user-agent string,
-/// and a `oneshot::Receiver` that fires once when the CDP stream ends
-/// (chromium subprocess died, websocket dropped, etc.). The supervisor
-/// uses that signal to respawn — see `main::supervise_browser`.
-pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver<()>), Error> {
+/// a `oneshot::Receiver` that fires once when the CDP stream ends (chromium
+/// subprocess died, websocket dropped, etc.), and a [`UserDataDir`] guard for
+/// this instance's profile directory. The per-instance manager uses the
+/// receiver to respawn and holds the guard for cleanup — see `pool`.
+pub async fn launch() -> Result<
+    (
+        Browser,
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        UserDataDir,
+    ),
+    Error,
+> {
     // --no-sandbox: required when running as non-root inside a container
     //   without user-namespace mapping (the default Docker config).
     //   Wired through chromiumoxide's `.no_sandbox()` builder rather than
@@ -172,9 +201,18 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
         .unwrap_or_else(|| (crate::default_timeout_ms() + 30_000).max(120_000));
     tracing::info!(cdp_request_timeout_ms, "cdp request timeout");
 
+    // Unique profile dir per instance. Without this chromiumoxide points every
+    // Browser at one fixed `temp/chromiumoxide-runner`, and a second concurrent
+    // Chromium aborts on that profile's SingletonLock — so a pool of >1 can't
+    // start. `UserDataDir` (returned below) removes the dir on recycle/shutdown.
+    let data_dir = std::env::temp_dir().join(format!("browser-headless-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| Error::InvalidInput(format!("create user-data-dir: {e}")))?;
+
     let config = BrowserConfig::builder()
         .no_sandbox()
         .arg("disable-dev-shm-usage")
+        .user_data_dir(&data_dir)
         .request_timeout(Duration::from_millis(cdp_request_timeout_ms))
         .build()
         .map_err(|e| Error::InvalidInput(format!("browser config: {e}")))?;
@@ -222,7 +260,12 @@ pub async fn launch() -> Result<(Browser, String, tokio::sync::oneshot::Receiver
     // The binary UA contains the literal `HeadlessChrome` token, which
     // is the single most common reason WAFs reject scrapes. Pages see
     // `DEFAULT_USER_AGENT` unless the caller overrides per-request.
-    Ok((browser, DEFAULT_USER_AGENT.to_string(), notify_rx))
+    Ok((
+        browser,
+        DEFAULT_USER_AGENT.to_string(),
+        notify_rx,
+        UserDataDir(data_dir),
+    ))
 }
 
 pub async fn apply_viewport(

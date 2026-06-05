@@ -25,7 +25,8 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   （低端机模拟）。
 - **等待** —— 元素选择器(`wait_for_element`)、JS 谓词(`wait_for_function`)、
   网络响应(`wait_for_request`，多个)、固定 `settle_ms` 延迟、`script`
-  自定义 JS。
+  自定义 JS，外加 `wait_until_load` gate 切换（在 `load` 事件 vs Chrome
+  `networkIdle` 之间选择返回时机）。
 - **完整快照** —— 每条资源的体积 / 状态 / 时间线 / mime / 缓存命中标记；
   JS 异常；cookie jar 里的全部 cookie；可选 console 消息、PNG 截图(base64)、
   PDF (base64)、HAR 1.2 归档、CDP `DOMSnapshot`（带 layout / computed style
@@ -54,22 +55,38 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   考虑 DPR，retina 优化图不会误报），关联网络响应揭示首屏大图浪费。
 - **响应封装** —— `format=json` 返回完整结构化数据；`format=markdown`
   返回适合 LLM 的 markdown 文档。
+- **只取内容模式** —— `content_only=true` 返回紧凑的
+  `{ status, final_url, char_count, data }`，正文按所选 `data_format`
+  （`html` / `text` / `markdown`）给出，跳过所有分析信号与二进制采集。
+  专为廉价的"页面是否真的渲染出来"检查设计：把 `status` 和非平凡的
+  `char_count` 配对判断，或把 `data`（markdown）喂给 LLM 判断页面是否
+  有效 —— 代价只是完整快照的一小部分。
 - **SSRF 防护** —— 拒绝非 http(s) 协议以及私有 / 回环 / 链路本地 / ULA /
   组播 IP（含云元数据 `169.254.169.254`），在占用 page 名额之前就快速失败。
   内网部署可通过环境变量关闭。
-- **总体超时兜底** —— 整个 capture 流程硬上限 `timeout_ms + 10s`，超出
-  返 504。
+- **总体超时兜底** —— 整个 capture 流程硬上限 `timeout_ms + buffer`
+  （buffer 默认 10s，可经 `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` 调整），
+  超出返 504。
 - **浏览器隔离** —— 每个请求一个全新的 CDP browser context（无痕模式），
   cookie / cache / localStorage 不会跨请求泄漏。
-- **并发限流** —— `Browser.new_page` 外层用 semaphore 限流，防止 Chrome
-  在高并发下 OOM（默认 8 个 page，可通过环境变量配置）。
+- **浏览器实例池 + 滚动回收** —— 固定大小的 chromium 进程池（
+  `BROWSER_HEADLESS_POOL_SIZE`，默认 1）。每个请求路由到最闲的活跃实例，
+  总并发 = `pool_size × pages_per_instance`。实例在服务一定请求数或达到一定
+  年龄后回收（先排空、再换子进程），抑制 chromium 内存膨胀；`pool_size ≥ 2`
+  时回收零停机（任意时刻最多 1 个实例不可用）。每个实例用独立 profile 目录，
+  回收 / 退出时清理。默认值与原单实例行为完全一致。
+- **并发限流** —— 每个实例外层用 semaphore 限流，防止 Chrome 在高并发下
+  OOM（默认**每实例** 8 个 page，可通过环境变量配置）。超出 `pool_size ×
+  pages_per_instance` 的请求排队。
 - **API key 鉴权（可选）** —— 设置 `BROWSER_HEADLESS_API_KEY` 环境变量
   即可要求 `/summary` 携带 `X-Api-Key` header。默认关闭（开放访问）。
   `/healthz` 和 `/readyz` 永不校验，保证探针可用。
-- **自愈** —— CDP 断开时 supervisor 任务按指数退避重启浏览器；期间
-  in-flight 请求返 503，新浏览器就位后立即恢复。
+- **自愈** —— 每个实例有独立的 manager 任务，CDP 断开时按指数退避重启该实例；
+  只影响该实例的 in-flight 请求，其它实例照常服务。
 - **健康探针** —— `/healthz` liveness、`/readyz` readiness（向 CDP 发
   `Browser.getVersion` 验证）。
+- **Prometheus 指标** —— `/metrics` 暴露请求数、延迟直方图、in-flight
+  gauge、浏览器 respawn 计数，供抓取。
 - **优雅退出** —— SIGTERM / SIGINT 触发 axum 的 `with_graceful_shutdown`，
   in-flight 请求完成后才退出进程。
 - **请求级 trace** —— 每个请求生成 `request_id`（参数 → `X-Request-ID`
@@ -77,6 +94,9 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   `capture` / `format`）记录耗时。
 - **GET + POST** —— 两种方法参数集完全相同。POST 走 JSON 体，适合带
   长 cookie / 多 header / 多行脚本的场景。
+- **批量端点** —— `POST /summary/batch` 一次请求抓 N 个 URL（共享参数模板），
+  在池上统一排并发，返回逐 URL 的结果数组（单个坏 URL 不会让整批失败）。
+  正适合「AI 批量判断一堆页面是否正常」。
 
 ---
 
@@ -111,6 +131,25 @@ Liveness —— HTTP server 在响应就返 `ok`。**不检查浏览器**。
 Readiness —— 向 CDP 发 `Browser.getVersion`。浏览器可达且 supervisor
 未在重启浏览器才返 `ok`，否则 503。
 
+### `GET /metrics`
+
+Prometheus 文本格式指标。与健康探针一样开放、无需 `X-Api-Key`，方便
+集群内 Prometheus 抓取；指标敏感时在网络层做限制。暴露：
+
+| 指标 | 类型 | 标签 | 含义 |
+|---|---|---|---|
+| `browser_headless_requests_total` | counter | `status` | 按最终 HTTP 状态码统计的 `/summary` 请求数 |
+| `browser_headless_request_duration_seconds` | histogram | `outcome`（`ok`/`error`） | `/summary` 端到端处理耗时 |
+| `browser_headless_requests_in_flight` | gauge | — | 当前正在处理的请求数（≤ `pool_size × pages_per_instance` + 排队） |
+| `browser_headless_pool_size` | gauge | — | 配置的 chromium 实例数 |
+| `browser_headless_pool_active_instances` | gauge | — | 当前 `Active`（未在排空 / 重启）的实例数 |
+| `browser_headless_browser_respawns_total` | counter | — | 崩溃实例被重启的次数 |
+| `browser_headless_recycles_total` | counter | `reason`（`age`/`count`） | 主动回收实例的次数 |
+
+`in_flight` 长期顶在 `pool_size × pages_per_instance` 上限 = 请求在并发
+semaphore 上排队；`browser_respawns_total` 上升 = chromium 在崩溃并被自动
+恢复；`pool_active_instances < pool_size` = 有实例正在回收中。
+
 ### `GET /summary` · `POST /summary`
 
 主接口。两种方法参数集完全相同 —— GET 走 query string，POST 走 JSON
@@ -133,7 +172,7 @@ curl -X POST http://localhost:3000/summary \
 | 名称 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `url` | string | — | **必填**。目标 URL（仅 http/https）。 |
-| `timeout_ms` | u64 | 30000 | 内部等待的软上限。整体硬上限 = `timeout_ms + 10s`。 |
+| `timeout_ms` | u64 | 30000 | 内部等待的软上限。整体硬上限 = `timeout_ms + buffer`（buffer 默认 10s，见 `BROWSER_HEADLESS_DEADLINE_BUFFER_MS`）。30000 这个默认值本身可经 `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` 覆盖。 |
 | `screenshot` | bool | false | 截图（PNG）写入 `stat.screenshot`。 |
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |
@@ -653,6 +692,29 @@ DOM/cookie 访问权限（Magecart 式供应链攻击向量）。按 JS 字节�
 (`resources[].initiator` 在 `initiators=true` 时也会填充：
 `{ "type": "parser" | "script" | "preload" | ..., "url": "...", "line_number": 12 }`。)
 
+#### 只取内容响应（`content_only=true`）
+
+"只要渲染出来、告诉我成没成"的精简快捷方式。完全绕过完整的
+`WebPageStat` 封装，返回一个紧凑对象：
+
+```json
+{ "status": 200, "final_url": "https://example.com/", "char_count": 4213, "data": "..." }
+```
+
+- `status` —— 最终文档（跳转后）的 HTTP 状态码。
+- `final_url` —— 跳转后的落地 URL（能抓到意外的跳转 / 登录墙）。
+- `char_count` —— `data.chars().count()`；本该有内容的页面若接近 0，
+  就是空白 / 骨架屏 / 反爬拦截的信号。
+- `data` —— 正文，格式由 `data_format` 决定（默认 `html` / `text` /
+  `markdown`）。
+
+所有分析类 flag、`all_metrics`、二进制采集
+（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）和 `coverage`
+都被强制**关闭**，`format` / `lang` 被忽略。JS 仍会执行，所以 SPA
+内容可被捕获。`status` + 健康的 `char_count` + 没有跑偏的 `final_url`
+三者组合，就是最便宜的渲染正确性探针 —— 而 `data`（markdown）正好是
+你交给 LLM 做"这个页面有效吗"语义判断的输入。
+
 #### Markdown 封装（`format=markdown`）
 
 返回 `text/markdown; charset=utf-8`，把所有字段渲染成自然语言：加载摘要、
@@ -671,7 +733,46 @@ DOM/cookie 访问权限（Magecart 式供应链攻击向量）。按 JS 字节�
 | 408 | 内部等待（`wait_for_element` / `wait_for_function`）超时 |
 | 502 | `wait_for_request` 命中的某个 URL 返了 4xx/5xx |
 | 503 | 浏览器在重启中，或 `Browser.getVersion` 失败（`/readyz`） |
-| 504 | 总体硬上限（`timeout_ms` + 10s 缓冲）超时 |
+| 504 | 总体硬上限（`timeout_ms` + buffer，默认 10s）超时 |
+
+### `POST /summary/batch`
+
+**一次请求抓多个 URL**。body 为 `{ "urls": [...] }` 加任意 `/summary` 参数，
+后者作为**共享模板**应用到每个 URL（顶层 flatten 的 `url` 若存在则忽略）。
+URL 在池的并发上限（`pool_size × pages_per_instance`）下并发抓取；连接保持
+到所有项完成。
+
+```bash
+curl -X POST http://localhost:3000/summary/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "urls": ["https://a.example", "https://b.example", "https://c.example"],
+    "content_only": true,
+    "data_format": "markdown",
+    "wait_for_element": "article"
+  }'
+```
+
+响应是**按输入顺序**的 JSON 数组；单个坏 URL 不会让整批失败，而是变成该项
+的错误：
+
+```json
+{
+  "count": 3,
+  "results": [
+    { "url": "https://a.example", "status": 200, "data": { "status": 200, "final_url": "https://a.example/", "char_count": 4213, "data": "# ..." } },
+    { "url": "https://b.example", "status": 400, "error": "scheme `ftp` not allowed; only http/https" },
+    { "url": "https://c.example", "status": 200, "data": { "status": 200, "final_url": "https://c.example/", "char_count": 980, "data": "# ..." } }
+  ]
+}
+```
+
+每项：`status` 成功为 `200`、失败为对应错误码；成功时 `data` 就是单接口返回的
+同款 JSON（`content_only` 为紧凑内容对象，否则为完整 `WebPageStat`），失败时
+`error` 带错误信息。封装恒为 JSON —— `format=markdown` 被忽略（批量是数组）。
+每项与单次 `/summary` 一样计入指标。每请求最大 URL 数由
+`BROWSER_HEADLESS_MAX_BATCH_URLS` 控制（默认 100）；空 `urls` 或超限返回 400。
+这正是「AI 批量判断一堆页面是否正常」的高效形态：一次请求、服务端统一排并发。
 
 ---
 
@@ -679,10 +780,15 @@ DOM/cookie 访问权限（Magecart 式供应链攻击向量）。按 JS 字节�
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `BROWSER_HEADLESS_API_KEY` | 未设置（开放） | 开启 API key 鉴权。设置后，`/summary` 必须带 `X-Api-Key: <value>` header，不匹配 / 缺失返 401。`/healthz` 和 `/readyz` 永远开放（保证探针可用）。建议使用高熵 key（≥32 随机字节）—— 这里是字节比对，不是 constant-time。 |
-| `BROWSER_HEADLESS_MAX_PAGES` | 8 | 并发限流。超出的请求排队，handler 返回时释放 permit。 |
+| `BROWSER_HEADLESS_API_KEY` | 未设置（开放） | 开启 API key 鉴权。设置后，`/summary` 必须带 `X-Api-Key: <value>` header，不匹配 / 缺失返 401。`/healthz`、`/readyz`、`/metrics` 永远开放（保证探针 / 抓取可用）。key 采用常量时间比对（`subtle::ConstantTimeEq`）；但因长度不同会短路，仍建议使用高熵 key（≥32 随机字节）。 |
+| `BROWSER_HEADLESS_POOL_SIZE` | 1 | 池中 chromium 进程数。总并发 = `POOL_SIZE × MAX_PAGES`。`1` 即原单实例行为。每个实例用独立 profile 目录、独立监督。 |
+| `BROWSER_HEADLESS_MAX_PAGES` | 8 | **每实例**的 page 并发上限。超出 `POOL_SIZE × MAX_PAGES` 的请求排队，handler 返回时释放 permit。 |
+| `BROWSER_HEADLESS_RECYCLE_AFTER_REQUESTS` | 0（关闭） | 实例服务满这么多请求后回收（排空 → 换子进程），抑制 chromium 内存增长。`0` 关闭按次数回收。 |
+| `BROWSER_HEADLESS_RECYCLE_AFTER_SECS` | 0（关闭） | 实例达到该年龄（秒）后回收。`0` 关闭按年龄回收。与按次数触发相互独立。 |
+| `BROWSER_HEADLESS_DRAIN_TIMEOUT_MS` | 30000 | 主动回收时，等待该实例 in-flight 请求跑完的最长时间，超时则强制换子进程（drop 旧 browser 会取消卡住的 capture）。 |
+| `BROWSER_HEADLESS_MAX_BATCH_URLS` | 100 | `POST /summary/batch` 单请求接受的最大 URL 数。空 `urls` 或超限返回 400。每个 URL 仍受池限流，此项只限单请求的 fan-out。 |
 | `BROWSER_HEADLESS_ALLOW_PRIVATE_IPS` | 未设置 | 设为 `1` / `true` / `yes` / `on` 关闭 SSRF 守卫（允许私有 / 回环 / 链路本地 IP）。仅用于内网部署。 |
-| `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` | 30000 | 调用方不传 `timeout_ms` 时的每请求默认软等待预算。空 / 非数字 / `0` 时忽略。硬上限仍为 `timeout_ms + 10s`。单次请求的 `?timeout_ms=` 仍然优先覆盖。 |
+| `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` | 30000 | 调用方不传 `timeout_ms` 时的每请求默认软等待预算。空 / 非数字 / `0` 时忽略。硬上限仍为 `timeout_ms + buffer`（buffer 默认 10s）。单次请求的 `?timeout_ms=` 仍然优先覆盖。 |
 | `BROWSER_HEADLESS_REQUEST_TIMEOUT_MS` | `max(默认超时 + 30s, 120000)` | chromiumoxide 的每次导航 CDP command-chain 超时（从其 30s 默认上调，避免较大的 `timeout_ms` 在导航层被截断）。**注意：** chromiumoxide 0.9 对*离散* `page.execute` 调用的超时硬编码为 30s，不受此项影响 —— 但页面加载等待走的是我们自己的事件循环、受 `timeout_ms` 约束，所以慢加载仍按 `timeout_ms` 独立生效。 |
 | `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` | 10000 | 在 `timeout_ms` 之上追加的硬截止 buffer（`总上限 = timeout_ms + buffer`），覆盖页面等待预算之外的 chromium 开销（建上下文 / 开 page / 释放）。允许设为 `0`（不留余量）。硬截止触发时返回 `504`。 |
 | `CHROME` | （自动探测） | Chrome / Chromium 可执行文件路径。Dockerfile 里设的是 `/usr/bin/chromium`。 |
@@ -738,6 +844,32 @@ curl -X POST http://localhost:3000/summary \
     "block_urls": ["google-analytics", "doubleclick"]
   }'
 ```
+
+### 廉价的渲染正确性检查（AI 友好）
+
+只抓渲染后的正文（markdown），不带指标、不带二进制采集，再交给模型
+判断页面是否有效。
+
+```bash
+curl -X POST http://localhost:3000/summary \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://example.com/article",
+    "content_only": true,
+    "data_format": "markdown",
+    "wait_for_element": "article"
+  }'
+```
+
+```json
+{ "status": 200, "final_url": "https://example.com/article", "char_count": 4213, "data": "# Title\n\n..." }
+```
+
+`200` 状态 + 健康的 `char_count` + 主题相关的 `data` = 页面渲染成功；
+接近空的 `data`（骨架屏 / 空白 / 反爬墙）、非 2xx 的 `status`、或跳到
+意外位置的 `final_url`，就是需要标记的信号。在机械检查之上，把 `data`
+喂给 LLM、用类似"这读起来像不像一个完整的文章页？"的提示做一次语义
+判断。
 
 ### 会话续期
 
@@ -856,11 +988,12 @@ curl -X POST http://localhost:3000/summary \
   }'
 ```
 
-(`all_metrics: true` 是简写，一次性开启全部 10 个分析类 flag ——
+(`all_metrics: true` 是简写，一次性开启全部 14 个分析类 flag ——
 `web_vitals` / `metrics` / `metadata` / `render_blocking` /
 `service_worker` / `initiators` / `console_messages` / `image_sizing` /
-`dom_mutations` / `resources`。大体积二进制 `screenshot` / `pdf`
-等仍需显式开启。)
+`dom_mutations` / `resources` / `http_errors` / `resource_hints` /
+`font_audit` / `security_scan`。大体积二进制 `screenshot` / `pdf` 等
+以及 `coverage` 仍需显式开启。)
 
 返回的单一 markdown 文档包含：加载摘要、异常、Web Vitals + LCP 元素 +
 top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-host

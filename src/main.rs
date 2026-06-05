@@ -1,4 +1,5 @@
 mod browser;
+mod pool;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -10,26 +11,20 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use axum_extra::extract::Query;
-use chromiumoxide::Browser;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, Semaphore};
 use tracing::Instrument;
 use url::{Host, Url};
 
 #[derive(Clone)]
 struct AppState {
-    /// RwLock-wrapped so the supervisor can atomically swap in a fresh
-    /// browser after a crash without breaking in-flight reads.
-    browser: Arc<RwLock<BrowserHandle>>,
-    /// Bounded-concurrency gate around `browser::capture`. Each in-flight
-    /// request holds one permit for its full lifetime, so the active page
-    /// count never exceeds the configured cap. Requests beyond the cap
-    /// queue (no 429 — async wait is simpler client UX).
-    permits: Arc<Semaphore>,
+    /// Fixed-size pool of chromium instances with rolling recycle. Routes each
+    /// request to the least-loaded active instance and bounds concurrency at
+    /// `pool_size * pages_per_instance`. See [`pool`].
+    pool: Arc<pool::BrowserPool>,
     /// When true, SSRF guard is disabled — private / loopback / link-local
     /// IPs are allowed. For internal deployments scraping LAN services.
     /// Default false. Set via `BROWSER_HEADLESS_ALLOW_PRIVATE_IPS=1`.
@@ -39,14 +34,9 @@ struct AppState {
     /// supply matching `X-Api-Key` header. Set via env
     /// `BROWSER_HEADLESS_API_KEY=<value>`.
     api_key: Option<Arc<String>>,
-}
-
-struct BrowserHandle {
-    browser: Arc<Browser>,
-    default_user_agent: Arc<String>,
-    /// `false` while the supervisor is respawning a crashed browser.
-    /// Handlers short-circuit with 503; `/readyz` reports unhealthy.
-    healthy: bool,
+    /// Prometheus exposition handle. `render()` produces the text payload
+    /// served at `GET /metrics`. Cheap to clone (shares state via Arc).
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 /// How the entire `/summary` response is delivered. Independent of
@@ -93,6 +83,64 @@ pub(crate) fn deadline_buffer_ms() -> u64 {
     })
 }
 
+/// Install the global Prometheus recorder and return a handle whose
+/// `render()` produces the `/metrics` exposition text. `install_recorder()`
+/// only sets the global recorder (no background HTTP listener — we serve the
+/// payload through axum), so it stays compatible with `default-features =
+/// false`. Also registers HELP/TYPE descriptions for the metrics we emit.
+fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
+    use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("install prometheus recorder");
+    describe_counter!(
+        "browser_headless_requests_total",
+        "Total /summary requests, labelled by final HTTP status code"
+    );
+    describe_histogram!(
+        "browser_headless_request_duration_seconds",
+        Unit::Seconds,
+        "End-to-end /summary handling time, labelled by outcome (ok/error)"
+    );
+    describe_gauge!(
+        "browser_headless_requests_in_flight",
+        "/summary requests currently being processed"
+    );
+    describe_counter!(
+        "browser_headless_browser_respawns_total",
+        "Times a crashed chromium instance was respawned"
+    );
+    describe_gauge!(
+        "browser_headless_pool_size",
+        "Configured number of chromium instances in the pool"
+    );
+    describe_gauge!(
+        "browser_headless_pool_active_instances",
+        "Chromium instances currently Active (not draining / respawning)"
+    );
+    describe_counter!(
+        "browser_headless_recycles_total",
+        "Voluntary instance recycles, labelled by reason (age / count)"
+    );
+    handle
+}
+
+/// RAII guard for the in-flight gauge: increments on construction, decrements
+/// on drop. Drop runs on the normal path, on early return, and on future
+/// cancellation / panic, so the gauge can't leak a phantom in-flight request.
+struct InFlightGuard;
+impl InFlightGuard {
+    fn new() -> Self {
+        metrics::gauge!("browser_headless_requests_in_flight").increment(1.0);
+        InFlightGuard
+    }
+}
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("browser_headless_requests_in_flight").decrement(1.0);
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -112,15 +160,12 @@ fn main() {
 }
 
 async fn run() {
-    let (browser_inst, default_ua, disconnect_rx) =
-        browser::launch().await.expect("failed to launch browser");
+    let metrics_handle = init_metrics();
 
-    let max_pages = std::env::var("BROWSER_HEADLESS_MAX_PAGES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8)
-        .max(1);
-    tracing::info!(max_pages, "concurrency limit");
+    // Launch the browser pool (each instance gets its own manager task that
+    // respawns it on crash and recycles it on the configured age / request
+    // thresholds). Backwards-compatible default: pool_size = 1, recycle off.
+    let pool = Arc::new(pool::BrowserPool::launch(pool::PoolConfig::from_env()).await);
 
     // Surface the resolved per-request default so operators can confirm an
     // override took effect (set via BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS).
@@ -148,28 +193,19 @@ async fn run() {
         tracing::warn!("API key auth disabled — /summary is open to anyone");
     }
 
-    let browser_handle = Arc::new(RwLock::new(BrowserHandle {
-        browser: Arc::new(browser_inst),
-        default_user_agent: Arc::new(default_ua),
-        healthy: true,
-    }));
-
-    // Supervisor: respawn browser on disconnect with exponential backoff.
-    // Holds its own clone of the shared handle so the swap is atomic from
-    // every handler's perspective.
-    tokio::spawn(supervise_browser(browser_handle.clone(), disconnect_rx));
-
     let state = AppState {
-        browser: browser_handle,
-        permits: Arc::new(Semaphore::new(max_pages)),
+        pool,
         allow_private_ips,
         api_key,
+        metrics_handle,
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_endpoint))
         .route("/summary", get(summary_handler).post(summary_handler_post))
+        .route("/summary/batch", post(summary_batch_handler))
         .with_state(state);
 
     let addr = "0.0.0.0:3000";
@@ -183,53 +219,6 @@ async fn run() {
         .await
         .expect("server error");
     tracing::info!("server shut down cleanly");
-}
-
-/// Supervisor: keeps the browser alive across crashes.
-///
-/// 1. Awaits the current browser's disconnect notification.
-/// 2. Marks `healthy = false` so handlers short-circuit with 503 and
-///    `/readyz` reports unhealthy.
-/// 3. Re-runs `browser::launch` with exponential backoff (1s → 60s cap)
-///    until it succeeds.
-/// 4. Atomically swaps the new browser into shared state; `healthy = true`.
-/// 5. Loops, waiting on the new browser's disconnect notification.
-///
-/// Runs forever — spawned as a detached tokio task.
-async fn supervise_browser(
-    state: Arc<RwLock<BrowserHandle>>,
-    initial_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut disconnect_rx = initial_rx;
-    loop {
-        let _ = disconnect_rx.await;
-        tracing::error!("browser disconnected; entering respawn loop");
-        state.write().await.healthy = false;
-
-        let mut backoff = Duration::from_secs(1);
-        let new_rx = loop {
-            match browser::launch().await {
-                Ok((new_browser, new_ua, new_rx)) => {
-                    let mut h = state.write().await;
-                    h.browser = Arc::new(new_browser);
-                    h.default_user_agent = Arc::new(new_ua);
-                    h.healthy = true;
-                    tracing::info!(
-                        "browser respawned successfully (UA: {})",
-                        h.default_user_agent
-                    );
-                    drop(h);
-                    break new_rx;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, retry_in = ?backoff, "browser respawn failed");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
-                }
-            }
-        };
-        disconnect_rx = new_rx;
-    }
 }
 
 /// Resolves when the process receives SIGTERM (`docker stop`, k8s pod
@@ -255,20 +244,26 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness probe — sends `Browser.getVersion` over CDP to confirm the
-/// chromium subprocess is still reachable. Returns 503 if the browser is
-/// dead or the CDP socket is broken (operator should restart the pod).
+/// Prometheus scrape endpoint. Open (no `X-Api-Key`) like the health probes,
+/// so an in-cluster Prometheus can scrape it without sharing the API key;
+/// restrict at the network layer if the operational metrics are sensitive.
+async fn metrics_endpoint(State(state): State<AppState>) -> Response {
+    use axum::http::header::CONTENT_TYPE;
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.metrics_handle.render(),
+    )
+        .into_response()
+}
+
+/// Readiness probe — sends `Browser.getVersion` over CDP to confirm an active
+/// pool instance is reachable. Returns 503 when no instance is active (all
+/// crashed / recycling) or the CDP socket is broken.
 async fn readyz(State(state): State<AppState>) -> Result<&'static str, (StatusCode, String)> {
-    let (browser, healthy) = {
-        let h = state.browser.read().await;
-        (h.browser.clone(), h.healthy)
-    };
-    if !healthy {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "browser respawn in progress".to_string(),
-        ));
-    }
+    let browser = state.pool.any_active_browser().await.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no active browser instance (pool recycling/respawning)".to_string(),
+    ))?;
     browser.version().await.map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -298,8 +293,12 @@ struct ContentResponse {
     data: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct SummaryQuery {
+    /// Defaulted so `/summary/batch` can flatten the shared params without a
+    /// top-level `url` (each URL comes from the batch's `urls` list). The
+    /// single endpoint validates it's non-empty — an empty/missing url → 400.
+    #[serde(default)]
     url: String,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
@@ -655,16 +654,175 @@ async fn summary_handler_post(
     summary(state, q, request_id).await
 }
 
+/// Body for `POST /summary/batch`. `urls` are captured concurrently (bounded
+/// by the pool); every other field is the shared capture template applied to
+/// each URL — a flattened top-level `url`, if present, is ignored. All
+/// `/summary` params work here; `content_only` + `data_format=markdown` is the
+/// typical "validate a batch of pages" shape.
+#[derive(Deserialize)]
+struct BatchQuery {
+    urls: Vec<String>,
+    #[serde(flatten)]
+    base: SummaryQuery,
+}
+
+/// One slot in a `/summary/batch` response. `status` is 200 on success or the
+/// per-item error status; exactly one of `data` / `error` is populated.
+#[derive(Serialize)]
+struct BatchItem {
+    /// Echoes the requested URL so callers can correlate by value, not index.
+    url: String,
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl BatchItem {
+    fn success(url: String, data: Result<serde_json::Value, serde_json::Error>) -> Self {
+        match data {
+            Ok(value) => BatchItem {
+                url,
+                status: 200,
+                data: Some(value),
+                error: None,
+            },
+            // Serializing our own stat should never fail; if it somehow does,
+            // surface it as a per-item 500 rather than poisoning the batch.
+            Err(e) => BatchItem {
+                url,
+                status: 500,
+                data: None,
+                error: Some(format!("serialize result: {e}")),
+            },
+        }
+    }
+
+    fn failure(url: String, status: u16, error: String) -> Self {
+        BatchItem {
+            url,
+            status,
+            data: None,
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BatchResponse {
+    count: usize,
+    results: Vec<BatchItem>,
+}
+
+/// Per-request cap on `/summary/batch` URL count
+/// (`BROWSER_HEADLESS_MAX_BATCH_URLS`, default 100). Read once + cached.
+fn max_batch_urls() -> usize {
+    use std::sync::OnceLock;
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("BROWSER_HEADLESS_MAX_BATCH_URLS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(100)
+    })
+}
+
+/// POST `/summary/batch` — capture many URLs in one request. Returns a JSON
+/// array of per-item results and never fails the whole batch on a single bad
+/// URL. The envelope is always JSON: `content_only` items yield the compact
+/// content object, others the full `WebPageStat`. `format=markdown` is ignored
+/// (the batch is a JSON array). Concurrency is bounded by the pool, so a large
+/// batch queues internally; the connection is held until all items finish.
+async fn summary_batch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(batch): Json<BatchQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    check_auth(&state, &headers)?;
+    if batch.urls.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`urls` must not be empty".to_string(),
+        ));
+    }
+    let max = max_batch_urls();
+    if batch.urls.len() > max {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many urls ({}, max {max})", batch.urls.len()),
+        ));
+    }
+
+    let started = Instant::now();
+    let total = batch.urls.len();
+    let results = run_batch(state, batch).await;
+    let failed = results.iter().filter(|r| r.status >= 400).count();
+    tracing::info!(
+        total,
+        failed,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "batch complete"
+    );
+    Ok(Json(BatchResponse {
+        count: results.len(),
+        results,
+    })
+    .into_response())
+}
+
+/// Drive a batch with bounded concurrency = pool capacity, preserving input
+/// order in the output. Each URL inherits the shared `base` params (with its
+/// own `url` substituted). Per-item failures become `BatchItem` errors rather
+/// than failing the whole request.
+async fn run_batch(state: AppState, batch: BatchQuery) -> Vec<BatchItem> {
+    use futures::stream::StreamExt;
+
+    let BatchQuery { urls, base } = batch;
+    let concurrency = state.pool.capacity().min(urls.len()).max(1);
+    let mut slots: Vec<Option<BatchItem>> = (0..urls.len()).map(|_| None).collect();
+
+    let mut stream = futures::stream::iter(urls.into_iter().enumerate())
+        .map(|(idx, url)| {
+            let state = state.clone();
+            let mut q = base.clone();
+            q.url = url.clone();
+            async move {
+                let item = match capture_one(&state, q).await {
+                    Ok(Captured::Content(content)) => {
+                        BatchItem::success(url, serde_json::to_value(content))
+                    }
+                    Ok(Captured::Full(stat)) => BatchItem::success(url, serde_json::to_value(stat)),
+                    Err((code, msg)) => BatchItem::failure(url, code.as_u16(), msg),
+                };
+                (idx, item)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some((idx, item)) = stream.next().await {
+        slots[idx] = Some(item);
+    }
+    slots
+        .into_iter()
+        .map(|slot| slot.expect("every batch slot filled"))
+        .collect()
+}
+
 /// Shared-secret API key check. No-op when `state.api_key` is `None`
-/// (auth disabled). When enabled, compares `X-Api-Key` header byte-for-byte
-/// — not constant-time, so use a high-entropy key (32+ random bytes) where
-/// timing attacks are infeasible.
+/// (auth disabled). When enabled, compares the `X-Api-Key` header against
+/// the configured key in **constant time** (`subtle::ConstantTimeEq`), so a
+/// correct prefix can't be recovered byte-by-byte from response-timing
+/// differences. (Length still short-circuits, so use a fixed-length,
+/// high-entropy key — 32+ random bytes.)
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    use subtle::ConstantTimeEq;
     let Some(required) = &state.api_key else {
         return Ok(());
     };
     match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        Some(provided) if provided == required.as_str() => Ok(()),
+        Some(provided) if bool::from(provided.as_bytes().ct_eq(required.as_bytes())) => Ok(()),
         Some(_) => Err((StatusCode::UNAUTHORIZED, "invalid X-Api-Key".to_string())),
         None => Err((
             StatusCode::UNAUTHORIZED,
@@ -715,6 +873,10 @@ async fn summary(
     let disable_cache = q.disable_cache;
 
     async move {
+        // Per-capture metrics (in-flight gauge, request counter, duration
+        // histogram) are recorded inside `capture_one` so `/summary` and
+        // `/summary/batch` items are metered uniformly. This wrapper only
+        // adds the structured request log.
         let started = Instant::now();
         let result = summary_inner(state, q).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -758,7 +920,61 @@ async fn summary(
     .await
 }
 
+/// Result of one capture before HTTP-envelope rendering. `Content` is the
+/// compact content-only object; `Full` is the complete page snapshot (boxed —
+/// `WebPageStat` is large, so an unboxed variant would bloat every result).
+enum Captured {
+    Content(ContentResponse),
+    Full(Box<browser::WebPageStat>),
+}
+
+/// Single-URL `/summary`: capture, then render the HTTP envelope (compact
+/// content object, full JSON, or markdown per `format` / `lang`).
 async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (StatusCode, String)> {
+    let format = q.format;
+    let lang = q.lang;
+    match capture_one(&state, q).await? {
+        Captured::Content(body) => Ok(Json(body).into_response()),
+        Captured::Full(stat) => Ok(match format {
+            ResponseFormat::Json => Json(stat).into_response(),
+            ResponseFormat::Markdown => (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/markdown; charset=utf-8",
+                )],
+                stat.to_markdown(lang),
+            )
+                .into_response(),
+        }),
+    }
+}
+
+/// Capture a single URL end to end — validate + SSRF-check, check out a pool
+/// slot, run the capture under the hard deadline, and shape the result into
+/// [`Captured`]. Records the per-capture metrics (in-flight gauge, request
+/// counter, duration histogram) so `/summary` and `/summary/batch` items are
+/// metered the same way. Errors are returned (never panicked) so a batch can
+/// report per-item failures.
+async fn capture_one(state: &AppState, q: SummaryQuery) -> Result<Captured, (StatusCode, String)> {
+    let _in_flight = InFlightGuard::new();
+    let started = Instant::now();
+    let result = capture_one_unmetered(state, q).await;
+    let status = match &result {
+        Ok(_) => 200u16,
+        Err((code, _)) => code.as_u16(),
+    };
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    metrics::counter!("browser_headless_requests_total", "status" => status.to_string())
+        .increment(1);
+    metrics::histogram!("browser_headless_request_duration_seconds", "outcome" => outcome)
+        .record(started.elapsed().as_secs_f64());
+    result
+}
+
+async fn capture_one_unmetered(
+    state: &AppState,
+    q: SummaryQuery,
+) -> Result<Captured, (StatusCode, String)> {
     // Cheap validation BEFORE permit acquisition — bad URLs shouldn't burn
     // queue slots. Reject non-http(s) schemes and private/loopback hosts
     // unless the operator explicitly opted out via env var.
@@ -767,9 +983,17 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         check_ssrf(&parsed_url).await?;
     }
 
-    // Block (queue) until a page slot is free. Permit released at function
-    // end — covers the full capture lifecycle so memory is bounded.
-    let _permit = state.permits.acquire().await.expect("semaphore closed");
+    // Check out a page slot on the least-loaded active instance. Blocks
+    // (queues) while every instance is saturated; errors only when no
+    // instance is active (all crashed / recycling). Held until function end —
+    // covers the full capture lifecycle so concurrency stays bounded and the
+    // instance's in-flight / served counters stay accurate.
+    let checkout = state.pool.checkout().await.map_err(|()| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "browser pool unavailable; retry shortly".to_string(),
+        )
+    })?;
 
     let cookies = q
         .cookie
@@ -865,30 +1089,19 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
         security_scan: !lean && (q.security_scan || q.all_metrics),
     };
 
-    // Snapshot the current browser handle out from under the RwLock so the
-    // supervisor can swap a new one in mid-capture without blocking us.
-    let (browser_arc, default_ua) = {
-        let h = state.browser.read().await;
-        if !h.healthy {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "browser respawning; retry shortly".to_string(),
-            ));
-        }
-        (h.browser.clone(), h.default_user_agent.clone())
-    };
-
     // Hard upper bound on the whole capture lifecycle. `timeout_ms` already
     // caps page-internal waits; the buffer (default 10s, overridable via
     // BROWSER_HEADLESS_DEADLINE_BUFFER_MS) covers chromium overhead (context
     // create / page open / dispose). When this fires, the future is dropped,
-    // the permit is RAII-released, and we return 504. (A mid-flight context
-    // may leak briefly; the browser GCs it eventually.)
+    // the checkout is RAII-released, and we return 504. (A mid-flight context
+    // may leak briefly; the browser GCs it eventually.) The checked-out
+    // instance's browser handle stays valid for the whole capture even if a
+    // different instance is recycled concurrently.
     let buffer_ms = deadline_buffer_ms();
     let total_deadline = Duration::from_millis(q.timeout_ms) + Duration::from_millis(buffer_ms);
     let stat = tokio::time::timeout(
         total_deadline,
-        browser::capture(&browser_arc, default_ua.as_str(), req),
+        browser::capture(checkout.browser(), checkout.default_user_agent(), req),
     )
     .await
     .map_err(|_| {
@@ -904,38 +1117,26 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (St
     })?
     .map_err(browser_error)?;
 
-    // Content-only mode ignores `format` / `lang` and returns the compact
-    // content object. `status` / `final_url` come from the always-on
-    // `document_timing` (final post-redirect document); when it's absent
-    // (fully-cached / unusual flow) we fall back to status 0 and the
-    // requested URL. `char_count` counts Unicode scalars so multibyte text
-    // isn't over-counted — a near-zero count flags a blank / skeleton page.
+    // Content-only mode → the compact content object; otherwise the full
+    // snapshot (rendering to JSON / markdown is `summary_inner`'s job). `status`
+    // / `final_url` come from the always-on `document_timing` (final post-
+    // redirect document); when absent (fully-cached / unusual flow) fall back
+    // to status 0 and the requested URL. `char_count` counts Unicode scalars,
+    // so a near-zero count flags a blank / skeleton page.
     if lean {
         let (status, final_url) = match &stat.document_timing {
             Some(dt) => (dt.status, dt.url.clone()),
             None => (0, requested_url),
         };
-        let body = ContentResponse {
+        return Ok(Captured::Content(ContentResponse {
             status,
             final_url,
             char_count: stat.data.chars().count(),
             data: stat.data,
-        };
-        return Ok(Json(body).into_response());
+        }));
     }
 
-    let response = match q.format {
-        ResponseFormat::Json => Json(stat).into_response(),
-        ResponseFormat::Markdown => (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/markdown; charset=utf-8",
-            )],
-            stat.to_markdown(q.lang),
-        )
-            .into_response(),
-    };
-    Ok(response)
+    Ok(Captured::Full(Box::new(stat)))
 }
 
 /// Parse + scheme-restrict the incoming URL. Reject anything other than

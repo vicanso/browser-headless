@@ -28,7 +28,8 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   **CPU throttling** (low-end-device simulation).
 - **Waits** — element selector (`wait_for_element`), JS predicate
   (`wait_for_function`), network responses (`wait_for_request`, multiple),
-  fixed `settle_ms`, custom JS via `script`.
+  fixed `settle_ms`, custom JS via `script`, plus a `wait_until_load`
+  gate toggle (return on the `load` event vs Chrome's `networkIdle`).
 - **Full snapshot** — every resource with size / status / timing / mime /
   cache flag; JS exceptions; cookies in the jar; optional console
   messages, screenshot (PNG base64), PDF (base64), HAR 1.2 archive, CDP
@@ -66,25 +67,45 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   bandwidth-wasting oversized images.
 - **Response envelope** — `format=json` for full structured access, or
   `format=markdown` for an LLM-friendly rendered document.
+- **Content-only mode** — `content_only=true` returns a compact
+  `{ status, final_url, char_count, data }` with the body in the chosen
+  `data_format` (`html` / `text` / `markdown`), skipping every analytical
+  signal and binary capture. Purpose-built as a cheap "did this page
+  actually render" check: pair `status` with a non-trivial `char_count`,
+  or feed `data` (as markdown) to an LLM to judge whether the page is
+  valid — at a fraction of the full-snapshot payload.
 - **SSRF guard** — rejects non-http(s) schemes and private / loopback /
   link-local / ULA / multicast IPs (incl. cloud metadata `169.254.169.254`)
   before even acquiring a page slot. Disabled via env var for internal
   scraping.
-- **Total deadline** — hard upper bound `timeout_ms + 10s` around the
-  whole capture; over the line returns 504.
+- **Total deadline** — hard upper bound `timeout_ms + buffer` around the
+  whole capture (buffer defaults to 10s, tunable via
+  `BROWSER_HEADLESS_DEADLINE_BUFFER_MS`); over the line returns 504.
 - **Browser isolation** — every request runs in a fresh CDP browser
   context (incognito), so cookies / cache / localStorage never leak
   across requests.
-- **Concurrency limit** — bounded semaphore around `Browser.new_page`
-  prevents Chrome OOM under load (default 8 pages, env-configurable).
+- **Browser pool + rolling recycle** — a fixed pool of `BROWSER_HEADLESS_POOL_SIZE`
+  chromium processes (default 1). Each request routes to the least-loaded
+  active instance; total concurrency is `pool_size × pages_per_instance`.
+  Instances are recycled (drained, then their subprocess replaced) after a
+  configurable request count or age, bounding chromium memory creep — and
+  with `pool_size ≥ 2` a recycle is zero-downtime (at most one instance is
+  unavailable at a time). Each instance gets its own profile dir, cleaned up
+  on recycle / shutdown. Defaults reproduce the original single-instance
+  behaviour exactly.
+- **Concurrency limit** — per-instance bounded semaphore around
+  `Browser.new_page` prevents Chrome OOM under load (default 8 pages **per
+  instance**, env-configurable). Requests beyond the cap queue.
 - **API key auth (opt-in)** — set `BROWSER_HEADLESS_API_KEY` env var to
   require `X-Api-Key` header on `/summary`. Default: disabled (open).
   `/healthz` and `/readyz` are always open so probes work.
-- **Self-healing** — on CDP disconnect a supervisor task respawns the
-  browser with exponential backoff; in-flight requests see 503 until
-  the new browser is ready.
+- **Self-healing** — each instance has its own manager task that respawns it
+  on CDP disconnect with exponential backoff; only that instance's in-flight
+  requests are affected, and other instances keep serving.
 - **Health probes** — `/healthz` for liveness, `/readyz` for readiness
   (sends `Browser.getVersion` over CDP).
+- **Prometheus metrics** — `/metrics` exposes request counts, latency
+  histogram, in-flight gauge, and browser-respawn counter for scraping.
 - **Graceful shutdown** — SIGTERM / SIGINT trigger axum's
   `with_graceful_shutdown`; in-flight requests finish before exit.
 - **Request tracing** — every request gets a `request_id` (caller param
@@ -92,6 +113,10 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   per-stage duration (`apply` / `collect` / `capture` / `format`).
 - **GET + POST** — same parameter set on both. POST takes JSON, ideal
   for long cookies / many headers / multi-line scripts.
+- **Batch endpoint** — `POST /summary/batch` captures N URLs in one
+  request (shared param template), scheduling concurrency across the pool
+  and returning a per-URL result array (one bad URL never fails the batch).
+  Ideal for "AI-validate a batch of pages".
 
 ---
 
@@ -128,6 +153,27 @@ Readiness — sends `Browser.getVersion` over CDP. Returns `ok` only if the
 browser is reachable AND the supervisor is not respawning. Returns 503
 otherwise.
 
+### `GET /metrics`
+
+Prometheus exposition (text format). Open like the health probes — no
+`X-Api-Key` — so an in-cluster Prometheus can scrape it; restrict at the
+network layer if the operational data is sensitive. Exposes:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `browser_headless_requests_total` | counter | `status` | `/summary` requests by final HTTP status code |
+| `browser_headless_request_duration_seconds` | histogram | `outcome` (`ok`/`error`) | end-to-end `/summary` handling time |
+| `browser_headless_requests_in_flight` | gauge | — | requests currently being processed (≤ `pool_size × pages_per_instance` + queue) |
+| `browser_headless_pool_size` | gauge | — | configured number of chromium instances |
+| `browser_headless_pool_active_instances` | gauge | — | instances currently `Active` (not draining / respawning) |
+| `browser_headless_browser_respawns_total` | counter | — | crashed instances respawned |
+| `browser_headless_recycles_total` | counter | `reason` (`age`/`count`) | voluntary instance recycles |
+
+`in_flight` riding at the `pool_size × pages_per_instance` ceiling means
+requests are queueing on the concurrency semaphores; a rising
+`browser_respawns_total` means chromium is crashing and being recovered;
+`pool_active_instances < pool_size` means an instance is mid-recycle.
+
 ### `GET /summary` · `POST /summary`
 
 The main endpoint. Same parameter set on both — GET uses query string,
@@ -150,7 +196,7 @@ curl -X POST http://localhost:3000/summary \
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `url` | string | — | **Required.** Target URL (http/https only). |
-| `timeout_ms` | u64 | 30000 | Internal soft cap for waits. Hard total cap = `timeout_ms + 10s`. |
+| `timeout_ms` | u64 | 30000 | Internal soft cap for waits. Hard total cap = `timeout_ms + buffer` (buffer default 10s, see `BROWSER_HEADLESS_DEADLINE_BUFFER_MS`). The 30000 default is itself overridable via `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS`. |
 | `screenshot` | bool | false | Capture PNG screenshot into `stat.screenshot`. |
 | `pdf` | bool | false | Capture PDF via `Page.printToPDF` into `stat.pdf`. |
 | `har` | bool | false | Emit HAR 1.2 archive into `stat.har` (importable into Chrome DevTools). |
@@ -686,6 +732,32 @@ bundlers strip globals); and `cors_issues[]` (passively-detected
 walk; the CORS portion is a pure server-side derive over the captured
 responses.
 
+#### Content-only response (`content_only=true`)
+
+A lean shortcut for "just render it and tell me it worked". Bypasses the
+full `WebPageStat` envelope entirely and returns a compact object:
+
+```json
+{ "status": 200, "final_url": "https://example.com/", "char_count": 4213, "data": "..." }
+```
+
+- `status` — HTTP status of the final document (post-redirect).
+- `final_url` — landing URL after redirects (catches unexpected hops /
+  login walls).
+- `char_count` — `data.chars().count()`; a near-zero value on a page that
+  should have content is the tell-tale of a blank / skeleton / anti-bot
+  render.
+- `data` — the page body in the requested `data_format` (`html` default /
+  `text` / `markdown`).
+
+Every analytical flag, `all_metrics`, the binary captures
+(`screenshot` / `pdf` / `har` / `save_dom_snapshot`) and `coverage` are
+forced **off**, and `format` / `lang` are ignored. JS still runs, so SPA
+content is captured. The combination of `status`, a healthy `char_count`,
+and a `final_url` that didn't drift makes this the cheapest render-
+correctness probe — and `data` (as markdown) is exactly what you'd hand an
+LLM to semantically judge "is this page valid".
+
 #### Markdown envelope (`format=markdown`)
 
 Returns `text/markdown; charset=utf-8` with the same fields rendered as
@@ -704,7 +776,49 @@ resource prose lines, and the `data` field in a fenced block.
 | 408 | Internal wait (`wait_for_element` / `wait_for_function`) timed out |
 | 502 | A `wait_for_request` URL came back 4xx/5xx |
 | 503 | Browser respawning or `Browser.getVersion` failed (`/readyz`) |
-| 504 | Total deadline (`timeout_ms` + 10s buffer) exceeded |
+| 504 | Total deadline (`timeout_ms` + buffer, default 10s) exceeded |
+
+### `POST /summary/batch`
+
+Capture **many URLs in one request**. The body is `{ "urls": [...] }` plus
+any `/summary` params, which form a **shared template** applied to every URL
+(a flattened top-level `url`, if present, is ignored). URLs are captured
+concurrently, bounded by the pool (`pool_size × pages_per_instance`); the
+connection is held until all items finish.
+
+```bash
+curl -X POST http://localhost:3000/summary/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "urls": ["https://a.example", "https://b.example", "https://c.example"],
+    "content_only": true,
+    "data_format": "markdown",
+    "wait_for_element": "article"
+  }'
+```
+
+The response is a JSON array in **input order**; one bad URL never fails the
+whole batch — it becomes a per-item error:
+
+```json
+{
+  "count": 3,
+  "results": [
+    { "url": "https://a.example", "status": 200, "data": { "status": 200, "final_url": "https://a.example/", "char_count": 4213, "data": "# ..." } },
+    { "url": "https://b.example", "status": 400, "error": "scheme `ftp` not allowed; only http/https" },
+    { "url": "https://c.example", "status": 200, "data": { "status": 200, "final_url": "https://c.example/", "char_count": 980, "data": "# ..." } }
+  ]
+}
+```
+
+Per item: `status` is `200` on success or the error status; on success `data`
+is the same JSON the single endpoint returns (the compact content object when
+`content_only`, otherwise the full `WebPageStat`); on failure `error` carries
+the message. The envelope is always JSON — `format=markdown` is ignored (the
+batch is an array). Each item is metered like a single `/summary` request.
+Max URLs per request: `BROWSER_HEADLESS_MAX_BATCH_URLS` (default 100); an
+empty `urls` or over-limit list returns 400. This is the efficient shape for
+"AI-validate a batch of pages": one request, server-scheduled concurrency.
 
 ---
 
@@ -712,10 +826,15 @@ resource prose lines, and the `data` field in a fenced block.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `BROWSER_HEADLESS_API_KEY` | unset (open) | Enables API key auth. When set, every `/summary` call must carry header `X-Api-Key: <value>`; mismatch / missing returns 401. `/healthz` and `/readyz` are always open so health probes work. Use a high-entropy key (≥32 random bytes); the check is byte-comparison, not constant-time. |
-| `BROWSER_HEADLESS_MAX_PAGES` | 8 | Concurrency limit. Requests beyond this queue; permit released when handler returns. |
+| `BROWSER_HEADLESS_API_KEY` | unset (open) | Enables API key auth. When set, every `/summary` call must carry header `X-Api-Key: <value>`; mismatch / missing returns 401. `/healthz`, `/readyz`, and `/metrics` are always open so probes / scrapers work. The key is compared in constant time (`subtle::ConstantTimeEq`); still use a high-entropy key (≥32 random bytes) since the comparison short-circuits on length. |
+| `BROWSER_HEADLESS_POOL_SIZE` | 1 | Number of chromium processes in the pool. Total concurrency = `POOL_SIZE × MAX_PAGES`. `1` reproduces the original single-instance behaviour. Each instance uses its own profile dir and is supervised independently. |
+| `BROWSER_HEADLESS_MAX_PAGES` | 8 | Page-concurrency cap **per instance**. Requests beyond `POOL_SIZE × MAX_PAGES` queue; the permit is released when the handler returns. |
+| `BROWSER_HEADLESS_RECYCLE_AFTER_REQUESTS` | 0 (off) | Recycle an instance after it has served this many requests (drain → replace subprocess), bounding chromium memory growth. `0` disables count-based recycling. |
+| `BROWSER_HEADLESS_RECYCLE_AFTER_SECS` | 0 (off) | Recycle an instance once it reaches this age in seconds. `0` disables age-based recycling. Independent of the request-count trigger. |
+| `BROWSER_HEADLESS_DRAIN_TIMEOUT_MS` | 30000 | How long a voluntary recycle waits for an instance's in-flight requests to finish before swapping the subprocess anyway (dropping the old browser cancels any stuck capture). |
+| `BROWSER_HEADLESS_MAX_BATCH_URLS` | 100 | Max number of URLs accepted per `POST /summary/batch`. An empty or over-limit `urls` list returns 400. Each URL is still gated by the pool, so this just caps one request's fan-out. |
 | `BROWSER_HEADLESS_ALLOW_PRIVATE_IPS` | unset | Set to `1` / `true` / `yes` / `on` to disable SSRF guard (allow private / loopback / link-local IPs). For internal deployments only. |
-| `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` | 30000 | Per-request default for `timeout_ms` (the soft page-wait budget) when the caller omits it. Ignored if empty / non-numeric / `0`. The hard cap stays `timeout_ms + 10s`. Per-call `?timeout_ms=` still overrides this. |
+| `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` | 30000 | Per-request default for `timeout_ms` (the soft page-wait budget) when the caller omits it. Ignored if empty / non-numeric / `0`. The hard cap stays `timeout_ms + buffer` (buffer default 10s). Per-call `?timeout_ms=` still overrides this. |
 | `BROWSER_HEADLESS_REQUEST_TIMEOUT_MS` | `max(default_timeout + 30s, 120000)` | chromiumoxide's per-navigation CDP command-chain timeout (raised from its 30s default so a large `timeout_ms` isn't capped at the navigation layer). **Caveat:** chromiumoxide 0.9 hardcodes the timeout for *discrete* `page.execute` calls to 30s regardless of this — but page-load waiting uses our own event loop bounded by `timeout_ms`, so slow loads honour `timeout_ms` independently. |
 | `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` | 10000 | Headroom added on top of `timeout_ms` to form the hard request deadline (`total = timeout_ms + buffer`), covering chromium overhead outside the page-wait budget (context create / page open / dispose). `0` allowed (no headroom). On hard-deadline fire the request returns `504`. |
 | `CHROME` | (auto-detect) | Path to the Chrome / Chromium binary. The provided Dockerfile sets `/usr/bin/chromium`. |
@@ -773,6 +892,33 @@ curl -X POST http://localhost:3000/summary \
     "block_urls": ["google-analytics", "doubleclick"]
   }'
 ```
+
+### Cheap render-correctness check (AI-friendly)
+
+Fetch just the rendered content as markdown — no metrics, no binary
+captures — then let a model decide whether the page is valid.
+
+```bash
+curl -X POST http://localhost:3000/summary \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://example.com/article",
+    "content_only": true,
+    "data_format": "markdown",
+    "wait_for_element": "article"
+  }'
+```
+
+```json
+{ "status": 200, "final_url": "https://example.com/article", "char_count": 4213, "data": "# Title\n\n..." }
+```
+
+A `200` status with a healthy `char_count` and on-topic `data` means the
+page rendered; a near-empty `data` (skeleton / blank / anti-bot wall), a
+non-2xx `status`, or a `final_url` that redirected somewhere unexpected is
+the signal to flag it. Feed `data` to an LLM with a prompt like "does this
+read like a complete article page?" for a semantic pass on top of the
+mechanical checks.
 
 ### Session continuation
 
@@ -893,11 +1039,12 @@ curl -X POST http://localhost:3000/summary \
   }'
 ```
 
-(`all_metrics: true` is shorthand for enabling all ten analytical flags at
-once — `web_vitals` / `metrics` / `metadata` / `render_blocking` /
-`service_worker` / `initiators` / `console_messages` / `image_sizing` /
-`dom_mutations` / `resources`. Binary captures like `screenshot` / `pdf`
-stay separate.)
+(`all_metrics: true` is shorthand for enabling all fourteen analytical
+flags at once — `web_vitals` / `metrics` / `metadata` / `render_blocking`
+/ `service_worker` / `initiators` / `console_messages` / `image_sizing` /
+`dom_mutations` / `resources` / `http_errors` / `resource_hints` /
+`font_audit` / `security_scan`. Binary captures like `screenshot` / `pdf`
+and `coverage` stay on explicit opt-in.)
 
 You get back a single markdown document with sections for: load summary,
 exceptions, web vitals + LCP element + top CLS offenders, resource
