@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 use chromiumoxide::Browser;
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
 
+use crate::browser;
+
 const M_POOL_SIZE: &str = "browser_headless_pool_size";
 const M_ACTIVE_INSTANCES: &str = "browser_headless_pool_active_instances";
 const M_RESPAWNS: &str = "browser_headless_browser_respawns_total";
@@ -122,7 +124,7 @@ struct InstanceInner {
     default_user_agent: Arc<String>,
     /// Profile-dir guard. Declared AFTER `browser` so on drop the subprocess
     /// is torn down first, then its profile directory is removed.
-    _data_dir: crate::browser::UserDataDir,
+    _data_dir: browser::UserDataDir,
 }
 
 struct Instance {
@@ -209,7 +211,7 @@ impl BrowserPool {
         let mut instances = Vec::with_capacity(config.pool_size);
 
         for id in 0..config.pool_size {
-            let (browser, ua, disconnect_rx, data_dir) = crate::browser::launch()
+            let (browser, ua, disconnect_rx, data_dir) = browser::launch()
                 .await
                 .unwrap_or_else(|e| panic!("failed to launch browser instance {id}: {e}"));
             let instance = Arc::new(Instance {
@@ -455,7 +457,7 @@ async fn drain(instance: &Arc<Instance>, timeout: Duration) {
 async fn relaunch(instance: &Arc<Instance>) -> oneshot::Receiver<()> {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match crate::browser::launch().await {
+        match browser::launch().await {
             Ok((browser, ua, disconnect_rx, data_dir)) => {
                 let (old_browser, old_dir) = {
                     let mut inner = instance.inner.write().await;

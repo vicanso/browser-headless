@@ -826,6 +826,7 @@ empty `urls` or over-limit list returns 400. This is the efficient shape for
 
 | Env var | Default | Effect |
 |---|---|---|
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no HTTP). See [Worker mode](#worker-mode-redis-queue). |
 | `BROWSER_HEADLESS_API_KEY` | unset (open) | Enables API key auth. When set, every `/summary` call must carry header `X-Api-Key: <value>`; mismatch / missing returns 401. `/healthz`, `/readyz`, and `/metrics` are always open so probes / scrapers work. The key is compared in constant time (`subtle::ConstantTimeEq`); still use a high-entropy key (≥32 random bytes) since the comparison short-circuits on length. |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | Number of chromium processes in the pool. Total concurrency = `POOL_SIZE × MAX_PAGES`. `1` reproduces the original single-instance behaviour. Each instance uses its own profile dir and is supervised independently. |
 | `BROWSER_HEADLESS_MAX_PAGES` | 8 | Page-concurrency cap **per instance**. Requests beyond `POOL_SIZE × MAX_PAGES` queue; the permit is released when the handler returns. |
@@ -839,6 +840,56 @@ empty `urls` or over-limit list returns 400. This is the efficient shape for
 | `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` | 10000 | Headroom added on top of `timeout_ms` to form the hard request deadline (`total = timeout_ms + buffer`), covering chromium overhead outside the page-wait budget (context create / page open / dispose). `0` allowed (no headroom). On hard-deadline fire the request returns `504`. |
 | `CHROME` | (auto-detect) | Path to the Chrome / Chromium binary. The provided Dockerfile sets `/usr/bin/chromium`. |
 | `RUST_LOG` | `info,chromiumoxide::conn=off,chromiumoxide::handler=off` | Standard `tracing_subscriber` filter. Set `browser_headless=debug` to see per-stage timings. |
+
+---
+
+## Worker mode (Redis queue)
+
+For horizontal scaling across machines, run instances as **queue workers**
+instead of (or alongside) the HTTP API. With `BROWSER_HEADLESS_MODE=worker` the
+process binds no HTTP port, joins a Redis Streams consumer group, and for each
+job runs the same capture engine on its own browser pool, writing the result to
+a `result:{id}` key. Add workers to add throughput; the HTTP API is fully
+decoupled (the two share only library code, never call each other).
+
+**Enqueue** a job by `XADD`-ing a single `payload` field (JSON) to the stream —
+`{ "id": "...", "url": "...", ...any /summary param... }` (`id` optional, falls
+back to the stream entry id):
+
+```bash
+redis-cli XADD browser_headless:jobs '*' payload \
+  '{"id":"job1","url":"https://example.com","content_only":true,"data_format":"markdown"}'
+```
+
+**Read** the result (JSON, TTL'd):
+
+```bash
+redis-cli GET browser_headless:result:job1
+# {"id":"job1","status":200,"data":{"status":200,"final_url":"https://example.com/","char_count":167,"data":"# ..."}}
+```
+
+`data` mirrors the single-endpoint payload (the compact content object when
+`content_only`, otherwise the full `WebPageStat`); on failure the result carries
+`status` + `error` instead. Delivery is **at-least-once**: a job is acked only
+after its result is written, and entries abandoned by a crashed worker are
+reclaimed (`XAUTOCLAIM`) after the visibility timeout — so a capture may run
+twice (fine for read-only captures; add an idempotency key for side-effecting
+`script`s). Concurrency per worker = its pool capacity (`POOL_SIZE × MAX_PAGES`).
+
+| Env var | Default | Effect |
+|---|---|---|
+| `BROWSER_HEADLESS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL. |
+| `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | Stream consumed for jobs. |
+| `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | Consumer group — load-balances jobs across all workers. |
+| `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | This worker's consumer name (unique per process). |
+| `BROWSER_HEADLESS_RESULT_PREFIX` | `browser_headless:result:` | Result key prefix; the key is `<prefix><id>`. |
+| `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | TTL (seconds) on result keys. |
+| `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` block time before a reclaim pass. |
+| `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | Idle time before a pending entry is reclaimable by another worker. |
+
+The pool / recycle / SSRF / timeout env vars from [Configuration](#configuration)
+apply to workers too. Workers expose no `/metrics` endpoint (no HTTP); monitor
+them via logs and Redis consumer-group lag (`XPENDING`).
 
 ---
 

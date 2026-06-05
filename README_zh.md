@@ -780,6 +780,7 @@ curl -X POST http://localhost:3000/summary/batch \
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 HTTP）。见 [Worker 模式](#worker-模式redis-队列)。 |
 | `BROWSER_HEADLESS_API_KEY` | 未设置（开放） | 开启 API key 鉴权。设置后，`/summary` 必须带 `X-Api-Key: <value>` header，不匹配 / 缺失返 401。`/healthz`、`/readyz`、`/metrics` 永远开放（保证探针 / 抓取可用）。key 采用常量时间比对（`subtle::ConstantTimeEq`）；但因长度不同会短路，仍建议使用高熵 key（≥32 随机字节）。 |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | 池中 chromium 进程数。总并发 = `POOL_SIZE × MAX_PAGES`。`1` 即原单实例行为。每个实例用独立 profile 目录、独立监督。 |
 | `BROWSER_HEADLESS_MAX_PAGES` | 8 | **每实例**的 page 并发上限。超出 `POOL_SIZE × MAX_PAGES` 的请求排队，handler 返回时释放 permit。 |
@@ -793,6 +794,53 @@ curl -X POST http://localhost:3000/summary/batch \
 | `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` | 10000 | 在 `timeout_ms` 之上追加的硬截止 buffer（`总上限 = timeout_ms + buffer`），覆盖页面等待预算之外的 chromium 开销（建上下文 / 开 page / 释放）。允许设为 `0`（不留余量）。硬截止触发时返回 `504`。 |
 | `CHROME` | （自动探测） | Chrome / Chromium 可执行文件路径。Dockerfile 里设的是 `/usr/bin/chromium`。 |
 | `RUST_LOG` | `info,chromiumoxide::conn=off,chromiumoxide::handler=off` | 标准 `tracing_subscriber` 过滤器。`browser_headless=debug` 可看到每阶段耗时。 |
+
+---
+
+## Worker 模式（Redis 队列）
+
+为了跨机横向扩展，可以把实例跑成**队列 worker**，与 HTTP 接口并存或替代它。
+设 `BROWSER_HEADLESS_MODE=worker`：进程不绑任何 HTTP 口，加入 Redis Streams
+consumer group，对每个 job 用同一套抓取引擎在自己的浏览器池上跑，把结果写回
+`result:{id}` 键。加机器 = 加 worker；HTTP 接口完全解耦（两者只共享库代码，
+互不调用）。
+
+**入队**：往 stream `XADD` 一个 `payload` 字段（JSON）——
+`{ "id": "...", "url": "...", ...任意 /summary 参数... }`（`id` 可选，缺省回退到
+stream entry id）：
+
+```bash
+redis-cli XADD browser_headless:jobs '*' payload \
+  '{"id":"job1","url":"https://example.com","content_only":true,"data_format":"markdown"}'
+```
+
+**取结果**（JSON，带 TTL）：
+
+```bash
+redis-cli GET browser_headless:result:job1
+# {"id":"job1","status":200,"data":{"status":200,"final_url":"https://example.com/","char_count":167,"data":"# ..."}}
+```
+
+`data` 与单接口返回同款（`content_only` 为紧凑内容对象，否则完整 `WebPageStat`）；
+失败时结果带 `status` + `error`。投递为 **at-least-once**：结果写完才 ack，崩溃
+worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所以同一 URL 可能抓两次
+（只读抓取无害；带副作用的 `script` 请加幂等键）。单 worker 并发 = 其池容量
+（`POOL_SIZE × MAX_PAGES`）。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `BROWSER_HEADLESS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis 连接 URL。 |
+| `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | 消费 job 的 stream。 |
+| `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | consumer group——在多 worker 间均衡 job。 |
+| `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | 本 worker 的 consumer 名（每进程唯一）。 |
+| `BROWSER_HEADLESS_RESULT_PREFIX` | `browser_headless:result:` | 结果键前缀；键为 `<前缀><id>`。 |
+| `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | 结果键 TTL（秒）。 |
+| `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。 |
+| `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
+
+上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。
+worker 不暴露 `/metrics`（无 HTTP）；用日志和 Redis consumer-group lag
+（`XPENDING`）监控。
 
 ---
 

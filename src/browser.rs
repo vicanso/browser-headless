@@ -51,6 +51,8 @@ use futures::stream::{self, BoxStream, StreamExt};
 use htmd::HtmlToMarkdown;
 use serde::{Deserialize, Serialize};
 
+use crate::config;
+
 pub use chromiumoxide::Page;
 
 #[derive(Debug)]
@@ -198,7 +200,7 @@ pub async fn launch() -> Result<
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or_else(|| (crate::default_timeout_ms() + 30_000).max(120_000));
+        .unwrap_or_else(|| (config::default_timeout_ms() + 30_000).max(120_000));
     tracing::info!(cdp_request_timeout_ms, "cdp request timeout");
 
     // Unique profile dir per instance. Without this chromiumoxide points every
