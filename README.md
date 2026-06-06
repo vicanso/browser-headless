@@ -913,6 +913,7 @@ twice (fine for read-only captures; add an idempotency key for side-effecting
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | `XDEL` each entry from the stream after it's processed + acked, so the stream doesn't grow forever (the result still lives in `result:{id}`). Set `false` to retain entries — e.g. for replay or a second consumer group on the same stream, since `XDEL` removes the entry for **all** groups (then cap the stream with MAXLEN yourself). |
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` block time before a reclaim pass. |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | Idle time before a pending entry is reclaimable by another worker. |
+| `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | TCP + TLS + auth handshake timeout when opening a Redis connection. Raised from redis-rs's 1s default, which is too tight for a high-latency / cross-region Redis (e.g. Upstash) and surfaces as `timed out` on connect. |
 
 The pool / recycle / SSRF / timeout env vars from [Configuration](#configuration)
 apply to workers too. Workers expose no `/metrics` endpoint (no HTTP); monitor

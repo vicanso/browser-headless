@@ -27,8 +27,8 @@ use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamReadOptions, StreamReadReply,
 };
 use redis::{
-    AsyncCommands, ClientTlsConfig, Cmd, ErrorKind, Pipeline, RedisFuture, RedisResult,
-    TlsCertificates, Value,
+    AsyncCommands, AsyncConnectionConfig, ClientTlsConfig, Cmd, ErrorKind, Pipeline, RedisFuture,
+    RedisResult, TlsCertificates, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,11 @@ struct WorkerConfig {
     /// Min idle time before a pending entry is eligible for `XAUTOCLAIM` (i.e.
     /// the original worker is presumed dead).
     visibility_ms: u64,
+    /// TCP + TLS + auth handshake timeout when opening a connection
+    /// (`BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS`, default 5000). redis-rs's
+    /// own default is only 1s, too tight for a high-latency / cross-region
+    /// link (e.g. Upstash), which surfaces as `timed out` on connect.
+    connect_timeout_ms: u64,
 }
 
 impl WorkerConfig {
@@ -94,6 +99,7 @@ impl WorkerConfig {
             delete_on_ack: env_bool("BROWSER_HEADLESS_DELETE_ON_ACK", true),
             block_ms: env_u64("BROWSER_HEADLESS_JOB_BLOCK_MS", 5000).max(1) as usize,
             visibility_ms: env_u64("BROWSER_HEADLESS_JOB_VISIBILITY_MS", 120_000).max(1),
+            connect_timeout_ms: env_u64("BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS", 5000).max(1),
         }
     }
 }
@@ -238,6 +244,11 @@ fn read_response_timeout(cfg: &WorkerConfig) -> Duration {
     Duration::from_millis(cfg.block_ms as u64 + 5_000)
 }
 
+/// Handshake (TCP + TLS + auth) timeout for opening a connection.
+fn connect_timeout(cfg: &WorkerConfig) -> Duration {
+    Duration::from_millis(cfg.connect_timeout_ms)
+}
+
 /// The Redis client — single-node or cluster — that hands out [`Conn`]s.
 enum Backend {
     Single(redis::Client),
@@ -256,10 +267,11 @@ impl Backend {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            // The cluster client bakes the response timeout into every
-            // connection (no per-connection setter), so set it here.
-            let mut builder =
-                ClusterClientBuilder::new(nodes).response_timeout(read_response_timeout(cfg));
+            // The cluster client bakes the timeouts into every connection (no
+            // per-connection setter), so set them here.
+            let mut builder = ClusterClientBuilder::new(nodes)
+                .connection_timeout(connect_timeout(cfg))
+                .response_timeout(read_response_timeout(cfg));
             if let Some(certs) = certs {
                 builder = builder.certs(certs);
             }
@@ -275,13 +287,27 @@ impl Backend {
         }
     }
 
-    /// Open a connection. `response_timeout` is applied to single-node
-    /// connections (cluster bakes it in at build time, so the arg is unused
-    /// there).
-    async fn connect(&self, response_timeout: Duration) -> redis::RedisResult<Conn> {
+    /// Open a connection. `connect_timeout` bounds the TCP+TLS+auth handshake
+    /// and is used as the handshake-command response timeout; `response_timeout`
+    /// is then applied for normal operation (long, to span `XREADGROUP BLOCK`).
+    /// Both args are for single-node connections — cluster bakes its timeouts in
+    /// at build time, so they're unused there.
+    async fn connect(
+        &self,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> redis::RedisResult<Conn> {
         match self {
             Backend::Single(c) => {
-                let mut conn = c.get_multiplexed_async_connection().await?;
+                // Raise the connect + handshake-response timeout above redis-rs's
+                // 1s / 500ms defaults so a slow link finishes authenticating.
+                let conn_cfg = AsyncConnectionConfig::new()
+                    .set_connection_timeout(Some(connect_timeout))
+                    .set_response_timeout(Some(connect_timeout));
+                let mut conn = c
+                    .get_multiplexed_async_connection_with_config(&conn_cfg)
+                    .await?;
+                // Switch to the long operational response timeout for blocking reads.
                 conn.set_response_timeout(response_timeout);
                 Ok(Conn::Single(conn))
             }
@@ -357,15 +383,14 @@ pub(crate) async fn run(ctx: CaptureCtx) {
     );
 
     let backend = Backend::from_cfg(&cfg).expect("invalid redis config");
-    let response_timeout = read_response_timeout(&cfg);
 
     ensure_group(&backend, &cfg).await;
 
     // Separate connections: `read_conn` owns the blocking XREADGROUP; the
     // cloned `write_conn` handles concurrent result writes + acks without being
     // stalled behind the blocking read.
-    let mut read_conn = connect(&backend, response_timeout).await;
-    let write_conn = connect(&backend, response_timeout).await;
+    let mut read_conn = connect(&backend, &cfg).await;
+    let write_conn = connect(&backend, &cfg).await;
 
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -399,7 +424,7 @@ pub(crate) async fn run(ctx: CaptureCtx) {
                 tracing::error!(error = %e, retry_in = ?backoff, "redis read failed; reconnecting");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
-                read_conn = connect(&backend, response_timeout).await;
+                read_conn = connect(&backend, &cfg).await;
             }
         }
     }
@@ -409,7 +434,10 @@ pub(crate) async fn run(ctx: CaptureCtx) {
 /// Retries until Redis is reachable; a pre-existing group (`BUSYGROUP`) is fine.
 async fn ensure_group(backend: &Backend, cfg: &WorkerConfig) {
     loop {
-        match backend.connect(read_response_timeout(cfg)).await {
+        match backend
+            .connect(connect_timeout(cfg), read_response_timeout(cfg))
+            .await
+        {
             Ok(mut conn) => {
                 let res: redis::RedisResult<()> = conn
                     .xgroup_create_mkstream(
@@ -435,9 +463,12 @@ async fn ensure_group(backend: &Backend, cfg: &WorkerConfig) {
 
 /// Open an async connection (single-node or cluster), retrying until Redis is
 /// reachable.
-async fn connect(backend: &Backend, response_timeout: Duration) -> Conn {
+async fn connect(backend: &Backend, cfg: &WorkerConfig) -> Conn {
     loop {
-        match backend.connect(response_timeout).await {
+        match backend
+            .connect(connect_timeout(cfg), read_response_timeout(cfg))
+            .await
+        {
             Ok(conn) => return conn,
             Err(e) => {
                 tracing::error!(error = %e, "redis connect failed; retrying in 2s");

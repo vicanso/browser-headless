@@ -863,6 +863,7 @@ worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所�
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | 处理 + ack 后 `XDEL` 把该条从 stream 删除，避免 stream 无限增长（结果仍在 `result:{id}`）。设 `false` 保留条目——例如要回放、或同一 stream 上挂第二个消费组（`XDEL` 是全局的、对**所有**消费组生效，那时改用 MAXLEN 自己控量）。 |
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。 |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
+| `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | 打开 Redis 连接时 TCP + TLS + 认证握手的超时。从 redis-rs 默认的 1s 上调——1s 对高延迟 / 跨区域 Redis（如 Upstash）太短，会表现为连接 `timed out`。 |
 
 上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。
 worker 不暴露 `/metrics`（无 HTTP）；用日志和 Redis consumer-group lag
