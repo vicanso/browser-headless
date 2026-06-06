@@ -7,6 +7,7 @@ mod worker;
 
 use std::sync::Arc;
 
+use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 
 use crate::capture::CaptureCtx;
@@ -30,9 +31,10 @@ fn main() {
         .block_on(run());
 }
 
-/// Dispatch on `BROWSER_HEADLESS_MODE`: `serve` (default) runs the HTTP API;
-/// `worker` runs the Redis queue consumer. Both share the same browser pool /
-/// capture engine; the two paths never call into each other.
+/// Dispatch on `BROWSER_HEADLESS_MODE`: `serve` (default) runs the HTTP API,
+/// `worker` runs the Redis queue consumer, `all` runs both in one process
+/// sharing a single browser pool. The serve and worker code paths never call
+/// into each other; `all` just starts both against the same `CaptureCtx`.
 async fn run() {
     let mode = std::env::var("BROWSER_HEADLESS_MODE")
         .ok()
@@ -41,7 +43,10 @@ async fn run() {
     match mode.as_str() {
         "serve" => run_serve().await,
         "worker" => run_worker().await,
-        other => panic!("unknown BROWSER_HEADLESS_MODE `{other}` (expected `serve` or `worker`)"),
+        "all" => run_all().await,
+        other => {
+            panic!("unknown BROWSER_HEADLESS_MODE `{other}` (expected `serve`, `worker`, or `all`)")
+        }
     }
 }
 
@@ -81,7 +86,33 @@ async fn run_serve() {
     // startup gauges (pool_size / active_instances) are recorded.
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
+    serve_http(ctx, metrics_handle).await;
+}
 
+/// Queue worker mode: consume capture jobs from Redis (no HTTP). Runs until the
+/// process is signalled.
+async fn run_worker() {
+    let ctx = build_capture_ctx().await;
+    worker::run(ctx).await;
+}
+
+/// Combined mode: run the HTTP API and the Redis queue consumer in one process,
+/// both driving the SAME browser pool (so they compete for the
+/// `POOL_SIZE × MAX_PAGES` capacity — split into separate processes if you need
+/// them to scale independently). The worker runs as a background task; HTTP owns
+/// graceful shutdown.
+async fn run_all() {
+    let metrics_handle = http::init_metrics();
+    let ctx = build_capture_ctx().await;
+    // Background queue consumer, sharing the pool. A fatal worker config error
+    // panics this task (logged by tokio) without taking down the HTTP server.
+    tokio::spawn(worker::run(ctx.clone()));
+    serve_http(ctx, metrics_handle).await;
+}
+
+/// Build `AppState` from the shared capture context and serve the HTTP API
+/// until the process is signalled. Shared by `serve` and `all`.
+async fn serve_http(ctx: CaptureCtx, metrics_handle: PrometheusHandle) {
     let api_key = std::env::var("BROWSER_HEADLESS_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -109,13 +140,6 @@ async fn run_serve() {
         .await
         .expect("server error");
     tracing::info!("server shut down cleanly");
-}
-
-/// Queue worker mode: consume capture jobs from Redis (no HTTP). Runs until the
-/// process is signalled.
-async fn run_worker() {
-    let ctx = build_capture_ctx().await;
-    worker::run(ctx).await;
 }
 
 /// Resolves when the process receives SIGTERM (`docker stop`, k8s pod

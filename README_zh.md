@@ -780,7 +780,7 @@ curl -X POST http://localhost:3000/summary/batch \
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 HTTP）。见 [Worker 模式](#worker-模式redis-队列)。 |
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 HTTP）；`all` 一个进程同时跑两者、共享一个浏览器池（单机方便——两者抢 `POOL_SIZE × MAX_PAGES` 容量）。见 [Worker 模式](#worker-模式redis-队列)。 |
 | `BROWSER_HEADLESS_API_KEY` | 未设置（开放） | 开启 API key 鉴权。设置后，`/summary` 必须带 `X-Api-Key: <value>` header，不匹配 / 缺失返 401。`/healthz`、`/readyz`、`/metrics` 永远开放（保证探针 / 抓取可用）。key 采用常量时间比对（`subtle::ConstantTimeEq`）；但因长度不同会短路，仍建议使用高熵 key（≥32 随机字节）。 |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | 池中 chromium 进程数。总并发 = `POOL_SIZE × MAX_PAGES`。`1` 即原单实例行为。每个实例用独立 profile 目录、独立监督。 |
 | `BROWSER_HEADLESS_MAX_PAGES` | 8 | **每实例**的 page 并发上限。超出 `POOL_SIZE × MAX_PAGES` 的请求排队，handler 返回时释放 permit。 |
@@ -804,6 +804,27 @@ curl -X POST http://localhost:3000/summary/batch \
 consumer group，对每个 job 用同一套抓取引擎在自己的浏览器池上跑，把结果写回
 `result:{id}` 键。加机器 = 加 worker；HTTP 接口完全解耦（两者只共享库代码，
 互不调用）。
+
+**启动 worker**——与 HTTP 服务同一个 binary，靠 `BROWSER_HEADLESS_MODE=worker`
+切换。和 serve 模式一样需要 Chrome，再加一个 Redis URL：
+
+```bash
+# Docker
+docker run --rm --shm-size=512m \
+  -e BROWSER_HEADLESS_MODE=worker \
+  -e BROWSER_HEADLESS_REDIS_URL=redis://redis:6379 \
+  -e BROWSER_HEADLESS_POOL_SIZE=4 \
+  vicanso/browser-headless
+
+# 从源码
+BROWSER_HEADLESS_MODE=worker \
+BROWSER_HEADLESS_REDIS_URL=redis://127.0.0.1:6379 \
+  ./target/release/browser-headless
+```
+
+想跑几个 worker 就跑几个（一机/一容器一个）——它们共享 consumer group，Redis
+给每个分发互不重叠的一份 stream。没有 HTTP 口要暴露；连上后 worker 会打印一条
+`worker mode starting`。
 
 **入队**：往 stream `XADD` 一个 `payload` 字段（JSON）——
 `{ "id": "...", "url": "...", ...任意 /summary 参数... }`（`id` 可选，缺省回退到
@@ -829,7 +850,10 @@ worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所�
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `BROWSER_HEADLESS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis 连接 URL。 |
+| `BROWSER_HEADLESS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis 连接 URL。cluster 模式下填逗号分隔的种子节点（`redis://h1:6379,redis://h2:6379`）；`rediss://` 启用 TLS。 |
+| `BROWSER_HEADLESS_REDIS_CLUSTER` | 未设置（false） | 设为 `1`/`true`/`yes`/`on` 把 `REDIS_URL` 当作 Redis **Cluster** 种子节点。worker 所有命令都是单 key，路由不会触发 CROSSSLOT；注意 job 流落在单个节点上（`result:{id}` 键分散到整个集群）。 |
+| `BROWSER_HEADLESS_REDIS_CA_CERT` | 未设置 | PEM 格式 CA 证书路径，用于验证服务端（私有 CA）。不设则用系统信任库。需配合 `rediss://` URL。单节点与 cluster 都生效。 |
+| `BROWSER_HEADLESS_REDIS_CLIENT_CERT` / `BROWSER_HEADLESS_REDIS_CLIENT_KEY` | 未设置 | PEM 格式客户端证书 + 私钥路径，用于**双向 TLS（mTLS）**。两者必须同时设置（只设其一是致命配置错误）。 |
 | `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | 消费 job 的 stream。 |
 | `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | consumer group——在多 worker 间均衡 job。 |
 | `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | 本 worker 的 consumer 名（每进程唯一）。 |

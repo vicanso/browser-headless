@@ -826,7 +826,7 @@ empty `urls` or over-limit list returns 400. This is the efficient shape for
 
 | Env var | Default | Effect |
 |---|---|---|
-| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no HTTP). See [Worker mode](#worker-mode-redis-queue). |
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no HTTP); `all` runs both in one process sharing one browser pool (handy on a single box — they compete for `POOL_SIZE × MAX_PAGES`). See [Worker mode](#worker-mode-redis-queue). |
 | `BROWSER_HEADLESS_API_KEY` | unset (open) | Enables API key auth. When set, every `/summary` call must carry header `X-Api-Key: <value>`; mismatch / missing returns 401. `/healthz`, `/readyz`, and `/metrics` are always open so probes / scrapers work. The key is compared in constant time (`subtle::ConstantTimeEq`); still use a high-entropy key (≥32 random bytes) since the comparison short-circuits on length. |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | Number of chromium processes in the pool. Total concurrency = `POOL_SIZE × MAX_PAGES`. `1` reproduces the original single-instance behaviour. Each instance uses its own profile dir and is supervised independently. |
 | `BROWSER_HEADLESS_MAX_PAGES` | 8 | Page-concurrency cap **per instance**. Requests beyond `POOL_SIZE × MAX_PAGES` queue; the permit is released when the handler returns. |
@@ -851,6 +851,28 @@ process binds no HTTP port, joins a Redis Streams consumer group, and for each
 job runs the same capture engine on its own browser pool, writing the result to
 a `result:{id}` key. Add workers to add throughput; the HTTP API is fully
 decoupled (the two share only library code, never call each other).
+
+**Start a worker** — same binary as the HTTP service, switched with
+`BROWSER_HEADLESS_MODE=worker`. It needs Chrome (like serve mode) plus a Redis
+URL:
+
+```bash
+# Docker
+docker run --rm --shm-size=512m \
+  -e BROWSER_HEADLESS_MODE=worker \
+  -e BROWSER_HEADLESS_REDIS_URL=redis://redis:6379 \
+  -e BROWSER_HEADLESS_POOL_SIZE=4 \
+  vicanso/browser-headless
+
+# From source
+BROWSER_HEADLESS_MODE=worker \
+BROWSER_HEADLESS_REDIS_URL=redis://127.0.0.1:6379 \
+  ./target/release/browser-headless
+```
+
+Run as many workers as you like (one per machine / container) — they share the
+consumer group and Redis hands each a disjoint slice of the stream. There's no
+HTTP port to expose; the worker logs `worker mode starting` once it's connected.
 
 **Enqueue** a job by `XADD`-ing a single `payload` field (JSON) to the stream —
 `{ "id": "...", "url": "...", ...any /summary param... }` (`id` optional, falls
@@ -878,7 +900,10 @@ twice (fine for read-only captures; add an idempotency key for side-effecting
 
 | Env var | Default | Effect |
 |---|---|---|
-| `BROWSER_HEADLESS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL. |
+| `BROWSER_HEADLESS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL. In cluster mode, comma-separated seed nodes (`redis://h1:6379,redis://h2:6379`); `rediss://` enables TLS. |
+| `BROWSER_HEADLESS_REDIS_CLUSTER` | unset (false) | Set to `1`/`true`/`yes`/`on` to treat `REDIS_URL` as Redis **Cluster** seed nodes. All worker commands are single-key so routing never hits CROSSSLOT; note the job stream lives on one node (`result:{id}` keys distribute across the cluster). |
+| `BROWSER_HEADLESS_REDIS_CA_CERT` | unset | Path to a PEM CA certificate to verify the server (private CA). When unset, the system trust store is used. Requires a `rediss://` URL. Applies to single-node and cluster. |
+| `BROWSER_HEADLESS_REDIS_CLIENT_CERT` / `BROWSER_HEADLESS_REDIS_CLIENT_KEY` | unset | Paths to a PEM client certificate + key for **mutual TLS**. Both must be set together (setting only one is a fatal config error). |
 | `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | Stream consumed for jobs. |
 | `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | Consumer group — load-balances jobs across all workers. |
 | `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | This worker's consumer name (unique per process). |

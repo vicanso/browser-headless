@@ -45,7 +45,8 @@ capture engine is reusable outside HTTP:
 
 - **`main.rs`** — entrypoint only: builds the tokio runtime, then dispatches on
   `BROWSER_HEADLESS_MODE` — `serve` (default) runs the HTTP API, `worker` runs
-  the Redis queue consumer. Both build the same pool + `CaptureCtx`.
+  the Redis queue consumer, `all` runs both in one process (worker as a
+  background task) sharing one `CaptureCtx` / pool.
 - **`config.rs`** — env-backed knobs, each cached once (`default_timeout_ms`,
   `deadline_buffer_ms`, `max_batch_urls`).
 - **`capture.rs`** — the **HTTP-agnostic capture core**. `CaptureCtx { pool,
@@ -67,6 +68,9 @@ capture engine is reusable outside HTTP:
   subprocess) on request-count/age thresholds, serialized so at most one
   instance is unavailable at a time (zero-downtime recycle at `pool_size ≥ 2`).
 - **`worker.rs`** — queue-consumer mode (`BROWSER_HEADLESS_MODE=worker`).
+  Works against single-node **or** Redis Cluster (`BROWSER_HEADLESS_REDIS_CLUSTER`)
+  via a `Conn` enum that delegates `ConnectionLike` — all commands are single-key,
+  so cluster routing is transparent.
   Reads jobs from a Redis Streams consumer group, runs `capture::capture_one` on
   the shared pool, writes results to `result:{id}` keys (TTL'd), and acks
   (at-least-once; `XAUTOCLAIM` reclaims jobs from crashed workers). Binds no HTTP
