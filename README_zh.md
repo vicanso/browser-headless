@@ -856,9 +856,11 @@ worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所�
 | `BROWSER_HEADLESS_REDIS_CLIENT_CERT` / `BROWSER_HEADLESS_REDIS_CLIENT_KEY` | 未设置 | PEM 格式客户端证书 + 私钥路径，用于**双向 TLS（mTLS）**。两者必须同时设置（只设其一是致命配置错误）。 |
 | `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | 消费 job 的 stream。 |
 | `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | consumer group——在多 worker 间均衡 job。 |
+| `BROWSER_HEADLESS_GROUP_START` | `0` | 消费组**首次创建**时的起点：`0` 消费 stream 里已有的全部（worker 启动前就入队的积压）；`$` 只消费创建之后的新消息。仅影响首次创建——组一旦存在就按自己的位置跨重启续读。 |
 | `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | 本 worker 的 consumer 名（每进程唯一）。 |
 | `BROWSER_HEADLESS_RESULT_PREFIX` | `browser_headless:result:` | 结果键前缀；键为 `<前缀><id>`。 |
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | 结果键 TTL（秒）。 |
+| `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | 处理 + ack 后 `XDEL` 把该条从 stream 删除，避免 stream 无限增长（结果仍在 `result:{id}`）。设 `false` 保留条目——例如要回放、或同一 stream 上挂第二个消费组（`XDEL` 是全局的、对**所有**消费组生效，那时改用 MAXLEN 自己控量）。 |
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。 |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
 

@@ -22,6 +22,14 @@ fn main() {
         )
         .init();
 
+    // Redis TLS (`rediss://` / custom certs in worker mode) goes through rustls
+    // 0.23, which needs a process-wide crypto provider chosen explicitly before
+    // the first TLS handshake. Install `ring` here so a worker pointed at a TLS
+    // Redis doesn't panic. Harmless when TLS is unused.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring crypto provider");
+
     let worker_threads = num_cpus::get();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

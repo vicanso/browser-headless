@@ -17,7 +17,7 @@
 //! (`id` optional — falls back to the Redis stream entry id).
 //! Result at `result:{id}`: `{ "id", "status", "data"? , "error"? }`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
 use redis::aio::{ConnectionLike, MultiplexedConnection};
@@ -52,9 +52,20 @@ struct WorkerConfig {
     client_key_path: Option<String>,
     stream: String,
     group: String,
+    /// Start position when the consumer group is FIRST created
+    /// (`BROWSER_HEADLESS_GROUP_START`): `0` consumes everything already in the
+    /// stream (backlog enqueued before the worker started), `$` only consumes
+    /// messages added after creation. Only affects the first creation — once
+    /// the group exists it keeps its own position across restarts.
+    group_start: String,
     consumer: String,
     result_prefix: String,
     result_ttl_secs: u64,
+    /// Delete each entry from the stream once it's processed + acked (XACK only
+    /// clears the pending list, so the stream would otherwise grow forever).
+    /// Default on; set `BROWSER_HEADLESS_DELETE_ON_ACK=false` to retain entries
+    /// (e.g. for replay) and cap the stream with MAXLEN yourself.
+    delete_on_ack: bool,
     /// How long `XREADGROUP` blocks waiting for new jobs before we fall through
     /// to a reclaim pass.
     block_ms: usize,
@@ -73,12 +84,14 @@ impl WorkerConfig {
             client_key_path: env_opt("BROWSER_HEADLESS_REDIS_CLIENT_KEY"),
             stream: env_string("BROWSER_HEADLESS_JOBS_STREAM", "browser_headless:jobs"),
             group: env_string("BROWSER_HEADLESS_CONSUMER_GROUP", "workers"),
+            group_start: env_string("BROWSER_HEADLESS_GROUP_START", "0"),
             consumer: env_string(
                 "BROWSER_HEADLESS_CONSUMER_NAME",
                 &format!("worker-{}", std::process::id()),
             ),
             result_prefix: env_string("BROWSER_HEADLESS_RESULT_PREFIX", "browser_headless:result:"),
             result_ttl_secs: env_u64("BROWSER_HEADLESS_RESULT_TTL_SECS", 3600).max(1),
+            delete_on_ack: env_bool("BROWSER_HEADLESS_DELETE_ON_ACK", true),
             block_ms: env_u64("BROWSER_HEADLESS_JOB_BLOCK_MS", 5000).max(1) as usize,
             visibility_ms: env_u64("BROWSER_HEADLESS_JOB_VISIBILITY_MS", 120_000).max(1),
         }
@@ -108,6 +121,30 @@ fn env_bool(key: &str, default: bool) -> bool {
 
 fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// Mask credentials in a Redis URL (or comma-separated cluster seed list) for
+/// logging: keep scheme / host / port / path, replace any `user:pass@` with
+/// `***@`. Never log the raw URL — it embeds the password (e.g. Upstash).
+fn redact_redis_url(raw: &str) -> String {
+    raw.split(',')
+        .map(|node| {
+            let node = node.trim();
+            match url::Url::parse(node) {
+                Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+                    let host = u.host_str().unwrap_or("");
+                    match u.port() {
+                        Some(p) => format!("{}://***@{host}:{p}{}", u.scheme(), u.path()),
+                        None => format!("{}://***@{host}{}", u.scheme(), u.path()),
+                    }
+                }
+                Ok(_) => node.to_string(),
+                // Unparseable — don't risk echoing embedded credentials.
+                Err(_) => "<redacted>".to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Read a PEM file into bytes for TLS configuration, mapping IO errors into a
@@ -309,7 +346,7 @@ pub(crate) async fn run(ctx: CaptureCtx) {
     let cfg = WorkerConfig::from_env();
     let capacity = ctx.pool.capacity().max(1);
     tracing::info!(
-        redis_url = %cfg.redis_url,
+        redis_url = %redact_redis_url(&cfg.redis_url),
         cluster = cfg.cluster,
         tls_custom_certs = cfg.ca_cert_path.is_some() || cfg.client_cert_path.is_some(),
         stream = %cfg.stream,
@@ -350,6 +387,14 @@ pub(crate) async fn run(ctx: CaptureCtx) {
                 }
                 process(&ctx, &cfg, &write_conn, entries).await;
             }
+            Err(e) if e.code() == Some("NOGROUP") => {
+                // The stream / consumer group vanished while we were running
+                // (deleted, evicted, or trimmed away). Recreate it and retry —
+                // no need to churn the connection.
+                tracing::warn!(error = %e, "consumer group missing; recreating");
+                ensure_group(&backend, &cfg).await;
+                backoff = Duration::from_secs(1);
+            }
             Err(e) => {
                 tracing::error!(error = %e, retry_in = ?backoff, "redis read failed; reconnecting");
                 tokio::time::sleep(backoff).await;
@@ -367,7 +412,11 @@ async fn ensure_group(backend: &Backend, cfg: &WorkerConfig) {
         match backend.connect(read_response_timeout(cfg)).await {
             Ok(mut conn) => {
                 let res: redis::RedisResult<()> = conn
-                    .xgroup_create_mkstream(cfg.stream.as_str(), cfg.group.as_str(), "$")
+                    .xgroup_create_mkstream(
+                        cfg.stream.as_str(),
+                        cfg.group.as_str(),
+                        cfg.group_start.as_str(),
+                    )
                     .await;
                 match res {
                     Ok(()) => {
@@ -461,7 +510,11 @@ async fn process(ctx: &CaptureCtx, cfg: &WorkerConfig, write_conn: &Conn, entrie
                     }
                 };
                 let id = job.id.unwrap_or_else(|| entry_id.clone());
+                let url = job.query.url.clone();
+                let started = Instant::now();
+                tracing::info!(entry = %entry_id, id = %id, url = %url, "job started");
                 let result = capture_to_result(&ctx, id, job.query).await;
+                let duration_ms = started.elapsed().as_millis() as u64;
 
                 let json = match serde_json::to_string(&result) {
                     Ok(j) => j,
@@ -480,7 +533,7 @@ async fn process(ctx: &CaptureCtx, cfg: &WorkerConfig, write_conn: &Conn, entrie
                     tracing::warn!(entry = %entry_id, error = %e, "result write failed; leaving entry pending");
                     return;
                 }
-                tracing::info!(entry = %entry_id, id = %result.id, status = result.status, "job done");
+                tracing::info!(entry = %entry_id, id = %result.id, status = result.status, duration_ms, "job done");
                 ack(&mut conn, &cfg, &entry_id).await;
             }
         })
@@ -502,5 +555,16 @@ async fn ack(conn: &mut Conn, cfg: &WorkerConfig, entry_id: &str) {
         .await;
     if let Err(e) = acked {
         tracing::warn!(entry = %entry_id, error = %e, "XACK failed");
+        return;
+    }
+    // XACK only clears the pending list — the entry stays in the stream. Delete
+    // it so the stream doesn't grow without bound (the result already lives in
+    // `result:{id}`). The reclaim path is unaffected: we only reach here after a
+    // definitive outcome, so nothing reclaimable is ever deleted.
+    if cfg.delete_on_ack {
+        let deleted: redis::RedisResult<i64> = conn.xdel(cfg.stream.as_str(), &[entry_id]).await;
+        if let Err(e) = deleted {
+            tracing::warn!(entry = %entry_id, error = %e, "XDEL failed");
+        }
     }
 }

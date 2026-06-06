@@ -22,3 +22,7 @@ subtle = "2.6"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 redis = { version = "1.2.2", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"] }
+# redis's `tokio-rustls-comp` pulls rustls 0.23 but selects no crypto provider,
+# so we enable + install `ring` ourselves (see main.rs). `ring` avoids the
+# cmake/C build deps that `aws-lc-rs` needs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

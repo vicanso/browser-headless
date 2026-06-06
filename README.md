@@ -906,9 +906,11 @@ twice (fine for read-only captures; add an idempotency key for side-effecting
 | `BROWSER_HEADLESS_REDIS_CLIENT_CERT` / `BROWSER_HEADLESS_REDIS_CLIENT_KEY` | unset | Paths to a PEM client certificate + key for **mutual TLS**. Both must be set together (setting only one is a fatal config error). |
 | `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | Stream consumed for jobs. |
 | `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | Consumer group — load-balances jobs across all workers. |
+| `BROWSER_HEADLESS_GROUP_START` | `0` | Start position when the group is **first** created: `0` consumes everything already in the stream (backlog enqueued before the worker started); `$` only consumes messages added after creation. Only affects first creation — once the group exists it keeps its own position across restarts. |
 | `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | This worker's consumer name (unique per process). |
 | `BROWSER_HEADLESS_RESULT_PREFIX` | `browser_headless:result:` | Result key prefix; the key is `<prefix><id>`. |
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | TTL (seconds) on result keys. |
+| `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | `XDEL` each entry from the stream after it's processed + acked, so the stream doesn't grow forever (the result still lives in `result:{id}`). Set `false` to retain entries — e.g. for replay or a second consumer group on the same stream, since `XDEL` removes the entry for **all** groups (then cap the stream with MAXLEN yourself). |
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` block time before a reclaim pass. |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | Idle time before a pending entry is reclaimable by another worker. |
 
