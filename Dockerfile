@@ -44,12 +44,18 @@ EXPOSE 3000
 #   - ca-certificates: TLS validation for HTTPS upstream pages
 #   - fonts-liberation + fonts-noto-cjk: prevent missing-glyph boxes when
 #     rendering Latin / CJK pages (matters for innerText and screenshots)
+#   - tini: PID 1 init that reaps zombie/orphan processes. The service
+#     constantly spawns + kills chromium (pool recycle / crash respawn), and
+#     chromium is multi-process, so without a reaping PID 1 orphaned children
+#     would accumulate as zombies and eventually exhaust PIDs. tini also
+#     forwards SIGTERM for graceful shutdown.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         chromium \
         ca-certificates \
         fonts-liberation \
         fonts-noto-cjk \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Service account with /bin/false to block interactive login; `-m` still
@@ -66,4 +72,7 @@ USER rust
 # google-chrome / chromium variants (works, but explicit is faster + clearer).
 ENV CHROME=/usr/bin/chromium
 
+# tini as PID 1: reaps orphaned chromium processes and forwards signals to the
+# server (graceful shutdown). `docker run --init` is therefore unnecessary.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["browser-headless"]

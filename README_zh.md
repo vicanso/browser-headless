@@ -890,6 +890,9 @@ worker 不暴露 `/metrics`（无 HTTP）；用日志和 Redis consumer-group la
     periodSeconds: 5
     initialDelaySeconds: 5
   ```
+- **僵尸进程回收**：镜像以 `tini` 作 PID 1（ENTRYPOINT），池回收 / 崩溃重启
+  产生的孤儿 chromium 进程会被 reap，不会堆积成僵尸。因此**无需** `docker
+  run --init`（加了也无害）。
 - **优雅退出**：`docker stop` 发 SIGTERM，会等 in-flight 请求完成
   （docker stop timeout 内）。如长抓取可能超过默认 10s，加
   `--stop-timeout=60`。

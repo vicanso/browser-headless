@@ -940,6 +940,10 @@ them via logs and Redis consumer-group lag (`XPENDING`).
     periodSeconds: 5
     initialDelaySeconds: 5
   ```
+- **Zombie reaping**: the image runs `tini` as PID 1 (ENTRYPOINT), so
+  orphaned chromium processes from pool recycle / crash respawn are reaped
+  instead of piling up as zombies. `docker run --init` is therefore not
+  needed (harmless if added).
 - **Graceful shutdown**: `docker stop` (SIGTERM) waits for in-flight
   requests up to the docker stop timeout. Use `--stop-timeout=60` if
   long-running captures may exceed the default 10s.
