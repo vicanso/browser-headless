@@ -7,18 +7,18 @@
 //! [`capture_one`] is the unit of work both paths share.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use url::{Host, Url};
+use url::Url;
 
 use crate::browser;
 use crate::config::{checkout_wait_ms, deadline_buffer_ms, default_timeout_ms};
 use crate::pool::BrowserPool;
+use crate::ssrf;
 
 /// Shared, transport-agnostic capture context: the browser pool plus the SSRF
 /// policy. Cheap to clone (an `Arc` + a bool). The HTTP `AppState` embeds one;
@@ -538,6 +538,10 @@ async fn capture_one_unmetered(
         headers: q.headers,
         block_urls: q.block_urls,
         block_resource_types: q.block_resource_types,
+        // Re-apply the SSRF blocklist to every in-page navigation / redirect
+        // hop (the pre-flight `check_ssrf` only validates the initial URL).
+        // Mirrors the pool-level policy: on unless private IPs are allowed.
+        ssrf_guard: !ctx.allow_private_ips,
         disable_cache: q.disable_cache,
         wait_for_element: q.wait_for_element,
         wait_for_function: q.wait_for_function,
@@ -737,84 +741,21 @@ fn validate_url(raw: &str) -> Result<Url, (StatusCode, String)> {
     }
 }
 
-/// SSRF guard. For literal-IP hosts checks the address directly; for
-/// domains performs a DNS lookup and rejects if ANY resolved address is in
-/// a blocked range. Covers IPv4 loopback / private / link-local /
-/// broadcast / unspecified, and IPv6 equivalents + ULA + IPv4-mapped.
+/// SSRF guard for the **initial** URL — a cheap pre-flight before a pool slot
+/// is checked out. Delegates host classification to [`crate::ssrf`] and maps
+/// its error to a transport status (`NoHost` / `DnsFailed` → 400, blocked →
+/// 403).
 ///
-/// Limitation: doesn't defend against DNS rebinding (browser may resolve
-/// the host again at navigation time and get a different IP). For high-
-/// stakes deployments combine with egress firewall / proxy.
+/// Redirects are covered separately: `browser`'s Fetch interception re-applies
+/// the same blocklist to every navigation hop (so a public URL can't 3xx-bounce
+/// into an internal host). For DNS-rebinding-grade threats, still combine with
+/// an egress firewall / proxy.
 async fn check_ssrf(url: &Url) -> Result<(), (StatusCode, String)> {
-    let host = url
-        .host()
-        .ok_or((StatusCode::BAD_REQUEST, "URL has no host".to_string()))?;
-    let port = url.port_or_known_default().unwrap_or(80);
-
-    match host {
-        Host::Ipv4(ip) => {
-            if is_blocked_ipv4(&ip) {
-                return Err((StatusCode::FORBIDDEN, format!("blocked IPv4 host: {ip}")));
-            }
-        }
-        Host::Ipv6(ip) => {
-            if is_blocked_ipv6(&ip) {
-                return Err((StatusCode::FORBIDDEN, format!("blocked IPv6 host: {ip}")));
-            }
-        }
-        Host::Domain(name) => {
-            let addrs = tokio::net::lookup_host(format!("{name}:{port}"))
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("dns resolution failed for `{name}`: {e}"),
-                    )
-                })?;
-            for addr in addrs {
-                let blocked = match addr.ip() {
-                    std::net::IpAddr::V4(v4) => is_blocked_ipv4(&v4),
-                    std::net::IpAddr::V6(v6) => is_blocked_ipv6(&v6),
-                };
-                if blocked {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        format!("`{name}` resolves to blocked IP {}", addr.ip()),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_blocked_ipv4(ip: &Ipv4Addr) -> bool {
-    ip.is_loopback()           // 127.0.0.0/8
-        || ip.is_private()      // 10/8, 172.16/12, 192.168/16
-        || ip.is_link_local()   // 169.254/16 (incl. cloud metadata 169.254.169.254)
-        || ip.is_broadcast()    // 255.255.255.255
-        || ip.is_unspecified()  // 0.0.0.0
-        || ip.octets()[0] == 0 // 0.0.0.0/8 reserved
-}
-
-fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return true;
-    }
-    let segments = ip.segments();
-    // fe80::/10 link-local
-    if (segments[0] & 0xffc0) == 0xfe80 {
-        return true;
-    }
-    // fc00::/7 ULA (unique local addresses)
-    if (segments[0] & 0xfe00) == 0xfc00 {
-        return true;
-    }
-    // IPv4-mapped (::ffff:x.x.x.x) — check embedded v4
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_blocked_ipv4(&v4);
-    }
-    false
+    use ssrf::SsrfError;
+    ssrf::check_url(url).await.map_err(|e| match e {
+        SsrfError::NoHost | SsrfError::DnsFailed(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        SsrfError::Blocked(_) => (StatusCode::FORBIDDEN, e.to_string()),
+    })
 }
 
 /// Parse a standard HTTP `Cookie` header into `(name, value)` pairs.

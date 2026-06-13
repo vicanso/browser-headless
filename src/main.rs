@@ -3,12 +3,14 @@ mod capture;
 mod config;
 mod http;
 mod pool;
+mod ssrf;
 mod worker;
 
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use crate::capture::CaptureCtx;
 use crate::http::AppState;
@@ -101,15 +103,15 @@ async fn run_serve() {
     // startup gauges (pool_size / active_instances) are recorded.
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
-    serve_http(ctx, metrics_handle).await;
+    serve_http(ctx, metrics_handle, install_shutdown()).await;
 }
 
 /// Queue worker mode: consume capture jobs from Redis. Binds no API port, but
 /// DOES expose a minimal `/healthz` + `/readyz` + `/metrics` listener on
 /// `BROWSER_HEADLESS_HEALTH_PORT` so the worker is probeable / scrapeable. The
 /// Prometheus recorder is installed here (worker mode otherwise has none, so
-/// the capture + worker metric macros would silently no-op). Runs until the
-/// process is signalled.
+/// the capture + worker metric macros would silently no-op). Runs until
+/// signalled, then drains in-flight jobs and returns.
 async fn run_worker() {
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
@@ -118,26 +120,34 @@ async fn run_worker() {
         metrics_handle,
         config::health_port(),
     ));
-    worker::run(ctx).await;
+    worker::run(ctx, install_shutdown()).await;
 }
 
 /// Combined mode: run the HTTP API and the Redis queue consumer in one process,
 /// both driving the SAME browser pool (so they compete for the
 /// `POOL_SIZE × MAX_PAGES` capacity — split into separate processes if you need
-/// them to scale independently). The worker runs as a background task; HTTP owns
-/// graceful shutdown.
+/// them to scale independently). Both share one shutdown signal: on SIGTERM the
+/// HTTP server drains its connections while the worker drains its in-flight
+/// jobs; we await the worker AFTER the server returns so the process doesn't
+/// exit (killing the worker) mid-drain.
 async fn run_all() {
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
+    let shutdown = install_shutdown();
     // Background queue consumer, sharing the pool. A fatal worker config error
     // panics this task (logged by tokio) without taking down the HTTP server.
-    tokio::spawn(worker::run(ctx.clone()));
-    serve_http(ctx, metrics_handle).await;
+    let worker = tokio::spawn(worker::run(ctx.clone(), shutdown.clone()));
+    serve_http(ctx, metrics_handle, shutdown).await;
+    let _ = worker.await;
 }
 
 /// Build `AppState` from the shared capture context and serve the HTTP API
-/// until the process is signalled. Shared by `serve` and `all`.
-async fn serve_http(ctx: CaptureCtx, metrics_handle: PrometheusHandle) {
+/// until `shutdown` fires, then drain connections. Shared by `serve` and `all`.
+async fn serve_http(
+    ctx: CaptureCtx,
+    metrics_handle: PrometheusHandle,
+    shutdown: watch::Receiver<bool>,
+) {
     let api_key = std::env::var("BROWSER_HEADLESS_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -161,20 +171,30 @@ async fn serve_http(ctx: CaptureCtx, metrics_handle: PrometheusHandle) {
         num_cpus::get()
     );
     axum::serve(listener, http::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_future(shutdown))
         .await
         .expect("server error");
     tracing::info!("server shut down cleanly");
 }
 
-/// Resolves when the process receives SIGTERM (`docker stop`, k8s pod
-/// eviction, systemd `Term=signal`) or SIGINT (Ctrl-C in a foreground shell).
-/// Used with `axum::serve(...).with_graceful_shutdown(...)` so the server
-/// stops accepting new connections and waits for in-flight requests to
-/// complete before returning. After return, AppState drops, the pool's
-/// `Arc<Browser>`s reach refcount 0, and chromiumoxide's Drop tears down the
-/// chrome subprocesses.
-async fn shutdown_signal() {
+/// Spawn the process-wide signal listener and return a `watch` receiver that
+/// flips to `true` on SIGTERM (`docker stop`, k8s eviction, systemd
+/// `Term=signal`) or SIGINT (Ctrl-C). One sender drives every mode's graceful
+/// shutdown: the HTTP server stops accepting connections and drains in-flight
+/// requests, and the worker stops pulling jobs and drains its in-flight
+/// captures. After both return, the pool drops, `Arc<Browser>`s hit refcount 0,
+/// and chromiumoxide tears down the chrome subprocesses.
+fn install_shutdown() -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_signal().await;
+        let _ = tx.send(true);
+    });
+    rx
+}
+
+/// Resolve on the first SIGTERM / SIGINT.
+async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
@@ -182,6 +202,12 @@ async fn shutdown_signal() {
         _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
         _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
     }
+}
+
+/// Resolve once `shutdown` flips to `true`; used as the axum graceful-shutdown
+/// future.
+async fn shutdown_future(mut shutdown: watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|v| *v).await;
 }
 
 /// Bind the worker's health/metrics listener (`/healthz`, `/readyz`,

@@ -32,6 +32,7 @@ use redis::{
     RedisResult, TlsCertificates, Value,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
@@ -39,6 +40,7 @@ use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
 const M_WORKER_JOBS: &str = "browser_headless_worker_jobs_total";
 const M_WORKER_JOB_DURATION: &str = "browser_headless_worker_job_duration_seconds";
 const M_WORKER_RECLAIMED: &str = "browser_headless_worker_reclaimed_total";
+const M_WORKER_RETRIES: &str = "browser_headless_worker_retries_total";
 const M_WORKER_INFLIGHT: &str = "browser_headless_worker_jobs_in_flight";
 const M_WORKER_STREAM_LEN: &str = "browser_headless_worker_stream_length";
 const M_WORKER_PENDING: &str = "browser_headless_worker_pending";
@@ -90,6 +92,25 @@ struct WorkerConfig {
     /// (stream length / pending / in-flight) via `XLEN` + `XPENDING`
     /// (`BROWSER_HEADLESS_METRICS_SAMPLE_SECS`, default 15).
     metrics_sample_secs: u64,
+    /// Publish each completed result to a Redis pub/sub channel named after the
+    /// result key (`<result_prefix><id>`), carrying the same JSON, so clients
+    /// can block on `SUBSCRIBE` instead of polling `GET`
+    /// (`BROWSER_HEADLESS_RESULT_NOTIFY`, default true). The key is still
+    /// written, so pollers and late subscribers keep working.
+    result_notify: bool,
+    /// Max times to retry a job whose capture returned a *transient* failure
+    /// (408 / 502 / 503 / 504) before writing a terminal error result
+    /// (`BROWSER_HEADLESS_JOB_MAX_RETRIES`, default 2). Definitive failures
+    /// (400 / 401 / 403 / 404) are never retried.
+    job_max_retries: u64,
+    /// Backoff between transient-failure retries
+    /// (`BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS`, default 500).
+    job_retry_backoff_ms: u64,
+    /// On shutdown (SIGTERM / SIGINT), how long to wait for in-flight jobs to
+    /// finish before exiting anyway (`BROWSER_HEADLESS_WORKER_DRAIN_MS`,
+    /// default 30000). Jobs still running at the deadline stay pending and are
+    /// reclaimed by another worker.
+    drain_ms: u64,
 }
 
 impl WorkerConfig {
@@ -114,6 +135,10 @@ impl WorkerConfig {
             visibility_ms: env_u64("BROWSER_HEADLESS_JOB_VISIBILITY_MS", 120_000).max(1),
             connect_timeout_ms: env_u64("BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS", 5000).max(1),
             metrics_sample_secs: env_u64("BROWSER_HEADLESS_METRICS_SAMPLE_SECS", 15).max(1),
+            result_notify: env_bool("BROWSER_HEADLESS_RESULT_NOTIFY", true),
+            job_max_retries: env_u64("BROWSER_HEADLESS_JOB_MAX_RETRIES", 2),
+            job_retry_backoff_ms: env_u64("BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS", 500),
+            drain_ms: env_u64("BROWSER_HEADLESS_WORKER_DRAIN_MS", 30_000).max(1),
         }
     }
 }
@@ -380,9 +405,10 @@ impl JobResult {
     }
 }
 
-/// Run the worker loop forever (until the process is signalled). Shares the
-/// browser pool via `ctx`; reads its own Redis config from the environment.
-pub(crate) async fn run(ctx: CaptureCtx) {
+/// Run the worker loop until `shutdown` flips to `true` (SIGTERM / SIGINT),
+/// then drain in-flight jobs and return. Shares the browser pool via `ctx`;
+/// reads its own Redis config from the environment.
+pub(crate) async fn run(ctx: CaptureCtx, mut shutdown: watch::Receiver<bool>) {
     let cfg = Arc::new(WorkerConfig::from_env());
     let capacity = ctx.pool.capacity().max(1);
     describe_worker_metrics();
@@ -425,14 +451,28 @@ pub(crate) async fn run(ctx: CaptureCtx) {
         // captures are busy — backpressure: we never pull jobs we can't run
         // now. `want` is everything currently free, so a burst of freed slots
         // is refilled in one batched read.
-        let first = inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("inflight semaphore closed");
+        let first = tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut shutdown) => break,
+            permit = inflight.clone().acquire_owned() => {
+                permit.expect("inflight semaphore closed")
+            }
+        };
         let want = 1 + inflight.available_permits();
 
-        match poll_new(&mut read_conn, &cfg, want).await {
+        // Block for new jobs, but abandon the read on shutdown (releasing the
+        // reserved slot) rather than sitting in a multi-second XREADGROUP while
+        // we're trying to drain.
+        let read = tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut shutdown) => {
+                drop(first);
+                break;
+            }
+            r = poll_new(&mut read_conn, &cfg, want) => r,
+        };
+
+        match read {
             Ok(entries) if entries.is_empty() => {
                 // No new jobs — release the reserved slot and try to reclaim
                 // entries abandoned by a crashed worker before blocking again.
@@ -490,6 +530,30 @@ pub(crate) async fn run(ctx: CaptureCtx) {
             }
         }
     }
+
+    // Graceful drain: stop pulling new jobs, then wait for in-flight ones to
+    // finish — each holds a permit, so acquiring all `capacity` means none are
+    // left — bounded by `drain_ms`. Jobs still running at the deadline stay
+    // pending in Redis and are reclaimed by another worker (at-least-once).
+    tracing::info!("worker shutting down; draining in-flight jobs");
+    match tokio::time::timeout(
+        Duration::from_millis(cfg.drain_ms),
+        inflight.acquire_many(capacity as u32),
+    )
+    .await
+    {
+        Ok(_) => tracing::info!("worker drained cleanly; exiting"),
+        Err(_) => tracing::warn!(
+            in_flight = capacity - inflight.available_permits(),
+            "worker drain timed out; exiting with jobs still in flight (will be reclaimed)"
+        ),
+    }
+}
+
+/// Resolve once the shutdown flag flips to `true` (or the sender is dropped,
+/// which shouldn't happen — it lives for the whole process).
+async fn shutdown_requested(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|v| *v).await;
 }
 
 /// Create the consumer group (and the stream, via `MKSTREAM`) if absent.
@@ -635,7 +699,7 @@ async fn process_one(ctx: &CaptureCtx, cfg: &WorkerConfig, mut conn: Conn, entry
     let url = job.query.url.clone();
     let started = Instant::now();
     tracing::info!(entry = %entry_id, id = %id, url = %url, "job started");
-    let result = capture_to_result(ctx, id, job.query).await;
+    let result = capture_to_result(ctx, cfg, id, job.query).await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     // Worker-queue metrics. `capture_one` already records the generic capture
@@ -661,6 +725,17 @@ async fn process_one(ctx: &CaptureCtx, cfg: &WorkerConfig, mut conn: Conn, entry
         tracing::warn!(entry = %entry_id, error = %e, "result write failed; leaving entry pending");
         return;
     }
+
+    // Notify any blocked subscribers (the channel name == the result key).
+    // Best-effort: the result key is already written, so pollers and late
+    // subscribers are covered even when PUBLISH reaches no one.
+    if cfg.result_notify {
+        let published: redis::RedisResult<()> = conn.publish(&key, &json).await;
+        if let Err(e) = published {
+            tracing::debug!(entry = %entry_id, error = %e, "result publish failed");
+        }
+    }
+
     tracing::info!(entry = %entry_id, id = %result.id, status = result.status, duration_ms, "job done");
     ack(&mut conn, cfg, &entry_id).await;
 }
@@ -682,6 +757,10 @@ fn describe_worker_metrics() {
     describe_counter!(
         M_WORKER_RECLAIMED,
         "Stale pending entries reclaimed from presumed-dead workers via XAUTOCLAIM"
+    );
+    describe_counter!(
+        M_WORKER_RETRIES,
+        "Transient capture failures retried before a terminal result"
     );
     describe_gauge!(M_WORKER_INFLIGHT, "Worker captures currently in flight");
     describe_gauge!(
@@ -736,13 +815,50 @@ async fn xpending_count(conn: &mut Conn, cfg: &WorkerConfig) -> redis::RedisResu
     })
 }
 
-/// Run one capture and shape it into a `JobResult`.
-async fn capture_to_result(ctx: &CaptureCtx, id: String, query: SummaryQuery) -> JobResult {
-    match capture::capture_one(ctx, query).await {
-        Ok(Captured::Content(content)) => JobResult::ok(id, serde_json::to_value(content)),
-        Ok(Captured::Full(stat)) => JobResult::ok(id, serde_json::to_value(stat)),
-        Err((code, msg)) => JobResult::err(id, code.as_u16(), msg),
+/// Run one capture and shape it into a `JobResult`, retrying *transient*
+/// failures (408 / 502 / 503 / 504) up to `job_max_retries` times with a fixed
+/// backoff. Definitive failures (400 / 401 / 403 / 404) and successes return
+/// immediately.
+async fn capture_to_result(
+    ctx: &CaptureCtx,
+    cfg: &WorkerConfig,
+    id: String,
+    query: SummaryQuery,
+) -> JobResult {
+    let mut attempt = 0u64;
+    loop {
+        // `capture_one` consumes the query; clone per attempt so a retry can
+        // re-run it (cheap relative to a browser capture).
+        match capture::capture_one(ctx, query.clone()).await {
+            Ok(Captured::Content(content)) => {
+                return JobResult::ok(id, serde_json::to_value(content));
+            }
+            Ok(Captured::Full(stat)) => return JobResult::ok(id, serde_json::to_value(stat)),
+            Err((code, msg)) => {
+                let status = code.as_u16();
+                if is_retryable(status) && attempt < cfg.job_max_retries {
+                    attempt += 1;
+                    metrics::counter!(M_WORKER_RETRIES).increment(1);
+                    tracing::warn!(
+                        id = %id,
+                        status,
+                        attempt,
+                        max = cfg.job_max_retries,
+                        "transient capture failure; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(cfg.job_retry_backoff_ms)).await;
+                    continue;
+                }
+                return JobResult::err(id, status, msg);
+            }
+        }
     }
+}
+
+/// Transient capture failures worth retrying — gateway / availability / timeout
+/// class. Client/definitive errors (400 / 401 / 403 / 404) are never retried.
+fn is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 502 | 503 | 504)
 }
 
 async fn ack(conn: &mut Conn, cfg: &WorkerConfig, entry_id: &str) {

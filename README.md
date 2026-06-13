@@ -76,8 +76,9 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   valid — at a fraction of the full-snapshot payload.
 - **SSRF guard** — rejects non-http(s) schemes and private / loopback /
   link-local / ULA / multicast IPs (incl. cloud metadata `169.254.169.254`)
-  before even acquiring a page slot. Disabled via env var for internal
-  scraping.
+  before even acquiring a page slot, **and re-checks every in-browser
+  navigation / redirect hop** so a public URL can't 3xx-bounce into an
+  internal host. Disabled via env var for internal scraping.
 - **Total deadline** — hard upper bound `timeout_ms + buffer` around the
   whole capture (buffer defaults to 10s, tunable via
   `BROWSER_HEADLESS_DEADLINE_BUFFER_MS`); over the line returns 504.
@@ -172,6 +173,7 @@ network layer if the operational data is sensitive. Exposes:
 | `browser_headless_worker_job_duration_seconds` | histogram | — | per-job worker processing time (capture + result write) |
 | `browser_headless_worker_jobs_in_flight` | gauge | — | worker captures currently running |
 | `browser_headless_worker_reclaimed_total` | counter | — | stale pending entries reclaimed from dead workers (`XAUTOCLAIM`) |
+| `browser_headless_worker_retries_total` | counter | — | transient capture failures (408/502/503/504) retried before a terminal result |
 | `browser_headless_worker_stream_length` | gauge | — | jobs stream length (`XLEN`) at last sample |
 | `browser_headless_worker_pending` | gauge | — | pending (delivered, unacked) entries for the consumer group at last sample |
 
@@ -908,7 +910,15 @@ redis-cli GET browser_headless:result:job1
 after its result is written, and entries abandoned by a crashed worker are
 reclaimed (`XAUTOCLAIM`) after the visibility timeout — so a capture may run
 twice (fine for read-only captures; add an idempotency key for side-effecting
-`script`s). Concurrency per worker = its pool capacity (`POOL_SIZE × MAX_PAGES`).
+`script`s). Transient failures (408 / 502 / 503 / 504) are retried in-process up
+to `JOB_MAX_RETRIES` before a terminal error is written. Concurrency per worker =
+its pool capacity (`POOL_SIZE × MAX_PAGES`); jobs run in a continuous pipeline,
+so a slow capture never holds back the others.
+
+**Block-waiting for a result:** instead of polling `GET result:{id}`, a client
+can `SUBSCRIBE` to the channel of the same name — the worker `PUBLISH`es the
+result JSON there on completion (`RESULT_NOTIFY`, on by default). The key is
+still written, so polling and late subscribers keep working.
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -922,12 +932,16 @@ twice (fine for read-only captures; add an idempotency key for side-effecting
 | `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | This worker's consumer name (unique per process). |
 | `BROWSER_HEADLESS_RESULT_PREFIX` | `browser_headless:result:` | Result key prefix; the key is `<prefix><id>`. |
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | TTL (seconds) on result keys. |
+| `BROWSER_HEADLESS_RESULT_NOTIFY` | `true` | After writing `result:{id}`, `PUBLISH` the result JSON to a channel of the same name so clients can `SUBSCRIBE` and block instead of polling. The key is still written; set `false` to skip publishing. |
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | `XDEL` each entry from the stream after it's processed + acked, so the stream doesn't grow forever (the result still lives in `result:{id}`). Set `false` to retain entries — e.g. for replay or a second consumer group on the same stream, since `XDEL` removes the entry for **all** groups (then cap the stream with MAXLEN yourself). |
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` block time before a reclaim pass. |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | Idle time before a pending entry is reclaimable by another worker. |
+| `BROWSER_HEADLESS_JOB_MAX_RETRIES` | 2 | Times to retry a *transient* capture failure (408 / 502 / 503 / 504) before writing a terminal error. Definitive failures (400 / 401 / 403 / 404) are never retried. `0` disables retries. |
+| `BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS` | 500 | Fixed backoff between transient-failure retries. |
 | `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | TCP + TLS + auth handshake timeout when opening a Redis connection. Raised from redis-rs's 1s default, which is too tight for a high-latency / cross-region Redis (e.g. Upstash) and surfaces as `timed out` on connect. |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | Port for the worker's `/healthz` + `/readyz` + `/metrics` listener (a worker binds no API port otherwise). The `healthcheck` subcommand probes it. |
 | `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 15 | How often the worker refreshes the queue-depth gauges (`worker_stream_length` / `worker_pending`) via `XLEN` + `XPENDING`. |
+| `BROWSER_HEADLESS_WORKER_DRAIN_MS` | 30000 | On SIGTERM / SIGINT, how long the worker waits for in-flight jobs to finish before exiting. Jobs still running at the deadline stay pending and are reclaimed by another worker. |
 
 The pool / recycle / SSRF / timeout env vars from [Configuration](#configuration)
 apply to workers too. A worker binds no API port but **does** serve `/healthz`,
@@ -965,13 +979,18 @@ pending). Also watch Redis consumer-group lag (`worker_pending` / `XPENDING`).
   orphaned chromium processes from pool recycle / crash respawn are reaped
   instead of piling up as zombies. `docker run --init` is therefore not
   needed (harmless if added).
-- **Graceful shutdown**: `docker stop` (SIGTERM) waits for in-flight
-  requests up to the docker stop timeout. Use `--stop-timeout=60` if
-  long-running captures may exceed the default 10s.
-- **DNS rebinding caveat**: SSRF guard resolves the host once at request
-  entry. Chromium re-resolves at navigation time; a malicious DNS server
-  could return a private IP between the two. For high-stakes deployments
-  combine with egress firewall / dedicated egress proxy.
+- **Graceful shutdown**: `docker stop` (SIGTERM) drains in-flight work before
+  exiting — the HTTP server finishes open requests, and the worker stops
+  pulling jobs and finishes its in-flight captures (up to
+  `BROWSER_HEADLESS_WORKER_DRAIN_MS`). Use `--stop-timeout=60` if long-running
+  captures may exceed docker's default 10s.
+- **SSRF redirect coverage / DNS-rebinding caveat**: the guard checks the
+  initial URL at request entry **and** re-checks every in-browser navigation +
+  redirect hop, so a public URL that 3xx-redirects to an internal host is
+  blocked before the request leaves the browser. The residual gap is DNS
+  rebinding — a malicious resolver returning a public IP for the guard's
+  lookup but a private IP for Chromium's. For high-stakes deployments combine
+  with an egress firewall / dedicated egress proxy.
 - **HAR limitations**: we don't capture `Network.requestWillBeSent`
   payloads, so HAR entries have placeholder request method (`GET`),
   empty headers/cookies, and `-1` for timing phases that weren't observed.

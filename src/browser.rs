@@ -52,6 +52,7 @@ use htmd::HtmlToMarkdown;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::ssrf;
 
 pub use chromiumoxide::Page;
 
@@ -311,23 +312,34 @@ fn parse_resource_type(s: &str) -> Option<ResourceType> {
     }
 }
 
-/// Enable `Fetch` interception scoped to the given resource types and
-/// spawn a drain task that fails matching requests, continues the rest.
-/// Returns a `oneshot::Sender` — drop it (or send) to signal the task to
-/// exit cleanly when the page is done.
-pub async fn apply_block_resource_types(
+/// Enable `Fetch` interception and spawn a single drain task that fails
+/// requests two ways: explicit resource-type blocks (`block_resource_types`),
+/// and — when `ssrf_guard` is on — navigation / redirect (`Document`) requests
+/// whose host resolves to a private / loopback address. Everything else is
+/// continued. Returns a `oneshot::Sender` — drop it (or send) to stop the task
+/// when the page is done. `None` when neither feature is active (no Fetch
+/// overhead in the common case).
+///
+/// Both concerns share ONE `Fetch.enable` + one event stream on purpose: a
+/// second independent interception task would race to continue/fail the same
+/// `request_id` and trip CDP "invalid interception id" errors.
+pub async fn apply_request_interception(
     page: &Page,
     types: &[String],
+    ssrf_guard: bool,
 ) -> Result<Option<tokio::sync::oneshot::Sender<()>>, Error> {
     let blocked: Vec<ResourceType> = types
         .iter()
         .filter_map(|s| parse_resource_type(s))
         .collect();
-    if blocked.is_empty() {
+    if blocked.is_empty() && !ssrf_guard {
         return Ok(None);
     }
 
-    let patterns: Vec<RequestPattern> = blocked
+    // Patterns decide which requests get paused. Pause the explicitly-blocked
+    // resource types, plus `Document` when the SSRF guard is on so each
+    // navigation + redirect hop is checked before it leaves the browser.
+    let mut patterns: Vec<RequestPattern> = blocked
         .iter()
         .map(|rt| RequestPattern {
             url_pattern: Some("*".to_string()),
@@ -335,6 +347,13 @@ pub async fn apply_block_resource_types(
             request_stage: None,
         })
         .collect();
+    if ssrf_guard && !blocked.contains(&ResourceType::Document) {
+        patterns.push(RequestPattern {
+            url_pattern: Some("*".to_string()),
+            resource_type: Some(ResourceType::Document),
+            request_stage: None,
+        });
+    }
 
     page.execute(FetchEnableParams {
         patterns: Some(patterns),
@@ -354,8 +373,8 @@ pub async fn apply_block_resource_types(
                 ev = stream.next() => match ev {
                     Some(event) => {
                         let request_id = event.request_id.clone();
-                        let drop_it = blocked_set.iter().any(|t| t == &event.resource_type);
-                        let result = if drop_it {
+                        let result = if blocked_set.iter().any(|t| t == &event.resource_type) {
+                            // Explicit resource-type block.
                             page_clone
                                 .execute(FailRequestParams::new(
                                     request_id,
@@ -363,6 +382,30 @@ pub async fn apply_block_resource_types(
                                 ))
                                 .await
                                 .map(|_| ())
+                        } else if ssrf_guard && event.resource_type == ResourceType::Document {
+                            // SSRF guard: only navigation/redirect documents are
+                            // resolved (bounds DNS lookups). A blocked host fails
+                            // the request before any bytes leave the browser.
+                            match ssrf::raw_url_blocked(&event.request.url).await {
+                                Some(reason) => {
+                                    tracing::warn!(
+                                        url = %event.request.url,
+                                        %reason,
+                                        "SSRF guard blocked navigation/redirect"
+                                    );
+                                    page_clone
+                                        .execute(FailRequestParams::new(
+                                            request_id,
+                                            ErrorReason::BlockedByClient,
+                                        ))
+                                        .await
+                                        .map(|_| ())
+                                }
+                                None => page_clone
+                                    .execute(ContinueRequestParams::new(request_id))
+                                    .await
+                                    .map(|_| ()),
+                            }
                         } else {
                             page_clone
                                 .execute(ContinueRequestParams::new(request_id))
@@ -7873,6 +7916,12 @@ pub struct SummaryRequest {
     /// request, decides block vs continue based on `resource_type`, and
     /// is torn down when this request completes.
     pub block_resource_types: Vec<String>,
+    /// Re-apply the SSRF blocklist to every in-page navigation / redirect hop
+    /// (the pre-flight check only sees the initial URL). When `true`, the Fetch
+    /// interception task resolves each Document request's host and fails it if
+    /// it lands on a private / loopback / link-local address. Set from
+    /// `!allow_private_ips`.
+    pub ssrf_guard: bool,
     pub disable_cache: bool,
     pub wait_for_element: Option<String>,
     /// JS expression polled with exponential backoff; resolves when it
@@ -8085,7 +8134,7 @@ pub async fn capture(
             }
         },
         apply_blocked_urls(&page, &req.block_urls),
-        apply_block_resource_types(&page, &req.block_resource_types),
+        apply_request_interception(&page, &req.block_resource_types, req.ssrf_guard),
         apply_disable_javascript(&page, req.disable_javascript),
         apply_cpu_throttle(&page, req.cpu_throttle),
         // web_vitals + dom_mutations setup scripts merged into ONE

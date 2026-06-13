@@ -56,7 +56,8 @@ capture engine is reusable outside HTTP:
 - **`capture.rs`** — the **HTTP-agnostic capture core**. `CaptureCtx { pool,
   allow_private_ips }` is the only context it needs; `capture_one(&CaptureCtx,
   SummaryQuery) -> Captured` is the unit of work; `run_batch` fans out under
-  the pool. Also owns `SummaryQuery` (the params DTO), SSRF/URL validation, and
+  the pool. Also owns `SummaryQuery` (the params DTO), the initial-URL SSRF /
+  scheme pre-check (delegated to `ssrf`, fast-reject before pool checkout), and
   per-capture metrics. `capture_one` bounds the pool-slot wait by
   `checkout_wait_ms()` (admission control — 503 on saturation rather than an
   unbounded queue). **Depends only on `browser` + `pool` + `config` — never
@@ -75,6 +76,10 @@ capture engine is reusable outside HTTP:
   manager task that respawns it on crash and recycles it (drain → replace
   subprocess) on request-count/age thresholds, serialized so at most one
   instance is unavailable at a time (zero-downtime recycle at `pool_size ≥ 2`).
+- **`ssrf.rs`** — shared SSRF host-blocklist: IP classification (`is_blocked_*`)
+  + a DNS-resolving URL check. Used by `capture` (initial-URL pre-check) **and**
+  `browser` (re-checks every navigation/redirect hop). Leaf module — no axum, so
+  `browser` can depend on it.
 - **`worker.rs`** — queue-consumer mode (`BROWSER_HEADLESS_MODE=worker`).
   Works against single-node **or** Redis Cluster (`BROWSER_HEADLESS_REDIS_CLUSTER`)
   via a `Conn` enum that delegates `ConnectionLike` — all commands are single-key,
@@ -85,7 +90,13 @@ capture engine is reusable outside HTTP:
   permit-bounded **continuous pipeline** keeps `pool capacity` captures in
   flight (a slow job frees its own slot — no batch-at-a-time stalls); a
   background sampler exports `worker_*` metrics (jobs / duration / in-flight /
-  reclaimed / XLEN / XPENDING). Never imports `http` — the health/metrics
+  reclaimed / retries / XLEN / XPENDING). Transient capture failures
+  (408/502/503/504) are retried up to `JOB_MAX_RETRIES`; on success it
+  `PUBLISH`es the result to a `result:{id}`-named channel (`RESULT_NOTIFY`) so
+  clients can block-wait instead of poll. On SIGTERM it stops pulling and drains
+  in-flight jobs (`WORKER_DRAIN_MS`) before returning — `main.rs` hands a shared
+  `watch` shutdown signal to both serve + worker, and `all` mode awaits the
+  worker after the HTTP server drains. Never imports `http` — the health/metrics
   listener is wired up in `main.rs`; horizontal scaling = more worker processes.
 - **`browser.rs`** — the CDP engine (~9k lines; the bulk of the codebase).
   `launch()` starts a Chromium and returns `(Browser, default_ua,
@@ -101,6 +112,14 @@ rendered as JSON / markdown / compact content object.
 
 ## Non-obvious gotchas (read these before touching the relevant code)
 
+- **One Fetch interception handler, two jobs.** `apply_request_interception`
+  (browser.rs) enables `Fetch` once and a single drain task does BOTH
+  resource-type blocking and the SSRF redirect guard. Don't add a second
+  `Fetch.enable` + `EventRequestPaused` listener — two handlers race to
+  continue/fail the same `request_id` and trip CDP "invalid interception id".
+  SSRF only checks `Document` requests (navigations + redirect hops) to bound
+  DNS lookups; CDP re-pauses each redirect hop at the Request stage, so a
+  blocked redirect fails before the request leaves the browser.
 - **chromiumoxide flags omit leading dashes.** Pass `.arg("disable-dev-shm-usage")`,
   not `.arg("--disable-dev-shm-usage")` — chromiumoxide prepends `--` itself, so
   a literal `--flag` becomes `----flag` and is silently ignored. `--no-sandbox`

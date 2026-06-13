@@ -62,8 +62,9 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   `char_count` 配对判断，或把 `data`（markdown）喂给 LLM 判断页面是否
   有效 —— 代价只是完整快照的一小部分。
 - **SSRF 防护** —— 拒绝非 http(s) 协议以及私有 / 回环 / 链路本地 / ULA /
-  组播 IP（含云元数据 `169.254.169.254`），在占用 page 名额之前就快速失败。
-  内网部署可通过环境变量关闭。
+  组播 IP（含云元数据 `169.254.169.254`），在占用 page 名额之前就快速失败，
+  **并对浏览器内每一次导航 / 重定向跳转重新校验**，使公网 URL 无法通过 3xx
+  跳转到内网主机。内网部署可通过环境变量关闭。
 - **总体超时兜底** —— 整个 capture 流程硬上限 `timeout_ms + buffer`
   （buffer 默认 10s，可经 `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` 调整），
   超出返 504。
@@ -149,6 +150,7 @@ Prometheus 文本格式指标。与健康探针一样开放、无需 `X-Api-Key`
 | `browser_headless_worker_job_duration_seconds` | histogram | — | 单任务 worker 处理耗时（capture + 写结果） |
 | `browser_headless_worker_jobs_in_flight` | gauge | — | 当前正在运行的 worker capture 数 |
 | `browser_headless_worker_reclaimed_total` | counter | — | 从挂掉的 worker 回收的滞留待处理条目数（`XAUTOCLAIM`） |
+| `browser_headless_worker_retries_total` | counter | — | 写终态结果前重试的瞬时失败（408/502/503/504）次数 |
 | `browser_headless_worker_stream_length` | gauge | — | 上次采样时任务 stream 的长度（`XLEN`） |
 | `browser_headless_worker_pending` | gauge | — | 上次采样时该 consumer group 的 pending（已投递未 ack）条目数 |
 
@@ -856,8 +858,13 @@ redis-cli GET browser_headless:result:job1
 `data` 与单接口返回同款（`content_only` 为紧凑内容对象，否则完整 `WebPageStat`）；
 失败时结果带 `status` + `error`。投递为 **at-least-once**：结果写完才 ack，崩溃
 worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所以同一 URL 可能抓两次
-（只读抓取无害；带副作用的 `script` 请加幂等键）。单 worker 并发 = 其池容量
-（`POOL_SIZE × MAX_PAGES`）。
+（只读抓取无害；带副作用的 `script` 请加幂等键）。瞬时失败（408 / 502 / 503 /
+504）会在进程内重试至多 `JOB_MAX_RETRIES` 次后才写终态错误。单 worker 并发 = 其池
+容量（`POOL_SIZE × MAX_PAGES`）；任务以连续流水线方式运行，慢任务不会拖住其它任务。
+
+**阻塞等待结果：** 客户端无需轮询 `GET result:{id}`，可 `SUBSCRIBE` 同名频道——
+worker 完成时把结果 JSON `PUBLISH` 到该频道（`RESULT_NOTIFY`，默认开启）。结果键
+仍会写入，所以轮询和迟到的订阅者照常工作。
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
@@ -871,12 +878,16 @@ worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所�
 | `BROWSER_HEADLESS_CONSUMER_NAME` | `worker-<pid>` | 本 worker 的 consumer 名（每进程唯一）。 |
 | `BROWSER_HEADLESS_RESULT_PREFIX` | `browser_headless:result:` | 结果键前缀；键为 `<前缀><id>`。 |
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | 结果键 TTL（秒）。 |
+| `BROWSER_HEADLESS_RESULT_NOTIFY` | `true` | 写完 `result:{id}` 后把结果 JSON `PUBLISH` 到同名频道，客户端可 `SUBSCRIBE` 阻塞等待而非轮询。结果键仍会写入；设 `false` 关闭发布。 |
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | 处理 + ack 后 `XDEL` 把该条从 stream 删除，避免 stream 无限增长（结果仍在 `result:{id}`）。设 `false` 保留条目——例如要回放、或同一 stream 上挂第二个消费组（`XDEL` 是全局的、对**所有**消费组生效，那时改用 MAXLEN 自己控量）。 |
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。 |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
+| `BROWSER_HEADLESS_JOB_MAX_RETRIES` | 2 | 写终态错误前对**瞬时**失败（408 / 502 / 503 / 504）的重试次数。确定性失败（400 / 401 / 403 / 404）不重试。`0` 关闭重试。 |
+| `BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS` | 500 | 瞬时失败重试之间的固定退避。 |
 | `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | 打开 Redis 连接时 TCP + TLS + 认证握手的超时。从 redis-rs 默认的 1s 上调——1s 对高延迟 / 跨区域 Redis（如 Upstash）太短，会表现为连接 `timed out`。 |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | worker 的 `/healthz` + `/readyz` + `/metrics` 监听端口（worker 本身不绑 API 端口）。`healthcheck` 子命令探测此端口。 |
 | `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 15 | worker 多久刷新一次队列深度 gauge（`worker_stream_length` / `worker_pending`），通过 `XLEN` + `XPENDING`。 |
+| `BROWSER_HEADLESS_WORKER_DRAIN_MS` | 30000 | 收到 SIGTERM / SIGINT 后，worker 等待 in-flight 任务完成多久再退出。到点仍在跑的任务保持 pending，由其它 worker 重认领。 |
 
 上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。
 worker 不绑 API 端口，但**会**在 `BROWSER_HEADLESS_HEALTH_PORT`（默认 3000）上
@@ -911,12 +922,15 @@ worker 不绑 API 端口，但**会**在 `BROWSER_HEADLESS_HEALTH_PORT`（默认
 - **僵尸进程回收**：镜像以 `tini` 作 PID 1（ENTRYPOINT），池回收 / 崩溃重启
   产生的孤儿 chromium 进程会被 reap，不会堆积成僵尸。因此**无需** `docker
   run --init`（加了也无害）。
-- **优雅退出**：`docker stop` 发 SIGTERM，会等 in-flight 请求完成
-  （docker stop timeout 内）。如长抓取可能超过默认 10s，加
+- **优雅退出**：`docker stop` 发 SIGTERM，会先排空 in-flight 工作再退出——HTTP
+  服务跑完已开请求，worker 停止拉取新任务并跑完在飞的抓取（最多
+  `BROWSER_HEADLESS_WORKER_DRAIN_MS`）。如长抓取可能超过 docker 默认 10s，加
   `--stop-timeout=60`。
-- **DNS rebinding 残留风险**：SSRF 守卫在请求入口做一次 DNS 解析。
-  chromium 在导航时会自己再解析一次 —— 攻击者可在两次解析之间换成
-  内网 IP 绕过。高安全场景需配合出口防火墙 / 专用代理。
+- **SSRF 重定向覆盖 / DNS rebinding 残留风险**：守卫在请求入口校验初始 URL，
+  **并**对浏览器内每一次导航 + 重定向跳转重新校验——公网 URL 通过 3xx 跳到内网
+  主机会在请求离开浏览器前被拦截。残留缺口是 DNS rebinding：恶意解析器对守卫的
+  查询返回公网 IP、对 chromium 的查询返回内网 IP。高安全场景需配合出口防火墙 /
+  专用代理。
 - **HAR 限制**：未捕获 `Network.requestWillBeSent` 的 payload，所以
   HAR 条目的请求 method 默认为 `GET`，headers/cookies 为空数组，
   未观测到的 timing 字段为 `-1`。够用于资源列表 / 状态码可视化，
