@@ -48,3 +48,36 @@ pub(crate) fn max_batch_urls() -> usize {
             .unwrap_or(100)
     })
 }
+
+/// Admission control: how long a capture waits for a free browser-pool slot
+/// before being shed with `503` (`BROWSER_HEADLESS_CHECKOUT_WAIT_MS`, default
+/// 30_000). When concurrent demand exceeds pool capacity
+/// (`POOL_SIZE × MAX_PAGES`) requests queue for a permit; this bounds that
+/// queue wait so a saturated service fails fast instead of parking callers (and
+/// their futures) indefinitely. `0` disables the bound — wait forever, the
+/// original behaviour. Read once + cached.
+pub(crate) fn checkout_wait_ms() -> u64 {
+    static WAIT: OnceLock<u64> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("BROWSER_HEADLESS_CHECKOUT_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30_000)
+    })
+}
+
+/// TCP port for the worker mode's health/metrics HTTP listener
+/// (`BROWSER_HEADLESS_HEALTH_PORT`, default 3000). Only worker mode binds it —
+/// serve / all already serve `/healthz`, `/readyz`, `/metrics` on the main API
+/// port (3000). The `healthcheck` subcommand probes this port in worker mode.
+/// Read once + cached.
+pub(crate) fn health_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        std::env::var("BROWSER_HEADLESS_HEALTH_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(3000)
+    })
+}

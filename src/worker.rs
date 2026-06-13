@@ -17,22 +17,31 @@
 //! (`id` optional — falls back to the Redis stream entry id).
 //! Result at `result:{id}`: `{ "id", "status", "data"? , "error"? }`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::stream::StreamExt;
 use redis::aio::{ConnectionLike, MultiplexedConnection};
 use redis::cluster::{ClusterClient, ClusterClientBuilder};
 use redis::cluster_async::ClusterConnection;
 use redis::streams::{
-    StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamReadOptions, StreamReadReply,
+    StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamPendingReply, StreamReadOptions,
+    StreamReadReply,
 };
 use redis::{
     AsyncCommands, AsyncConnectionConfig, ClientTlsConfig, Cmd, ErrorKind, Pipeline, RedisFuture,
     RedisResult, TlsCertificates, Value,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
+
+const M_WORKER_JOBS: &str = "browser_headless_worker_jobs_total";
+const M_WORKER_JOB_DURATION: &str = "browser_headless_worker_job_duration_seconds";
+const M_WORKER_RECLAIMED: &str = "browser_headless_worker_reclaimed_total";
+const M_WORKER_INFLIGHT: &str = "browser_headless_worker_jobs_in_flight";
+const M_WORKER_STREAM_LEN: &str = "browser_headless_worker_stream_length";
+const M_WORKER_PENDING: &str = "browser_headless_worker_pending";
 
 /// Worker settings, resolved once from the environment.
 #[derive(Clone)]
@@ -77,6 +86,10 @@ struct WorkerConfig {
     /// own default is only 1s, too tight for a high-latency / cross-region
     /// link (e.g. Upstash), which surfaces as `timed out` on connect.
     connect_timeout_ms: u64,
+    /// How often the background sampler refreshes the queue-depth gauges
+    /// (stream length / pending / in-flight) via `XLEN` + `XPENDING`
+    /// (`BROWSER_HEADLESS_METRICS_SAMPLE_SECS`, default 15).
+    metrics_sample_secs: u64,
 }
 
 impl WorkerConfig {
@@ -100,6 +113,7 @@ impl WorkerConfig {
             block_ms: env_u64("BROWSER_HEADLESS_JOB_BLOCK_MS", 5000).max(1) as usize,
             visibility_ms: env_u64("BROWSER_HEADLESS_JOB_VISIBILITY_MS", 120_000).max(1),
             connect_timeout_ms: env_u64("BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS", 5000).max(1),
+            metrics_sample_secs: env_u64("BROWSER_HEADLESS_METRICS_SAMPLE_SECS", 15).max(1),
         }
     }
 }
@@ -369,8 +383,9 @@ impl JobResult {
 /// Run the worker loop forever (until the process is signalled). Shares the
 /// browser pool via `ctx`; reads its own Redis config from the environment.
 pub(crate) async fn run(ctx: CaptureCtx) {
-    let cfg = WorkerConfig::from_env();
+    let cfg = Arc::new(WorkerConfig::from_env());
     let capacity = ctx.pool.capacity().max(1);
+    describe_worker_metrics();
     tracing::info!(
         redis_url = %redact_redis_url(&cfg.redis_url),
         cluster = cfg.cluster,
@@ -382,45 +397,92 @@ pub(crate) async fn run(ctx: CaptureCtx) {
         "worker mode starting"
     );
 
-    let backend = Backend::from_cfg(&cfg).expect("invalid redis config");
+    let backend = Arc::new(Backend::from_cfg(&cfg).expect("invalid redis config"));
 
     ensure_group(&backend, &cfg).await;
 
     // Separate connections: `read_conn` owns the blocking XREADGROUP; the
-    // cloned `write_conn` handles concurrent result writes + acks without being
-    // stalled behind the blocking read.
+    // cloned `write_conn` (cloned again per job) handles concurrent result
+    // writes + acks without being stalled behind the blocking read.
     let mut read_conn = connect(&backend, &cfg).await;
     let write_conn = connect(&backend, &cfg).await;
 
+    // Bounds how many captures run at once — and therefore how many jobs we
+    // pull from Redis — to the pool capacity. A permit is held for a job's
+    // whole lifetime and released when its spawned task finishes, so a slow
+    // job frees its slot independently instead of holding back a whole batch
+    // (the old batch-at-a-time loop left fast slots idle until the slowest
+    // job in the batch completed).
+    let inflight = Arc::new(Semaphore::new(capacity));
+
+    // Background queue-depth sampler (XLEN / XPENDING → gauges). In-flight is
+    // tracked per-job by `InFlightGuard`, not sampled here.
+    tokio::spawn(sample_queue_metrics(backend.clone(), cfg.clone()));
+
     let mut backoff = Duration::from_secs(1);
     loop {
-        match poll_new(&mut read_conn, &cfg, capacity).await {
+        // Reserve one slot before reading. This blocks while all `capacity`
+        // captures are busy — backpressure: we never pull jobs we can't run
+        // now. `want` is everything currently free, so a burst of freed slots
+        // is refilled in one batched read.
+        let first = inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("inflight semaphore closed");
+        let want = 1 + inflight.available_permits();
+
+        match poll_new(&mut read_conn, &cfg, want).await {
+            Ok(entries) if entries.is_empty() => {
+                // No new jobs — release the reserved slot and try to reclaim
+                // entries abandoned by a crashed worker before blocking again.
+                drop(first);
+                backoff = Duration::from_secs(1);
+                match reclaim(&mut read_conn, &cfg, want).await {
+                    Ok(reclaimed) if !reclaimed.is_empty() => {
+                        metrics::counter!(M_WORKER_RECLAIMED).increment(reclaimed.len() as u64);
+                        tracing::info!(count = reclaimed.len(), "reclaimed stale jobs");
+                        for entry in reclaimed {
+                            let permit = inflight
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .expect("inflight semaphore closed");
+                            spawn_job(ctx.clone(), cfg.clone(), write_conn.clone(), permit, entry);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "XAUTOCLAIM failed"),
+                }
+            }
             Ok(entries) => {
                 backoff = Duration::from_secs(1);
-                if entries.is_empty() {
-                    // No new jobs this cycle — try to reclaim entries abandoned
-                    // by a crashed worker before looping back to the blocking read.
-                    match reclaim(&mut read_conn, &cfg, capacity).await {
-                        Ok(reclaimed) if !reclaimed.is_empty() => {
-                            tracing::info!(count = reclaimed.len(), "reclaimed stale jobs");
-                            process(&ctx, &cfg, &write_conn, reclaimed).await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "XAUTOCLAIM failed"),
-                    }
-                    continue;
+                // Non-empty. Reuse the reserved permit for the first entry;
+                // acquire one per remaining entry (all within `want`, so ready).
+                let mut held = Some(first);
+                for entry in entries {
+                    let permit = match held.take() {
+                        Some(p) => p,
+                        None => inflight
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("inflight semaphore closed"),
+                    };
+                    spawn_job(ctx.clone(), cfg.clone(), write_conn.clone(), permit, entry);
                 }
-                process(&ctx, &cfg, &write_conn, entries).await;
             }
             Err(e) if e.code() == Some("NOGROUP") => {
                 // The stream / consumer group vanished while we were running
                 // (deleted, evicted, or trimmed away). Recreate it and retry —
                 // no need to churn the connection.
+                drop(first);
                 tracing::warn!(error = %e, "consumer group missing; recreating");
                 ensure_group(&backend, &cfg).await;
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
+                drop(first);
                 tracing::error!(error = %e, retry_in = ?backoff, "redis read failed; reconnecting");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -515,60 +577,163 @@ async fn reclaim(
     Ok(reply.claimed)
 }
 
-/// Capture each entry concurrently (bounded by pool capacity), write its
-/// result, then ack. A failed capture still writes a result + acks; a failed
-/// Redis write leaves the entry pending for later reclaim.
-async fn process(ctx: &CaptureCtx, cfg: &WorkerConfig, write_conn: &Conn, entries: Vec<StreamId>) {
-    let capacity = ctx.pool.capacity().max(1);
-    futures::stream::iter(entries)
-        .for_each_concurrent(capacity, |entry| {
-            let ctx = ctx.clone();
-            let cfg = cfg.clone();
-            let mut conn = write_conn.clone();
-            async move {
-                let entry_id = entry.id.clone();
-                let Some(payload) = entry.get::<String>("payload") else {
-                    tracing::warn!(entry = %entry_id, "job missing `payload` field; dropping");
-                    ack(&mut conn, &cfg, &entry_id).await;
-                    return;
-                };
-                let job: WorkerJob = match serde_json::from_str(&payload) {
-                    Ok(job) => job,
-                    Err(e) => {
-                        tracing::warn!(entry = %entry_id, error = %e, "malformed job; dropping");
-                        ack(&mut conn, &cfg, &entry_id).await;
-                        return;
-                    }
-                };
-                let id = job.id.unwrap_or_else(|| entry_id.clone());
-                let url = job.query.url.clone();
-                let started = Instant::now();
-                tracing::info!(entry = %entry_id, id = %id, url = %url, "job started");
-                let result = capture_to_result(&ctx, id, job.query).await;
-                let duration_ms = started.elapsed().as_millis() as u64;
+/// RAII guard for the worker in-flight gauge — increments on construction,
+/// decrements on drop. Counts captures actually running, NOT the read loop's
+/// reserved permit (which is held during the idle blocking read), and survives
+/// a task panic since drop runs during unwind.
+struct InFlightGuard;
+impl InFlightGuard {
+    fn new() -> Self {
+        metrics::gauge!(M_WORKER_INFLIGHT).increment(1.0);
+        InFlightGuard
+    }
+}
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(M_WORKER_INFLIGHT).decrement(1.0);
+    }
+}
 
-                let json = match serde_json::to_string(&result) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        tracing::error!(entry = %entry_id, error = %e, "result serialize failed");
-                        ack(&mut conn, &cfg, &entry_id).await;
-                        return;
-                    }
-                };
-                let key = format!("{}{}", cfg.result_prefix, result.id);
-                let write: redis::RedisResult<()> =
-                    conn.set_ex(&key, &json, cfg.result_ttl_secs).await;
-                if let Err(e) = write {
-                    // Don't ack — the entry stays pending and gets reclaimed,
-                    // so the result isn't silently lost.
-                    tracing::warn!(entry = %entry_id, error = %e, "result write failed; leaving entry pending");
-                    return;
-                }
-                tracing::info!(entry = %entry_id, id = %result.id, status = result.status, duration_ms, "job done");
-                ack(&mut conn, &cfg, &entry_id).await;
+/// Spawn a detached task that processes one entry and releases its pool slot
+/// (`permit`) when it finishes. Detaching lets a slow capture run independently
+/// of the read loop, so the worker keeps pulling and dispatching other jobs
+/// while it runs.
+fn spawn_job(
+    ctx: CaptureCtx,
+    cfg: Arc<WorkerConfig>,
+    conn: Conn,
+    permit: OwnedSemaphorePermit,
+    entry: StreamId,
+) {
+    tokio::spawn(async move {
+        // Held for the whole job; dropping it on task completion frees the slot.
+        let _permit = permit;
+        let _in_flight = InFlightGuard::new();
+        process_one(&ctx, &cfg, conn, entry).await;
+    });
+}
+
+/// Process one entry: parse → capture → write `result:{id}` → ack. A failed
+/// capture still writes a result + acks (a definitive outcome). A failed Redis
+/// write leaves the entry pending so a later reclaim retries it.
+async fn process_one(ctx: &CaptureCtx, cfg: &WorkerConfig, mut conn: Conn, entry: StreamId) {
+    let entry_id = entry.id.clone();
+    let Some(payload) = entry.get::<String>("payload") else {
+        tracing::warn!(entry = %entry_id, "job missing `payload` field; dropping");
+        ack(&mut conn, cfg, &entry_id).await;
+        return;
+    };
+    let job: WorkerJob = match serde_json::from_str(&payload) {
+        Ok(job) => job,
+        Err(e) => {
+            tracing::warn!(entry = %entry_id, error = %e, "malformed job; dropping");
+            ack(&mut conn, cfg, &entry_id).await;
+            return;
+        }
+    };
+    let id = job.id.unwrap_or_else(|| entry_id.clone());
+    let url = job.query.url.clone();
+    let started = Instant::now();
+    tracing::info!(entry = %entry_id, id = %id, url = %url, "job started");
+    let result = capture_to_result(ctx, id, job.query).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    // Worker-queue metrics. `capture_one` already records the generic capture
+    // counter/histogram; these are queue-specific: per-job outcome + the
+    // end-to-end worker time (capture + bookkeeping).
+    let outcome = if result.status < 400 { "ok" } else { "error" };
+    metrics::counter!(M_WORKER_JOBS, "outcome" => outcome).increment(1);
+    metrics::histogram!(M_WORKER_JOB_DURATION).record(started.elapsed().as_secs_f64());
+
+    let json = match serde_json::to_string(&result) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(entry = %entry_id, error = %e, "result serialize failed");
+            ack(&mut conn, cfg, &entry_id).await;
+            return;
+        }
+    };
+    let key = format!("{}{}", cfg.result_prefix, result.id);
+    let write: redis::RedisResult<()> = conn.set_ex(&key, &json, cfg.result_ttl_secs).await;
+    if let Err(e) = write {
+        // Don't ack — the entry stays pending and gets reclaimed, so the result
+        // isn't silently lost.
+        tracing::warn!(entry = %entry_id, error = %e, "result write failed; leaving entry pending");
+        return;
+    }
+    tracing::info!(entry = %entry_id, id = %result.id, status = result.status, duration_ms, "job done");
+    ack(&mut conn, cfg, &entry_id).await;
+}
+
+/// Register HELP/TYPE descriptions for the worker-specific metrics. Safe to
+/// call once at startup (the recorder is installed by `run_worker` / `run_all`
+/// before the worker starts).
+fn describe_worker_metrics() {
+    use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
+    describe_counter!(
+        M_WORKER_JOBS,
+        "Worker jobs processed, labelled by outcome (ok / error)"
+    );
+    describe_histogram!(
+        M_WORKER_JOB_DURATION,
+        Unit::Seconds,
+        "Per-job worker processing time (capture + result write)"
+    );
+    describe_counter!(
+        M_WORKER_RECLAIMED,
+        "Stale pending entries reclaimed from presumed-dead workers via XAUTOCLAIM"
+    );
+    describe_gauge!(M_WORKER_INFLIGHT, "Worker captures currently in flight");
+    describe_gauge!(
+        M_WORKER_STREAM_LEN,
+        "Jobs stream length (XLEN) at last sample"
+    );
+    describe_gauge!(
+        M_WORKER_PENDING,
+        "Pending (delivered, unacked) entries for the consumer group at last sample"
+    );
+}
+
+/// Periodically refresh the queue-depth gauges from Redis: stream length
+/// (`XLEN`) and group pending count (`XPENDING` summary). In-flight is tracked
+/// separately by [`InFlightGuard`] around each job. Owns its own connection so
+/// it never contends with the blocking read loop; reconnects on error.
+async fn sample_queue_metrics(backend: Arc<Backend>, cfg: Arc<WorkerConfig>) {
+    let interval = Duration::from_secs(cfg.metrics_sample_secs);
+    let mut conn = connect(&backend, &cfg).await;
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let len: redis::RedisResult<i64> = conn.xlen(cfg.stream.as_str()).await;
+        match len {
+            Ok(len) => metrics::gauge!(M_WORKER_STREAM_LEN).set(len as f64),
+            Err(e) => {
+                tracing::debug!(error = %e, "XLEN sample failed; reconnecting");
+                conn = connect(&backend, &cfg).await;
+                continue;
             }
-        })
-        .await;
+        }
+
+        match xpending_count(&mut conn, &cfg).await {
+            Ok(pending) => metrics::gauge!(M_WORKER_PENDING).set(pending as f64),
+            Err(e) => {
+                tracing::debug!(error = %e, "XPENDING sample failed; reconnecting");
+                conn = connect(&backend, &cfg).await;
+            }
+        }
+    }
+}
+
+/// Pending-entry count for the consumer group (`XPENDING` summary form).
+async fn xpending_count(conn: &mut Conn, cfg: &WorkerConfig) -> redis::RedisResult<u64> {
+    let reply: StreamPendingReply = conn
+        .xpending(cfg.stream.as_str(), cfg.group.as_str())
+        .await?;
+    Ok(match reply {
+        StreamPendingReply::Data(data) => data.count as u64,
+        // `Empty` and any future non-exhaustive variant → no pending entries.
+        _ => 0,
+    })
 }
 
 /// Run one capture and shape it into a `JobResult`.

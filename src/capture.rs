@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
 use crate::browser;
-use crate::config::{deadline_buffer_ms, default_timeout_ms};
+use crate::config::{checkout_wait_ms, deadline_buffer_ms, default_timeout_ms};
 use crate::pool::BrowserPool;
 
 /// Shared, transport-agnostic capture context: the browser pool plus the SSRF
@@ -465,12 +465,36 @@ async fn capture_one_unmetered(
     // instance is active (all crashed / recycling). Held until function end —
     // covers the full capture lifecycle so concurrency stays bounded and the
     // instance's in-flight / served counters stay accurate.
-    let checkout = ctx.pool.checkout().await.map_err(|()| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "browser pool unavailable; retry shortly".to_string(),
-        )
-    })?;
+    //
+    // Admission control: bound the queue wait by `checkout_wait_ms()`. Without
+    // it, demand above pool capacity parks callers (and their futures) here
+    // indefinitely — under load that is an unbounded backlog, not backpressure.
+    // On timeout we shed the request with 503 so a saturated service fails
+    // fast. `0` disables the bound (wait forever — original behaviour).
+    let wait_ms = checkout_wait_ms();
+    let checkout = {
+        let acquire = ctx.pool.checkout();
+        let acquired = if wait_ms == 0 {
+            Ok(acquire.await)
+        } else {
+            tokio::time::timeout(Duration::from_millis(wait_ms), acquire).await
+        };
+        match acquired {
+            Ok(Ok(checkout)) => checkout,
+            Ok(Err(())) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "browser pool unavailable; retry shortly".to_string(),
+                ));
+            }
+            Err(_elapsed) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("browser pool saturated; no slot within {wait_ms}ms, retry shortly"),
+                ));
+            }
+        }
+    };
 
     let cookies = q
         .cookie

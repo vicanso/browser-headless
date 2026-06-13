@@ -72,6 +72,14 @@ USER rust
 # google-chrome / chromium variants (works, but explicit is faster + clearer).
 ENV CHROME=/usr/bin/chromium
 
+# Health probe for every mode: serve / all serve /healthz on 3000; worker serves
+# it on BROWSER_HEADLESS_HEALTH_PORT (default 3000). `browser-headless
+# healthcheck` does an internal HTTP GET and picks the port from
+# BROWSER_HEADLESS_MODE, so the image needs no curl/wget. The generous
+# start-period covers the initial chromium launch.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD ["browser-headless", "healthcheck"]
+
 # tini as PID 1: reaps orphaned chromium processes and forwards signals to the
 # server (graceful shutdown). `docker run --init` is therefore unnecessary.
 ENTRYPOINT ["/usr/bin/tini", "--"]

@@ -44,6 +44,13 @@ fn main() {
 /// sharing a single browser pool. The serve and worker code paths never call
 /// into each other; `all` just starts both against the same `CaptureCtx`.
 async fn run() {
+    // `browser-headless healthcheck` — probe the local health endpoint and exit
+    // 0 (HTTP 200) / 1 (anything else). Used as the container HEALTHCHECK so the
+    // image needs no curl/wget. Handled before mode dispatch; never returns.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        run_healthcheck().await;
+    }
+
     let mode = std::env::var("BROWSER_HEADLESS_MODE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -97,10 +104,20 @@ async fn run_serve() {
     serve_http(ctx, metrics_handle).await;
 }
 
-/// Queue worker mode: consume capture jobs from Redis (no HTTP). Runs until the
+/// Queue worker mode: consume capture jobs from Redis. Binds no API port, but
+/// DOES expose a minimal `/healthz` + `/readyz` + `/metrics` listener on
+/// `BROWSER_HEADLESS_HEALTH_PORT` so the worker is probeable / scrapeable. The
+/// Prometheus recorder is installed here (worker mode otherwise has none, so
+/// the capture + worker metric macros would silently no-op). Runs until the
 /// process is signalled.
 async fn run_worker() {
+    let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
+    tokio::spawn(serve_health(
+        ctx.clone(),
+        metrics_handle,
+        config::health_port(),
+    ));
     worker::run(ctx).await;
 }
 
@@ -164,5 +181,81 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
         _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
+    }
+}
+
+/// Bind the worker's health/metrics listener (`/healthz`, `/readyz`,
+/// `/metrics`) on `0.0.0.0:port`. A bind failure is logged but NON-fatal — the
+/// worker keeps consuming jobs; only the probes/metrics go dark. Spawned as a
+/// background task by `run_worker`.
+async fn serve_health(ctx: CaptureCtx, metrics_handle: PrometheusHandle, port: u16) {
+    let addr = format!("0.0.0.0:{port}");
+    match TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            tracing::info!("worker health/metrics listening on {addr}");
+            if let Err(e) = axum::serve(listener, http::health_router(ctx, metrics_handle)).await {
+                tracing::error!(error = %e, "worker health server error");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %addr, "failed to bind worker health port; probes disabled");
+        }
+    }
+}
+
+/// `healthcheck` subcommand: GET `/healthz` on the local health port and exit
+/// 0 on HTTP 200, else 1. The probed port matches the running mode — `worker`
+/// uses `BROWSER_HEADLESS_HEALTH_PORT`; serve / all use the fixed API port 3000.
+async fn run_healthcheck() -> ! {
+    let mode = std::env::var("BROWSER_HEADLESS_MODE").unwrap_or_default();
+    let port = if mode == "worker" {
+        config::health_port()
+    } else {
+        3000
+    };
+    match probe_health(port).await {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("healthcheck failed (port {port}): {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Minimal, dependency-free HTTP/1.0 `GET /healthz` against `127.0.0.1:port`.
+/// Success = a `200` status line received within the 5s budget. Kept tiny on
+/// purpose: it avoids pulling an HTTP client into the runtime image just for
+/// the container HEALTHCHECK.
+async fn probe_health(port: u16) -> Result<(), String> {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let budget = Duration::from_secs(5);
+    let mut stream = tokio::time::timeout(budget, TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let req =
+        format!("GET /healthz HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::with_capacity(256);
+    tokio::time::timeout(budget, stream.read_to_end(&mut buf))
+        .await
+        .map_err(|_| "read timed out".to_string())?
+        .map_err(|e| format!("read: {e}"))?;
+
+    let head = String::from_utf8_lossy(&buf);
+    let status_line = head.lines().next().unwrap_or_default();
+    if status_line.contains(" 200 ") {
+        Ok(())
+    } else {
+        Err(format!("unexpected status line: {status_line:?}"))
     }
 }

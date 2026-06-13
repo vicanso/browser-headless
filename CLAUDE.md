@@ -45,21 +45,29 @@ capture engine is reusable outside HTTP:
 
 - **`main.rs`** — entrypoint only: builds the tokio runtime, then dispatches on
   `BROWSER_HEADLESS_MODE` — `serve` (default) runs the HTTP API, `worker` runs
-  the Redis queue consumer, `all` runs both in one process (worker as a
-  background task) sharing one `CaptureCtx` / pool.
+  the Redis queue consumer (plus a health-only `/healthz`+`/readyz`+`/metrics`
+  listener on `BROWSER_HEADLESS_HEALTH_PORT`, default 3000), `all` runs both in
+  one process (worker as a background task) sharing one `CaptureCtx` / pool. A
+  `healthcheck` argv subcommand (`browser-headless healthcheck`) does an
+  internal `GET /healthz` and exits 0/1 — it's the container HEALTHCHECK, so
+  the image needs no curl/wget.
 - **`config.rs`** — env-backed knobs, each cached once (`default_timeout_ms`,
-  `deadline_buffer_ms`, `max_batch_urls`).
+  `deadline_buffer_ms`, `max_batch_urls`, `checkout_wait_ms`, `health_port`).
 - **`capture.rs`** — the **HTTP-agnostic capture core**. `CaptureCtx { pool,
   allow_private_ips }` is the only context it needs; `capture_one(&CaptureCtx,
   SummaryQuery) -> Captured` is the unit of work; `run_batch` fans out under
   the pool. Also owns `SummaryQuery` (the params DTO), SSRF/URL validation, and
-  per-capture metrics. **Depends only on `browser` + `pool` + `config` — never
+  per-capture metrics. `capture_one` bounds the pool-slot wait by
+  `checkout_wait_ms()` (admission control — 503 on saturation rather than an
+  unbounded queue). **Depends only on `browser` + `pool` + `config` — never
   axum.** This is the reuse boundary: both `http.rs` and `worker.rs` call
   `capture::capture_one` without depending on each other.
 - **`http.rs`** — the axum layer: `router()`, all handlers (`/summary`
   GET+POST, `/summary/batch`, `/healthz`, `/readyz`, `/metrics`), API-key auth,
   request-shape logging, and Prometheus recorder install. `AppState` embeds a
-  `CaptureCtx`.
+  `CaptureCtx`; `HealthState` (a `FromRef` sub-state, no API key) backs the
+  probe/metrics routes, and `health_router()` exposes just those three for
+  worker mode.
 - **`pool.rs`** — `BrowserPool`: a fixed pool of N chromium instances.
   `checkout()` routes each request to the least-loaded active instance and is
   the concurrency gate (per-instance semaphore of `pages_per_instance`; total
@@ -73,8 +81,12 @@ capture engine is reusable outside HTTP:
   so cluster routing is transparent.
   Reads jobs from a Redis Streams consumer group, runs `capture::capture_one` on
   the shared pool, writes results to `result:{id}` keys (TTL'd), and acks
-  (at-least-once; `XAUTOCLAIM` reclaims jobs from crashed workers). Binds no HTTP
-  port and never imports `http` — horizontal scaling = more worker processes.
+  (at-least-once; `XAUTOCLAIM` reclaims jobs from crashed workers). A
+  permit-bounded **continuous pipeline** keeps `pool capacity` captures in
+  flight (a slow job frees its own slot — no batch-at-a-time stalls); a
+  background sampler exports `worker_*` metrics (jobs / duration / in-flight /
+  reclaimed / XLEN / XPENDING). Never imports `http` — the health/metrics
+  listener is wired up in `main.rs`; horizontal scaling = more worker processes.
 - **`browser.rs`** — the CDP engine (~9k lines; the bulk of the codebase).
   `launch()` starts a Chromium and returns `(Browser, default_ua,
   disconnect_rx, UserDataDir)`; `capture()` runs the full pipeline

@@ -145,10 +145,19 @@ Prometheus 文本格式指标。与健康探针一样开放、无需 `X-Api-Key`
 | `browser_headless_pool_active_instances` | gauge | — | 当前 `Active`（未在排空 / 重启）的实例数 |
 | `browser_headless_browser_respawns_total` | counter | — | 崩溃实例被重启的次数 |
 | `browser_headless_recycles_total` | counter | `reason`（`age`/`count`） | 主动回收实例的次数 |
+| `browser_headless_worker_jobs_total` | counter | `outcome`（`ok`/`error`） | worker 处理的任务数（worker / all 模式） |
+| `browser_headless_worker_job_duration_seconds` | histogram | — | 单任务 worker 处理耗时（capture + 写结果） |
+| `browser_headless_worker_jobs_in_flight` | gauge | — | 当前正在运行的 worker capture 数 |
+| `browser_headless_worker_reclaimed_total` | counter | — | 从挂掉的 worker 回收的滞留待处理条目数（`XAUTOCLAIM`） |
+| `browser_headless_worker_stream_length` | gauge | — | 上次采样时任务 stream 的长度（`XLEN`） |
+| `browser_headless_worker_pending` | gauge | — | 上次采样时该 consumer group 的 pending（已投递未 ack）条目数 |
 
 `in_flight` 长期顶在 `pool_size × pages_per_instance` 上限 = 请求在并发
-semaphore 上排队；`browser_respawns_total` 上升 = chromium 在崩溃并被自动
-恢复；`pool_active_instances < pool_size` = 有实例正在回收中。
+semaphore 上排队（超过 `BROWSER_HEADLESS_CHECKOUT_WAIT_MS` 后会以 503 丢弃）；
+`browser_respawns_total` 上升 = chromium 在崩溃并被自动恢复；
+`pool_active_instances < pool_size` = 有实例正在回收中。`worker_*` 指标仅在
+`worker` / `all` 模式下有值；`worker_stream_length` / `worker_pending` 持续增长
+= 任务到达快于 worker 消费速度（多起几个 worker 进程横向扩容）。
 
 ### `GET /summary` · `POST /summary`
 
@@ -732,7 +741,7 @@ DOM/cookie 访问权限（Magecart 式供应链攻击向量）。按 JS 字节�
 | 404 | `capture_element` 选择器没匹配到元素 |
 | 408 | 内部等待（`wait_for_element` / `wait_for_function`）超时 |
 | 502 | `wait_for_request` 命中的某个 URL 返了 4xx/5xx |
-| 503 | 浏览器在重启中，或 `Browser.getVersion` 失败（`/readyz`） |
+| 503 | 无可用实例（池在重启 / 回收），或池已饱和——`BROWSER_HEADLESS_CHECKOUT_WAIT_MS` 内拿不到空闲槽位；或 `Browser.getVersion` 失败（`/readyz`） |
 | 504 | 总体硬上限（`timeout_ms` + buffer，默认 10s）超时 |
 
 ### `POST /summary/batch`
@@ -780,10 +789,12 @@ curl -X POST http://localhost:3000/summary/batch \
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 HTTP）；`all` 一个进程同时跑两者、共享一个浏览器池（单机方便——两者抢 `POOL_SIZE × MAX_PAGES` 容量）。见 [Worker 模式](#worker-模式redis-队列)。 |
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 API 端口）；`all` 一个进程同时跑两者、共享一个浏览器池（单机方便——两者抢 `POOL_SIZE × MAX_PAGES` 容量）。见 [Worker 模式](#worker-模式redis-队列)。 |
+| `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | **仅 worker 模式。** worker 的 `/healthz` + `/readyz` + `/metrics` 监听端口（serve / all 已在 API 端口 3000 上提供这些）。`healthcheck` 子命令在 worker 模式下探测此端口。 |
 | `BROWSER_HEADLESS_API_KEY` | 未设置（开放） | 开启 API key 鉴权。设置后，`/summary` 必须带 `X-Api-Key: <value>` header，不匹配 / 缺失返 401。`/healthz`、`/readyz`、`/metrics` 永远开放（保证探针 / 抓取可用）。key 采用常量时间比对（`subtle::ConstantTimeEq`）；但因长度不同会短路，仍建议使用高熵 key（≥32 随机字节）。 |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | 池中 chromium 进程数。总并发 = `POOL_SIZE × MAX_PAGES`。`1` 即原单实例行为。每个实例用独立 profile 目录、独立监督。 |
 | `BROWSER_HEADLESS_MAX_PAGES` | 8 | **每实例**的 page 并发上限。超出 `POOL_SIZE × MAX_PAGES` 的请求排队，handler 返回时释放 permit。 |
+| `BROWSER_HEADLESS_CHECKOUT_WAIT_MS` | 30000 | 准入控制：一次 capture 等待空闲池槽位的最长时间，超时则以 `503`（`browser pool saturated`）丢弃。当需求超过 `POOL_SIZE × MAX_PAGES` 时限制排队长度，让饱和的服务快速失败，而非无限期挂住调用方（及其 future）。`0` 表示无限等待（原行为）。 |
 | `BROWSER_HEADLESS_RECYCLE_AFTER_REQUESTS` | 0（关闭） | 实例服务满这么多请求后回收（排空 → 换子进程），抑制 chromium 内存增长。`0` 关闭按次数回收。 |
 | `BROWSER_HEADLESS_RECYCLE_AFTER_SECS` | 0（关闭） | 实例达到该年龄（秒）后回收。`0` 关闭按年龄回收。与按次数触发相互独立。 |
 | `BROWSER_HEADLESS_DRAIN_TIMEOUT_MS` | 30000 | 主动回收时，等待该实例 in-flight 请求跑完的最长时间，超时则强制换子进程（drop 旧 browser 会取消卡住的 capture）。 |
@@ -864,10 +875,14 @@ worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所�
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。 |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
 | `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | 打开 Redis 连接时 TCP + TLS + 认证握手的超时。从 redis-rs 默认的 1s 上调——1s 对高延迟 / 跨区域 Redis（如 Upstash）太短，会表现为连接 `timed out`。 |
+| `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | worker 的 `/healthz` + `/readyz` + `/metrics` 监听端口（worker 本身不绑 API 端口）。`healthcheck` 子命令探测此端口。 |
+| `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 15 | worker 多久刷新一次队列深度 gauge（`worker_stream_length` / `worker_pending`），通过 `XLEN` + `XPENDING`。 |
 
 上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。
-worker 不暴露 `/metrics`（无 HTTP）；用日志和 Redis consumer-group lag
-（`XPENDING`）监控。
+worker 不绑 API 端口，但**会**在 `BROWSER_HEADLESS_HEALTH_PORT`（默认 3000）上
+提供 `/healthz`、`/readyz`、`/metrics`——和 HTTP 服务一样可探针 / 可抓取，并额外
+暴露 `worker_*` 指标（任务数、耗时、in-flight、reclaim、stream 长度、pending）。
+同时关注 Redis consumer-group lag（`worker_pending` / `XPENDING`）。
 
 ---
 
@@ -879,8 +894,11 @@ worker 不暴露 `/metrics`（无 HTTP）；用日志和 Redis consumer-group la
 - **`--shm-size`**：Docker 默认 64MB `/dev/shm` 不够 Chrome 高负载使用。
   我们传了 `--disable-dev-shm-usage` 让 Chrome 回退到 `/tmp`，但
   `docker run --shm-size=512m` 还是更稳。
-- **健康探针**：`/healthz`（liveness）+ `/readyz`（readiness）。k8s
-  示例：
+- **健康探针**：`/healthz`（liveness）+ `/readyz`（readiness）在每种模式下都
+  提供——`serve` / `all` 在 3000，`worker` 在 `BROWSER_HEADLESS_HEALTH_PORT`
+  （默认 3000）。镜像内置 Docker `HEALTHCHECK`，运行 `browser-headless
+  healthcheck`（内部发起 `GET /healthz`，因此镜像无需 curl/wget），并按
+  `BROWSER_HEADLESS_MODE` 自动选对端口。k8s 示例：
   ```yaml
   livenessProbe:
     httpGet: { path: /healthz, port: 3000 }

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{FromRef, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -32,7 +32,28 @@ pub(crate) struct AppState {
     pub(crate) metrics_handle: PrometheusHandle,
 }
 
-/// Build the axum router with all routes wired to `state`.
+/// State for the probe/metrics routes — the pool (for readiness) plus the
+/// Prometheus handle, without the API key. The full API router extracts it from
+/// [`AppState`] via [`FromRef`]; the worker's health-only listener
+/// ([`health_router`]) uses it directly, so worker mode exposes the same
+/// `/healthz`, `/readyz`, `/metrics` without depending on the HTTP API.
+#[derive(Clone)]
+pub(crate) struct HealthState {
+    pub(crate) ctx: CaptureCtx,
+    pub(crate) metrics_handle: PrometheusHandle,
+}
+
+impl FromRef<AppState> for HealthState {
+    fn from_ref(app: &AppState) -> HealthState {
+        HealthState {
+            ctx: app.ctx.clone(),
+            metrics_handle: app.metrics_handle.clone(),
+        }
+    }
+}
+
+/// Build the axum router with all routes wired to `state`. The probe/metrics
+/// handlers take `State<HealthState>`, extracted from `AppState` via `FromRef`.
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -41,6 +62,20 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/summary", get(summary_handler).post(summary_handler_post))
         .route("/summary/batch", post(summary_batch_handler))
         .with_state(state)
+}
+
+/// Health-only router for worker mode: `/healthz`, `/readyz`, `/metrics` and
+/// nothing else (no `/summary*`, no API-key auth). serve / all modes use
+/// [`router`], which serves these same probes alongside the capture API.
+pub(crate) fn health_router(ctx: CaptureCtx, metrics_handle: PrometheusHandle) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_endpoint))
+        .with_state(HealthState {
+            ctx,
+            metrics_handle,
+        })
 }
 
 /// Install the global Prometheus recorder and return a handle whose `render()`
@@ -93,7 +128,7 @@ async fn healthz() -> &'static str {
 /// Prometheus scrape endpoint. Open (no `X-Api-Key`) like the health probes,
 /// so an in-cluster Prometheus can scrape it without sharing the API key;
 /// restrict at the network layer if the operational metrics are sensitive.
-async fn metrics_endpoint(State(state): State<AppState>) -> Response {
+async fn metrics_endpoint(State(state): State<HealthState>) -> Response {
     use axum::http::header::CONTENT_TYPE;
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -105,7 +140,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
 /// Readiness probe — sends `Browser.getVersion` over CDP to confirm an active
 /// pool instance is reachable. Returns 503 when no instance is active (all
 /// crashed / recycling) or the CDP socket is broken.
-async fn readyz(State(state): State<AppState>) -> Result<&'static str, (StatusCode, String)> {
+async fn readyz(State(state): State<HealthState>) -> Result<&'static str, (StatusCode, String)> {
     let browser = state.ctx.pool.any_active_browser().await.ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "no active browser instance (pool recycling/respawning)".to_string(),

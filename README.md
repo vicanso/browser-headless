@@ -168,11 +168,21 @@ network layer if the operational data is sensitive. Exposes:
 | `browser_headless_pool_active_instances` | gauge | — | instances currently `Active` (not draining / respawning) |
 | `browser_headless_browser_respawns_total` | counter | — | crashed instances respawned |
 | `browser_headless_recycles_total` | counter | `reason` (`age`/`count`) | voluntary instance recycles |
+| `browser_headless_worker_jobs_total` | counter | `outcome` (`ok`/`error`) | worker jobs processed (worker / all modes) |
+| `browser_headless_worker_job_duration_seconds` | histogram | — | per-job worker processing time (capture + result write) |
+| `browser_headless_worker_jobs_in_flight` | gauge | — | worker captures currently running |
+| `browser_headless_worker_reclaimed_total` | counter | — | stale pending entries reclaimed from dead workers (`XAUTOCLAIM`) |
+| `browser_headless_worker_stream_length` | gauge | — | jobs stream length (`XLEN`) at last sample |
+| `browser_headless_worker_pending` | gauge | — | pending (delivered, unacked) entries for the consumer group at last sample |
 
 `in_flight` riding at the `pool_size × pages_per_instance` ceiling means
-requests are queueing on the concurrency semaphores; a rising
+requests are queueing on the concurrency semaphores (and, past
+`BROWSER_HEADLESS_CHECKOUT_WAIT_MS`, being shed with 503); a rising
 `browser_respawns_total` means chromium is crashing and being recovered;
-`pool_active_instances < pool_size` means an instance is mid-recycle.
+`pool_active_instances < pool_size` means an instance is mid-recycle. The
+`worker_*` metrics are only populated in `worker` / `all` modes; a growing
+`worker_stream_length` / `worker_pending` means jobs are arriving faster than
+the workers drain them (scale out more worker processes).
 
 ### `GET /summary` · `POST /summary`
 
@@ -775,7 +785,7 @@ resource prose lines, and the `data` field in a fenced block.
 | 404 | `capture_element` selector matched nothing |
 | 408 | Internal wait (`wait_for_element` / `wait_for_function`) timed out |
 | 502 | A `wait_for_request` URL came back 4xx/5xx |
-| 503 | Browser respawning or `Browser.getVersion` failed (`/readyz`) |
+| 503 | No active instance (pool respawning/recycling), or pool saturated — no free slot within `BROWSER_HEADLESS_CHECKOUT_WAIT_MS`; or `Browser.getVersion` failed (`/readyz`) |
 | 504 | Total deadline (`timeout_ms` + buffer, default 10s) exceeded |
 
 ### `POST /summary/batch`
@@ -826,10 +836,12 @@ empty `urls` or over-limit list returns 400. This is the efficient shape for
 
 | Env var | Default | Effect |
 |---|---|---|
-| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no HTTP); `all` runs both in one process sharing one browser pool (handy on a single box — they compete for `POOL_SIZE × MAX_PAGES`). See [Worker mode](#worker-mode-redis-queue). |
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no API port); `all` runs both in one process sharing one browser pool (handy on a single box — they compete for `POOL_SIZE × MAX_PAGES`). See [Worker mode](#worker-mode-redis-queue). |
+| `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | **Worker mode only.** Port for the worker's `/healthz` + `/readyz` + `/metrics` listener (serve / all already serve these on the API port 3000). The `healthcheck` subcommand probes this port in worker mode. |
 | `BROWSER_HEADLESS_API_KEY` | unset (open) | Enables API key auth. When set, every `/summary` call must carry header `X-Api-Key: <value>`; mismatch / missing returns 401. `/healthz`, `/readyz`, and `/metrics` are always open so probes / scrapers work. The key is compared in constant time (`subtle::ConstantTimeEq`); still use a high-entropy key (≥32 random bytes) since the comparison short-circuits on length. |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | Number of chromium processes in the pool. Total concurrency = `POOL_SIZE × MAX_PAGES`. `1` reproduces the original single-instance behaviour. Each instance uses its own profile dir and is supervised independently. |
 | `BROWSER_HEADLESS_MAX_PAGES` | 8 | Page-concurrency cap **per instance**. Requests beyond `POOL_SIZE × MAX_PAGES` queue; the permit is released when the handler returns. |
+| `BROWSER_HEADLESS_CHECKOUT_WAIT_MS` | 30000 | Admission control: max time a capture waits for a free pool slot before being shed with `503` (`browser pool saturated`). Bounds the queue when demand exceeds `POOL_SIZE × MAX_PAGES`, so a saturated service fails fast instead of parking callers (and their futures) indefinitely. `0` waits forever (the original behaviour). |
 | `BROWSER_HEADLESS_RECYCLE_AFTER_REQUESTS` | 0 (off) | Recycle an instance after it has served this many requests (drain → replace subprocess), bounding chromium memory growth. `0` disables count-based recycling. |
 | `BROWSER_HEADLESS_RECYCLE_AFTER_SECS` | 0 (off) | Recycle an instance once it reaches this age in seconds. `0` disables age-based recycling. Independent of the request-count trigger. |
 | `BROWSER_HEADLESS_DRAIN_TIMEOUT_MS` | 30000 | How long a voluntary recycle waits for an instance's in-flight requests to finish before swapping the subprocess anyway (dropping the old browser cancels any stuck capture). |
@@ -914,10 +926,15 @@ twice (fine for read-only captures; add an idempotency key for side-effecting
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` block time before a reclaim pass. |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | Idle time before a pending entry is reclaimable by another worker. |
 | `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | TCP + TLS + auth handshake timeout when opening a Redis connection. Raised from redis-rs's 1s default, which is too tight for a high-latency / cross-region Redis (e.g. Upstash) and surfaces as `timed out` on connect. |
+| `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | Port for the worker's `/healthz` + `/readyz` + `/metrics` listener (a worker binds no API port otherwise). The `healthcheck` subcommand probes it. |
+| `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 15 | How often the worker refreshes the queue-depth gauges (`worker_stream_length` / `worker_pending`) via `XLEN` + `XPENDING`. |
 
 The pool / recycle / SSRF / timeout env vars from [Configuration](#configuration)
-apply to workers too. Workers expose no `/metrics` endpoint (no HTTP); monitor
-them via logs and Redis consumer-group lag (`XPENDING`).
+apply to workers too. A worker binds no API port but **does** serve `/healthz`,
+`/readyz`, and `/metrics` on `BROWSER_HEADLESS_HEALTH_PORT` (default 3000) — so
+it is probeable and scrapeable like the HTTP service, exposing the extra
+`worker_*` metrics (jobs, duration, in-flight, reclaimed, stream length,
+pending). Also watch Redis consumer-group lag (`worker_pending` / `XPENDING`).
 
 ---
 
@@ -929,8 +946,12 @@ them via logs and Redis consumer-group lag (`XPENDING`).
 - **`--shm-size`**: Docker's default 64MB `/dev/shm` is too small for
   Chrome under load. We pass `--disable-dev-shm-usage` to fall back to
   `/tmp`, but bumping shm with `docker run --shm-size=512m` is still safer.
-- **Health probes**: see `/healthz` (liveness) and `/readyz` (readiness).
-  Example k8s config:
+- **Health probes**: `/healthz` (liveness) + `/readyz` (readiness) are served
+  in every mode — on port 3000 for `serve` / `all`, and on
+  `BROWSER_HEADLESS_HEALTH_PORT` (default 3000) for `worker`. The image ships a
+  Docker `HEALTHCHECK` that runs `browser-headless healthcheck` (an internal
+  `GET /healthz`, so no curl/wget in the image); it picks the right port from
+  `BROWSER_HEADLESS_MODE`. Example k8s config:
   ```yaml
   livenessProbe:
     httpGet: { path: /healthz, port: 3000 }
