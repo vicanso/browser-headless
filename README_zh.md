@@ -921,13 +921,13 @@ worker 完成时把结果 JSON `PUBLISH` 到该频道（`RESULT_NOTIFY`，默认
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | 结果键 TTL（秒）。 |
 | `BROWSER_HEADLESS_RESULT_NOTIFY` | `true` | 写完 `result:{id}` 后把结果 JSON `PUBLISH` 到同名频道，客户端可 `SUBSCRIBE` 阻塞等待而非轮询。结果键仍会写入；设 `false` 关闭发布。 |
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | 处理 + ack 后 `XDEL` 把该条从 stream 删除，避免 stream 无限增长（结果仍在 `result:{id}`）。设 `false` 保留条目——例如要回放、或同一 stream 上挂第二个消费组（`XDEL` 是全局的、对**所有**消费组生效，那时改用 MAXLEN 自己控量）。 |
-| `BROWSER_HEADLESS_JOB_BLOCK_MS` | 5000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。 |
+| `BROWSER_HEADLESS_JOB_BLOCK_MS` | 60000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。窗口拉长**不会**增加任务延迟（阻塞读在新条目到达的瞬间立即返回），只降低空转频率（每次超时 = 1 条 `XREADGROUP` + 1 条 `XAUTOCLAIM`）——对按命令条数计费/限额的云 Redis（如 Upstash 免费档）很重要。网页检测本就不是实时型负载，分钟级空转节奏完全够用。仅当需要更快接管崩溃 worker 的遗留任务时才调小（最坏多等 ~1 个窗口，叠加在 `JOB_VISIBILITY_MS` 之上）。 |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
 | `BROWSER_HEADLESS_JOB_MAX_RETRIES` | 2 | 写终态错误前对**瞬时**失败（408 / 502 / 503 / 504）的重试次数。确定性失败（400 / 401 / 403 / 404）不重试。`0` 关闭重试。 |
 | `BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS` | 500 | 瞬时失败重试之间的固定退避。 |
 | `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | 打开 Redis 连接时 TCP + TLS + 认证握手的超时。从 redis-rs 默认的 1s 上调——1s 对高延迟 / 跨区域 Redis（如 Upstash）太短，会表现为连接 `timed out`。 |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | worker 的 `/healthz` + `/readyz` + `/metrics` 监听端口（worker 本身不绑 API 端口）。`healthcheck` 子命令探测此端口。 |
-| `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 15 | worker 多久刷新一次队列深度 gauge（`worker_stream_length` / `worker_pending`），通过 `XLEN` + `XPENDING`。 |
+| `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 300 | worker 多久刷新一次队列深度 gauge（`worker_stream_length` / `worker_pending`），通过 `XLEN` + `XPENDING`（每次采样 2 条命令）。非实时的检测型负载，队列深度 5 分钟粒度足够；按可观测性粒度与 Redis 命令预算的取舍调整。 |
 | `BROWSER_HEADLESS_WORKER_DRAIN_MS` | 30000 | 收到 SIGTERM / SIGINT 后，worker 等待 in-flight 任务完成多久再退出。到点仍在跑的任务保持 pending，由其它 worker 重认领。 |
 
 上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。

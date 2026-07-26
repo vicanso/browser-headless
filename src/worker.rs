@@ -74,7 +74,15 @@ struct WorkerConfig {
     /// (e.g. for replay) and cap the stream with MAXLEN yourself.
     delete_on_ack: bool,
     /// How long `XREADGROUP` blocks waiting for new jobs before we fall through
-    /// to a reclaim pass.
+    /// to a reclaim pass (`BROWSER_HEADLESS_JOB_BLOCK_MS`, default 60_000).
+    ///
+    /// A long window does NOT delay job pickup — a blocking read returns the
+    /// moment a new entry lands. It only sets the idle-churn rate: every
+    /// timeout costs one `XREADGROUP` + one `XAUTOCLAIM`, which matters on
+    /// command-count-limited cloud Redis (e.g. Upstash free tier). Page
+    /// detection is not a real-time workload — minute-level idle cadence is
+    /// plenty. The only trade-off is reclaim latency for crashed-worker
+    /// entries (worst case ~1 block window on top of `visibility_ms`).
     block_ms: usize,
     /// Min idle time before a pending entry is eligible for `XAUTOCLAIM` (i.e.
     /// the original worker is presumed dead).
@@ -85,8 +93,11 @@ struct WorkerConfig {
     /// link (e.g. Upstash), which surfaces as `timed out` on connect.
     connect_timeout_ms: u64,
     /// How often the background sampler refreshes the queue-depth gauges
-    /// (stream length / pending / in-flight) via `XLEN` + `XPENDING`
-    /// (`BROWSER_HEADLESS_METRICS_SAMPLE_SECS`, default 15).
+    /// (stream length / pending) via `XLEN` + `XPENDING`
+    /// (`BROWSER_HEADLESS_METRICS_SAMPLE_SECS`, default 300). Each sample is
+    /// 2 Redis commands, billed on command-count-limited cloud Redis; queue
+    /// depth for a non-real-time detection workload doesn't need finer than
+    /// 5-minute resolution. In-flight is tracked per-job, not sampled.
     metrics_sample_secs: u64,
     /// Publish each completed result to a Redis pub/sub channel named after the
     /// result key (`<result_prefix><id>`), carrying the same JSON, so clients
@@ -127,10 +138,10 @@ impl WorkerConfig {
             result_prefix: env_string("BROWSER_HEADLESS_RESULT_PREFIX", "browser_headless:result:"),
             result_ttl_secs: env_u64("BROWSER_HEADLESS_RESULT_TTL_SECS", 3600).max(1),
             delete_on_ack: env_bool("BROWSER_HEADLESS_DELETE_ON_ACK", true),
-            block_ms: env_u64("BROWSER_HEADLESS_JOB_BLOCK_MS", 5000).max(1) as usize,
+            block_ms: env_u64("BROWSER_HEADLESS_JOB_BLOCK_MS", 60_000).max(1) as usize,
             visibility_ms: env_u64("BROWSER_HEADLESS_JOB_VISIBILITY_MS", 120_000).max(1),
             connect_timeout_ms: env_u64("BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS", 5000).max(1),
-            metrics_sample_secs: env_u64("BROWSER_HEADLESS_METRICS_SAMPLE_SECS", 15).max(1),
+            metrics_sample_secs: env_u64("BROWSER_HEADLESS_METRICS_SAMPLE_SECS", 300).max(1),
             result_notify: env_bool("BROWSER_HEADLESS_RESULT_NOTIFY", true),
             job_max_retries: env_u64("BROWSER_HEADLESS_JOB_MAX_RETRIES", 2),
             job_retry_backoff_ms: env_u64("BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS", 500),
