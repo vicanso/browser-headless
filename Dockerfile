@@ -1,4 +1,4 @@
-FROM rust:1.95.0 as builder
+FROM rust:1.97.1 as builder
 
 # Build-time system deps. Kept above source COPY so this layer caches
 # independently of code edits.
