@@ -823,17 +823,67 @@ fn extract_security_headers(headers: &Headers) -> Option<HashMap<String, String>
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Case-insensitive single-header lookup. Used for per-resource header
-/// extraction (e.g. `content-encoding`) where we want one value, not the
-/// curated security-headers map.
-fn lookup_header(headers: &Headers, name: &str) -> Option<String> {
-    let obj = headers.inner().as_object()?;
+/// The per-resource response-header facts the collect loop needs.
+/// Extracted in a single pass over the headers object (see
+/// [`extract_resource_headers`]) instead of one full scan per name.
+#[derive(Default)]
+struct ResourceHeaderFacts {
+    content_encoding: Option<String>,
+    cache_control: Option<String>,
+    /// Modern `SourceMap` or legacy `X-SourceMap` — either counts.
+    has_source_map: bool,
+    cors_allow_origin: Option<String>,
+    cors_allow_credentials: bool,
+}
+
+/// Single-pass, case-insensitive extraction of every response header the
+/// per-resource hot path cares about. Runs once per `responseReceived`
+/// event, so it deliberately avoids the N-scans-per-resource cost of a
+/// per-name lookup helper. `want_resource` gates the resource-
+/// summary trio (content-encoding / cache-control / SourceMap — skipped in
+/// content-only mode); `want_cors` gates the CORS pair (only the
+/// `security_scan` derive consumes them). With both off the headers object
+/// is never even iterated.
+fn extract_resource_headers(
+    headers: &Headers,
+    want_resource: bool,
+    want_cors: bool,
+) -> ResourceHeaderFacts {
+    let mut facts = ResourceHeaderFacts::default();
+    if !want_resource && !want_cors {
+        return facts;
+    }
+    let Some(obj) = headers.inner().as_object() else {
+        return facts;
+    };
     for (k, v) in obj {
-        if k.eq_ignore_ascii_case(name) {
-            return v.as_str().map(str::to_string);
+        if want_resource {
+            if k.eq_ignore_ascii_case("content-encoding") {
+                facts.content_encoding = v.as_str().map(str::to_string);
+                continue;
+            }
+            if k.eq_ignore_ascii_case("cache-control") {
+                facts.cache_control = v.as_str().map(str::to_string);
+                continue;
+            }
+            if k.eq_ignore_ascii_case("sourcemap") || k.eq_ignore_ascii_case("x-sourcemap") {
+                facts.has_source_map = true;
+                continue;
+            }
+        }
+        if want_cors {
+            if k.eq_ignore_ascii_case("access-control-allow-origin") {
+                facts.cors_allow_origin = v.as_str().map(str::to_string);
+                continue;
+            }
+            if k.eq_ignore_ascii_case("access-control-allow-credentials") {
+                facts.cors_allow_credentials = v
+                    .as_str()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+            }
         }
     }
-    None
+    facts
 }
 
 /// Project chromiumoxide's `Initiator` into our compact `RequestInitiator`.
@@ -4961,6 +5011,19 @@ pub struct CollectCaptures {
     /// `stopRuleUsageTracking` after the page settles. Builds
     /// `CoverageReport`.
     pub coverage: bool,
+    /// Fetch the page's cookie jar (`Page.getCookies`) into `stat.cookies`
+    /// at snapshot time. Off = one CDP round-trip saved and `cookies` stays
+    /// empty — high-volume scraping rarely reads it.
+    pub cookies: bool,
+    /// Extract per-resource response headers that feed the resource summary
+    /// (`content-encoding` / `cache-control` / `SourceMap`). Off in
+    /// content-only mode, where the summary is never built — the response
+    /// hot path then skips header scanning entirely.
+    pub resource_headers: bool,
+    /// Extract per-resource CORS response headers
+    /// (`access-control-allow-origin` / `-credentials`). Only the
+    /// `security_scan` CORS-misconfig derive consumes them.
+    pub cors_headers: bool,
 }
 
 /// Navigate to `url` and collect a full page summary: lifecycle timings,
@@ -5232,22 +5295,23 @@ pub async fn collect_summary(
                     || ev.response.from_service_worker.unwrap_or(false)
                     || ev.response.from_prefetch_cache.unwrap_or(false);
                 entry.protocol = ev.response.protocol.clone().unwrap_or_default();
-                entry.content_encoding = lookup_header(&ev.response.headers, "content-encoding");
-                entry.cache_control = lookup_header(&ev.response.headers, "cache-control");
-                // Two header spellings: modern `SourceMap` and the
-                // legacy `X-SourceMap` that older tooling (webpack,
-                // pre-2018 Babel) emitted. Either one counts.
-                entry.has_source_map = lookup_header(&ev.response.headers, "sourcemap").is_some()
-                    || lookup_header(&ev.response.headers, "x-sourcemap").is_some();
-                // CORS headers — feed the `security_scan` derive. Two
-                // cheap lookups (matches the unconditional extraction of
-                // content-encoding / cache-control above); the fields are
-                // `#[serde(skip)]` so they cost nothing in the output.
-                entry.cors_allow_origin =
-                    lookup_header(&ev.response.headers, "access-control-allow-origin");
-                entry.cors_allow_credentials =
-                    lookup_header(&ev.response.headers, "access-control-allow-credentials")
-                        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+                // One pass over the headers for everything this arm needs
+                // (content-encoding / cache-control / SourceMap for the
+                // resource summary, CORS pair for `security_scan`) — the
+                // previous per-name `lookup_header` calls scanned the full
+                // header map six times per resource. Both groups are gated:
+                // content-only mode skips the summary trio, and only
+                // `security_scan` consumes the CORS pair.
+                let facts = extract_resource_headers(
+                    &ev.response.headers,
+                    captures.resource_headers,
+                    captures.cors_headers,
+                );
+                entry.content_encoding = facts.content_encoding;
+                entry.cache_control = facts.cache_control;
+                entry.has_source_map = facts.has_source_map;
+                entry.cors_allow_origin = facts.cors_allow_origin;
+                entry.cors_allow_credentials = facts.cors_allow_credentials;
 
                 // Diagnostic log (debug level). Pairs with the
                 // `request_will_be_sent` log on the same request_id —
@@ -5522,13 +5586,20 @@ pub async fn collect_summary(
         }
     };
 
-    // Fetch cookies scoped to the target URL (parent domains included by CDP).
-    let cookies_resp = page
-        .execute(GetCookiesParams {
-            urls: Some(vec![url.to_string()]),
-        })
-        .await?;
-    let cookies: Vec<Cookie> = cookies_resp.result.cookies.iter().map(map_cookie).collect();
+    // Fetch cookies scoped to the target URL (parent domains included by
+    // CDP). Gated — one CDP round-trip that high-volume scraping rarely
+    // reads; when off, `stat.cookies` stays empty (and its JSON/markdown
+    // sections render as absent).
+    let cookies: Vec<Cookie> = if captures.cookies {
+        let cookies_resp = page
+            .execute(GetCookiesParams {
+                urls: Some(vec![url.to_string()]),
+            })
+            .await?;
+        cookies_resp.result.cookies.iter().map(map_cookie).collect()
+    } else {
+        Vec::new()
+    };
 
     // `data` is populated by `capture()` AFTER any user script runs, so the
     // returned HTML reflects post-script DOM. collect_summary just leaves it
@@ -8070,6 +8141,11 @@ pub struct SummaryRequest {
     /// One extra `page.evaluate` DOM walk (~2–5ms) plus a pure
     /// server-side CORS derive. OR-merged with `all_metrics`.
     pub security_scan: bool,
+    /// Fetch the page's cookie jar into `stat.cookies`
+    /// (`Page.getCookies`, one CDP round-trip). Named `collect_` to stay
+    /// clear of the `cookies` INPUT field above (the cookies set on the
+    /// request). OR-merged with `all_metrics`.
+    pub collect_cookies: bool,
     /// Lean content-only mode. When `true`, `capture` skips the server-side
     /// `build_resource_summary` derive (nothing consumes it — the lean HTTP
     /// response carries only the content body + status). Every analytical
@@ -8205,6 +8281,12 @@ pub async fn capture(
             console: req.console_messages,
             http_errors: req.http_errors,
             coverage: req.coverage,
+            cookies: req.collect_cookies,
+            // The resource-summary trio (content-encoding / cache-control /
+            // SourceMap) is only consumed by `build_resource_summary`,
+            // which content-only mode skips.
+            resource_headers: !req.content_only,
+            cors_headers: req.security_scan,
         },
     )
     .await?;

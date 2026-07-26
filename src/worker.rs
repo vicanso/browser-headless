@@ -718,22 +718,25 @@ async fn process_one(ctx: &CaptureCtx, cfg: &WorkerConfig, mut conn: Conn, entry
         }
     };
     let key = format!("{}{}", cfg.result_prefix, result.id);
-    let write: redis::RedisResult<()> = conn.set_ex(&key, &json, cfg.result_ttl_secs).await;
+    // Result write + subscriber notify in ONE pipelined round-trip (the
+    // channel name == the result key, so cluster routing stays single-slot;
+    // PUBLISH itself is slotless and broadcasts cluster-wide from whichever
+    // node the pipeline lands on). The old serial `SETEX` → `PUBLISH` paid
+    // two RTTs per job — real money on a cross-region Redis. PUBLISH only
+    // fails when the connection is broken (it can't fail server-side), so
+    // folding it into the write's error path loses nothing: any pipeline
+    // error → leave the entry pending for reclaim, same as a write failure.
+    let mut pipe = redis::pipe();
+    pipe.set_ex(&key, &json, cfg.result_ttl_secs).ignore();
+    if cfg.result_notify {
+        pipe.publish(&key, &json).ignore();
+    }
+    let write: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
     if let Err(e) = write {
         // Don't ack — the entry stays pending and gets reclaimed, so the result
         // isn't silently lost.
         tracing::warn!(entry = %entry_id, error = %e, "result write failed; leaving entry pending");
         return;
-    }
-
-    // Notify any blocked subscribers (the channel name == the result key).
-    // Best-effort: the result key is already written, so pollers and late
-    // subscribers are covered even when PUBLISH reaches no one.
-    if cfg.result_notify {
-        let published: redis::RedisResult<()> = conn.publish(&key, &json).await;
-        if let Err(e) = published {
-            tracing::debug!(entry = %entry_id, error = %e, "result publish failed");
-        }
     }
 
     tracing::info!(entry = %entry_id, id = %result.id, status = result.status, duration_ms, "job done");
@@ -862,21 +865,24 @@ fn is_retryable(status: u16) -> bool {
 }
 
 async fn ack(conn: &mut Conn, cfg: &WorkerConfig, entry_id: &str) {
-    let acked: redis::RedisResult<i64> = conn
-        .xack(cfg.stream.as_str(), cfg.group.as_str(), &[entry_id])
-        .await;
+    // XACK only clears the pending list — the entry stays in the stream, so
+    // (by default) XDEL it too, or the stream grows without bound (the result
+    // already lives in `result:{id}`). Both commands key on the stream (same
+    // cluster slot), so they're pipelined into one round-trip instead of the
+    // old serial pair. The reclaim path is unaffected: we only reach here
+    // after a definitive outcome, so nothing reclaimable is ever deleted.
+    let acked: redis::RedisResult<()> = if cfg.delete_on_ack {
+        let mut pipe = redis::pipe();
+        pipe.xack(cfg.stream.as_str(), cfg.group.as_str(), &[entry_id])
+            .ignore();
+        pipe.xdel(cfg.stream.as_str(), &[entry_id]).ignore();
+        pipe.query_async(&mut *conn).await
+    } else {
+        conn.xack(cfg.stream.as_str(), cfg.group.as_str(), &[entry_id])
+            .await
+            .map(|_: i64| ())
+    };
     if let Err(e) = acked {
-        tracing::warn!(entry = %entry_id, error = %e, "XACK failed");
-        return;
-    }
-    // XACK only clears the pending list — the entry stays in the stream. Delete
-    // it so the stream doesn't grow without bound (the result already lives in
-    // `result:{id}`). The reclaim path is unaffected: we only reach here after a
-    // definitive outcome, so nothing reclaimable is ever deleted.
-    if cfg.delete_on_ack {
-        let deleted: redis::RedisResult<i64> = conn.xdel(cfg.stream.as_str(), &[entry_id]).await;
-        if let Err(e) = deleted {
-            tracing::warn!(entry = %entry_id, error = %e, "XDEL failed");
-        }
+        tracing::warn!(entry = %entry_id, error = %e, "ack failed");
     }
 }

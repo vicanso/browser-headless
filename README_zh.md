@@ -28,7 +28,7 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   自定义 JS，外加 `wait_until_load` gate 切换（在 `load` 事件 vs Chrome
   `networkIdle` 之间选择返回时机）。
 - **完整快照** —— 每条资源的体积 / 状态 / 时间线 / mime / 缓存命中标记；
-  JS 异常；cookie jar 里的全部 cookie；可选 console 消息、PNG 截图(base64)、
+  JS 异常；cookie jar（`cookies=true` 时输出）；可选 console 消息、PNG 截图(base64)、
   PDF (base64)、HAR 1.2 归档、CDP `DOMSnapshot`（带 layout / computed style
   的结构化快照）、**Core Web Vitals** 增强版（含 **LCP 元素身份** + 每次
   shift 的 **CLS 源** + 服务端预聚合的 top offenders + **INP** 2024
@@ -208,7 +208,8 @@ curl -X POST http://localhost:3000/summary \
 | `resource_hints` | bool | false | 审计 `<link rel="preconnect">` / `<link rel="dns-prefetch">` 声明与实际命中的第三方主机的差距。结果写入 `resource_summary.resource_hints`，包含 `declared_preconnect[]` / `declared_dns_prefetch[]` 以及 `gap[]` —— 实际加载量大但未声明 hint 的第三方主机列表（每个 = 一次可避免的 100–300ms DNS+TLS 开销）。多一次 `<head>` evaluate（约 5ms）。与 `all_metrics` OR 合并。 |
 | `font_audit` | bool | false | 审计 `@font-face` 声明 + `document.fonts` 的 FOIT（Flash of Invisible Text，"文字加载期间不可见"）风险。结果写入 `stat.font_audit`，包含 `font-display` 取值分布、`missing_swap[]`（FOIT 罪魁列表 —— 每条对应一个 `font-display: swap;` 的具体修复）、`declared_preload_count`（标量 —— "你到底有没有 preload 字体"）、`unreadable_stylesheets`（CORS 盲区计数 —— 跨域 stylesheet 没加 `crossorigin` 就读不到 cssRules，把这部分数据如实暴露而不是默默丢掉）。多一次 CSSOM `page.evaluate`（约 3–8ms）。与 `all_metrics` OR 合并。 |
 | `security_scan` | bool | false | 深度客户端安全扫描，写入 `stat.security_scan`：**SRI 覆盖**（跨域 `<script>`/`<link>` 缺 `integrity` 的供应链风险）、**`target=_blank`** 显式带 `rel=opener`（高危反向 tabnabbing；现代浏览器已默认隐含 noopener，故单纯缺 noopener 不再上报）、**表单安全**（明文 `action` / 非 HTTPS 页上的密码框）、**JS 库版本指纹**（jQuery / React / Vue / Angular / …，可离线对照 CVE 区间）、以及被动检测的 **CORS** `Access-Control-Allow-Origin: *` 配合 credentials 的配置错误。多一次 `page.evaluate` DOM 遍历（约 2–5ms）+ 一次纯服务端 CORS 派生。与 `all_metrics` OR 合并。与始终输出的 `security_audit`（响应头/cookie 配置 scorecard）互补。 |
-| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
+| `cookies` | bool | false | 快照时读取页面的 cookie jar，写入 `stat.cookies`（`Page.getCookies`，一次 CDP 往返）。与 `cookie` **输入**参数（往请求上设置 cookie）不同 —— 这个是在页面运行后**读取** jar，例如会话续期场景。关闭时 `stat.cookies` 为空，JSON/markdown 中对应段落不出现。与 `all_metrics` OR 合并。 |
+| `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan` / `cookies`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
 | `content_only` | bool | false | 精简的**只取内容**模式 —— "我只想拿页面内容"。正文按调用方选择的 `data_format` 返回（默认 `html` / `text` / `markdown`）；此 flag **不会**强制 markdown —— 需要哪种格式由 `data_format` 决定。抑制所有分析类 flag + `all_metrics` + 二进制采集（`screenshot`/`pdf`/`har`/`save_dom_snapshot`）+ `coverage`，并跳过 `resource_summary` 派生。返回一个紧凑 JSON 对象 `{ status, final_url, char_count, data }`（忽略 `format`/`lang` 参数）—— `status` + 非平凡的 `char_count`（外加 `final_url` 没有跳到意外位置）顺带就是一个廉价的"是否正确渲染"检查，无需返回完整 `WebPageStat`。JS 仍会执行，所以 SPA 内容可被捕获；空白/骨架页会表现为接近空的 `data`。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
@@ -996,7 +997,8 @@ LOGIN=$(curl -X POST http://localhost:3000/summary \
     "url": "https://app.example.com/login",
     "script": "document.querySelector(\"#u\").value=\"alice\"; document.querySelector(\"#p\").value=\"secret\"; document.querySelector(\"form\").submit();",
     "wait_for_request": ["api/login"],
-    "settle_ms": 300
+    "settle_ms": 300,
+    "cookies": true
   }')
 
 # 2. 复用 cookies
@@ -1103,12 +1105,12 @@ curl -X POST http://localhost:3000/summary \
   }'
 ```
 
-(`all_metrics: true` 是简写，一次性开启全部 14 个分析类 flag ——
+(`all_metrics: true` 是简写，一次性开启全部 15 个分析类 flag ——
 `web_vitals` / `metrics` / `metadata` / `render_blocking` /
 `service_worker` / `initiators` / `console_messages` / `image_sizing` /
 `dom_mutations` / `resources` / `http_errors` / `resource_hints` /
-`font_audit` / `security_scan`。大体积二进制 `screenshot` / `pdf` 等
-以及 `coverage` 仍需显式开启。)
+`font_audit` / `security_scan` / `cookies`。大体积二进制 `screenshot` /
+`pdf` 等以及 `coverage` 仍需显式开启。)
 
 返回的单一 markdown 文档包含：加载摘要、异常、Web Vitals + LCP 元素 +
 top CLS offenders、资源汇总、render-blocking 资源、TLS 证书 + per-host

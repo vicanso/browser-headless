@@ -271,6 +271,15 @@ pub(crate) struct SummaryQuery {
     #[serde(default)]
     pub(crate) font_audit: bool,
 
+    /// Fetch the page's cookie jar at snapshot time into `stat.cookies`
+    /// (`Page.getCookies`, one CDP round-trip). Default off — high-volume
+    /// scraping rarely reads it, and the empty list renders as an absent
+    /// section. Distinct from the `cookie` INPUT param above (cookies SET
+    /// on the request); this one REPORTS the jar after the page ran (e.g.
+    /// for session-continuation flows). OR-merged with `all_metrics`.
+    #[serde(default)]
+    pub(crate) cookies: bool,
+
     /// Deep client-side security scan into `stat.security_scan`:
     /// Subresource-Integrity coverage on cross-origin `<script>` /
     /// `<link>`, `target=_blank` links missing `rel=noopener`
@@ -286,8 +295,9 @@ pub(crate) struct SummaryQuery {
     /// Convenience switch that turns ON every **analytical** flag:
     /// `web_vitals` / `metrics` / `metadata` / `render_blocking` /
     /// `service_worker` / `initiators` / `console_messages` /
-    /// `image_sizing` / `dom_mutations` / `resources` / `http_errors`.
-    /// Equivalent to setting all eleven manually — saves long query
+    /// `image_sizing` / `dom_mutations` / `resources` / `http_errors` /
+    /// `resource_hints` / `font_audit` / `security_scan` / `cookies`.
+    /// Equivalent to setting all fifteen manually — saves long query
     /// strings in AI comparison / regression-audit workflows.
     ///
     /// **Does NOT enable binary captures** (`screenshot` / `pdf` / `har`
@@ -581,6 +591,7 @@ async fn capture_one_unmetered(
         resource_hints: !lean && (q.resource_hints || q.all_metrics),
         font_audit: !lean && (q.font_audit || q.all_metrics),
         security_scan: !lean && (q.security_scan || q.all_metrics),
+        collect_cookies: !lean && (q.cookies || q.all_metrics),
     };
 
     // Hard upper bound on the whole capture lifecycle. `timeout_ms` already

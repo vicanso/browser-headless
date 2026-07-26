@@ -31,7 +31,7 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   fixed `settle_ms`, custom JS via `script`, plus a `wait_until_load`
   gate toggle (return on the `load` event vs Chrome's `networkIdle`).
 - **Full snapshot** — every resource with size / status / timing / mime /
-  cache flag; JS exceptions; cookies in the jar; optional console
+  cache flag; JS exceptions; cookie jar (opt-in `cookies=true`); optional console
   messages, screenshot (PNG base64), PDF (base64), HAR 1.2 archive, CDP
   `DOMSnapshot` (structured layout + computed styles), **Core Web Vitals**
   enriched with **LCP element identity**, per-shift **CLS sources** (with
@@ -234,7 +234,8 @@ curl -X POST http://localhost:3000/summary \
 | `resource_hints` | bool | false | Audit declared `<link rel="preconnect">` / `<link rel="dns-prefetch">` against actually-loaded third-party hosts. Populates `resource_summary.resource_hints` with `declared_preconnect[]` / `declared_dns_prefetch[]` and a `gap[]` list of hot third parties hit without a hint (each = avoidable 100–300ms DNS+TLS per origin). One extra `<head>` evaluate (~5ms). OR-merged with `all_metrics`. |
 | `font_audit` | bool | false | Audit `@font-face` declarations + `document.fonts` for FOIT (Flash of Invisible Text) risk. Populates `stat.font_audit` with `font-display` distribution, `missing_swap[]` (per-face FOIT offenders — each gets `font-display: swap;` as the AI fix), `declared_preload_count` (scalar — "did you preload any fonts at all"), and `unreadable_stylesheets` (CORS blind-spot count, so the audit is honest about what it couldn't see). One `page.evaluate` over CSSOM (~3–8ms). OR-merged with `all_metrics`. |
 | `security_scan` | bool | false | Deep client-side security scan into `stat.security_scan`: **SRI coverage** on cross-origin `<script>`/`<link>` (missing-`integrity` supply-chain risks), **`target=_blank`** links with an explicit `rel=opener` (high-severity reverse-tabnabbing; bare missing-`noopener` is not flagged since modern browsers imply it), **form security** (cleartext `action` / password fields on non-HTTPS pages), **JS library + version fingerprint** (jQuery / React / Vue / Angular / …, cross-reference against CVE ranges offline), and passively-detected **CORS** `Access-Control-Allow-Origin: *`-with-credentials misconfigurations. One extra `page.evaluate` DOM walk (~2–5ms) plus a pure server-side CORS derive. OR-merged with `all_metrics`. Distinct from the always-on `security_audit` (header/cookie config scorecard). |
-| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
+| `cookies` | bool | false | Report the page's cookie jar at snapshot time into `stat.cookies` (`Page.getCookies`, one CDP round-trip). Distinct from the `cookie` INPUT param (cookies SET on the request) — this one READS the jar after the page ran, e.g. for session-continuation flows. When off, `stat.cookies` is empty and its JSON/markdown sections are absent. OR-merged with `all_metrics`. |
+| `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan` / `cookies`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
 | `content_only` | bool | false | Lean **content-only** mode — "just give me the page content". The body is returned in the caller's chosen `data_format` (`html` default / `text` / `markdown`); this flag does **not** force markdown — pick the format via `data_format`. Suppresses every analytical flag + `all_metrics` + binary captures (`screenshot`/`pdf`/`har`/`save_dom_snapshot`) + `coverage`, and skips the `resource_summary` derive. Returns a compact JSON object `{ status, final_url, char_count, data }` (the `format`/`lang` params are ignored) — `status` + a non-trivial `char_count` (and `final_url` not landing somewhere unexpected) doubles as a cheap render-correctness check without shipping the full `WebPageStat`. JS still runs, so SPA content is captured; a blank/skeleton page shows up as a near-empty `data`. |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
@@ -1059,7 +1060,8 @@ LOGIN=$(curl -X POST http://localhost:3000/summary \
     "url": "https://app.example.com/login",
     "script": "document.querySelector(\"#u\").value=\"alice\"; document.querySelector(\"#p\").value=\"secret\"; document.querySelector(\"form\").submit();",
     "wait_for_request": ["api/login"],
-    "settle_ms": 300
+    "settle_ms": 300,
+    "cookies": true
   }')
 
 # 2. Reuse the cookies
@@ -1168,12 +1170,12 @@ curl -X POST http://localhost:3000/summary \
   }'
 ```
 
-(`all_metrics: true` is shorthand for enabling all fourteen analytical
+(`all_metrics: true` is shorthand for enabling all fifteen analytical
 flags at once — `web_vitals` / `metrics` / `metadata` / `render_blocking`
 / `service_worker` / `initiators` / `console_messages` / `image_sizing` /
 `dom_mutations` / `resources` / `http_errors` / `resource_hints` /
-`font_audit` / `security_scan`. Binary captures like `screenshot` / `pdf`
-and `coverage` stay on explicit opt-in.)
+`font_audit` / `security_scan` / `cookies`. Binary captures like
+`screenshot` / `pdf` and `coverage` stay on explicit opt-in.)
 
 You get back a single markdown document with sections for: load summary,
 exceptions, web vitals + LCP element + top CLS offenders, resource

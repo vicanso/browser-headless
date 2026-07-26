@@ -9,22 +9,22 @@ axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
 # Response compression for the large HTML/markdown/JSON payloads /summary
 # returns — negotiated via Accept-Encoding, so plain clients are unaffected.
-tower-http = { version = "0.6", features = ["compression-gzip", "compression-br", "compression-zstd"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync", "io-util"] }
+tower-http = { version = "0.7.0", features = ["compression-gzip", "compression-br", "compression-zstd"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync", "io-util"] }
 num_cpus = "1.17.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 chromiumoxide = { version = "0.9.1", default-features = false }
-futures = "0.3.32"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+futures = "0.3.33"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 htmd = "0.5.4"
 url = "2.5.8"
-uuid = { version = "1.23.2", features = ["v4"] }
+uuid = { version = "1.24.0", features = ["v4"] }
 subtle = "2.6"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-redis = { version = "1.2.2", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"] }
+redis = { version = "1.4.1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"] }
 # redis's `tokio-rustls-comp` pulls rustls 0.23 but selects no crypto provider,
 # so we enable + install `ring` ourselves (see main.rs). `ring` avoids the
 # cmake/C build deps that `aws-lc-rs` needs.
