@@ -5,12 +5,12 @@ mod error;
 mod http;
 mod jobs;
 mod pool;
+mod queue;
 mod rate_limit;
 mod ssrf;
 mod worker;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
@@ -19,7 +19,6 @@ use tokio::sync::watch;
 use crate::capture::CaptureCtx;
 use crate::config::LogFormat;
 use crate::http::AppState;
-use crate::jobs::JobStore;
 use crate::rate_limit::RateLimiter;
 
 fn main() {
@@ -186,9 +185,8 @@ async fn serve_http(
         tracing::info!("/metrics requires X-Api-Key (BROWSER_HEADLESS_PROTECT_METRICS)");
     }
 
-    let jobs = JobStore::new();
-    if config::async_jobs_enabled() {
-        jobs.clone().spawn_sweeper(Duration::from_secs(60));
+    let jobs = queue::init_jobs_backend().await;
+    if jobs.is_some() {
         tracing::info!("async job API enabled at POST /jobs + GET /jobs/:id");
     }
 

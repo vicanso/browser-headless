@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
+// Serialize is required so HTTP can enqueue SummaryQuery onto the Redis job stream.
 use url::Url;
 
 use crate::browser;
@@ -34,7 +35,7 @@ pub(crate) struct CaptureCtx {
 
 /// How the entire response is delivered. Independent of `DataFormat`, which
 /// controls only the `data` field's representation.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ResponseFormat {
     #[default]
@@ -65,7 +66,7 @@ pub(crate) struct ContentResponse {
 /// All capture knobs. Deserialized from the HTTP query/body and, for
 /// `/summary/batch`, flattened as the shared template; fields are
 /// `pub(crate)` so the HTTP layer can snapshot them for request logging.
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct SummaryQuery {
     /// Defaulted so `/summary/batch` can flatten the shared params without a
     /// top-level `url` (each URL comes from the batch's `urls` list). The
@@ -420,7 +421,7 @@ pub(crate) struct SummaryQuery {
 
 /// Named capture presets. Each expands to a set of analytical / content
 /// flags so callers don't have to remember long query strings.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum CaptureProfile {
     /// Lean content fetch: `content_only=true`, `wait_until_load=true`.

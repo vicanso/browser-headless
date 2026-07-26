@@ -242,9 +242,8 @@ pub(crate) fn max_async_jobs() -> usize {
     *V.get_or_init(|| env_usize("BROWSER_HEADLESS_MAX_ASYNC_JOBS", 256).max(1))
 }
 
-/// Whether the in-process async job API is enabled
-/// (`BROWSER_HEADLESS_ASYNC_JOBS`, default true). Set `false` to hide
-/// `/jobs` routes entirely.
+/// Whether the async job API is enabled (`BROWSER_HEADLESS_ASYNC_JOBS`,
+/// default true). Set `false` to hide `/jobs` routes entirely.
 pub(crate) fn async_jobs_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| env_bool("BROWSER_HEADLESS_ASYNC_JOBS", true))

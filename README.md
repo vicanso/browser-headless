@@ -853,12 +853,22 @@ empty `urls` or over-limit list returns 400. This is the efficient shape for
 
 ### `POST /jobs` · `GET /jobs/{id}`
 
-In-process async captures (enabled by default; disable with
+Async captures (enabled by default; disable with
 `BROWSER_HEADLESS_ASYNC_JOBS=false`). Same body as `POST /summary`; the
 server returns `{ "id", "status": "queued" }` immediately and you poll
-`GET /jobs/{id}` until `status` is `done` or `error`. Results expire after
-`BROWSER_HEADLESS_JOB_TTL_SECS` (default 1h). For multi-node queues use
-[Worker mode](#worker-mode-redis-queue) instead.
+`GET /jobs/{id}` until `status` is `done` or `error`.
+
+**Backends** (`BROWSER_HEADLESS_JOBS_BACKEND`):
+
+| Backend | When | Behaviour |
+|---|---|---|
+| `local` | default without Redis | In-process spawn on this node's browser pool |
+| `redis` | multi-node / `MODE=all` | `XADD` to `BROWSER_HEADLESS_JOBS_STREAM`; workers (`MODE=worker` or `all`) run the capture and write `result:{id}` — same wire format as the [Worker mode](#worker-mode-redis-queue) queue |
+| `auto` | default | Redis if `BROWSER_HEADLESS_REDIS_URL` is set, else local |
+
+Results expire after `BROWSER_HEADLESS_JOB_TTL_SECS` / `RESULT_TTL_SECS`
+(default 1h). With the Redis backend, scale capture capacity by adding worker
+processes — the HTTP API only enqueues.
 
 ```bash
 curl -X POST http://localhost:3000/jobs \
@@ -905,8 +915,9 @@ this README).
 | `BROWSER_HEADLESS_PROTECT_METRICS` | false | When true, `/metrics` requires the same `X-Api-Key` as the API. `/healthz` stays open. |
 | `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` or `json` (structured logs for k8s). |
 | `BROWSER_HEADLESS_ASYNC_JOBS` | true | Enable `POST /jobs` + `GET /jobs/{id}`. Set `false` to hide the routes. |
-| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | TTL for in-process async job results. |
-| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | Cap on concurrent/retained async jobs (purge expired first). |
+| `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` = in-process capture on this node's pool; `redis` = `XADD` to the worker stream (same as `MODE=worker` consumers); `auto` = Redis when `BROWSER_HEADLESS_REDIS_URL` is set, otherwise local. Use `redis` (or `auto` + Redis URL) so HTTP API and workers share one queue. |
+| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | TTL for async job results (local map expiry / Redis result-key TTL). |
+| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | Cap on concurrent/retained **local** async jobs (Redis-backed queues are bounded by workers + stream length). |
 | `CHROME` | (auto-detect) | Path to the Chrome / Chromium binary. The provided Dockerfile sets `/usr/bin/chromium`. |
 | `RUST_LOG` | `info,chromiumoxide::conn=off,chromiumoxide::handler=off` | Standard `tracing_subscriber` filter. Set `browser_headless=debug` to see per-stage timings. |
 

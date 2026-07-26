@@ -37,3 +37,39 @@ jobs:
 
       - name: Tests
         run: cargo test --all-features
+
+  # Optional live smoke: installs Chromium and hits /healthz + /summary.
+  # Runs after unit tests; still part of CI so regressions surface, but is
+  # isolated so a browser packaging glitch is easy to spot in the job name.
+  smoke:
+    name: chrome e2e smoke
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends chromium-browser ca-certificates
+          chromium-browser --version || chromium --version || true
+
+      - name: Build release binary
+        run: cargo build --release --bin browser-headless
+
+      - name: Run ignored e2e smoke
+        env:
+          CHROME: /usr/bin/chromium-browser
+        run: |
+          if [ ! -x "$CHROME" ]; then
+            CHROME=/usr/bin/chromium
+            export CHROME
+          fi
+          cargo test --test e2e_chrome --release -- --ignored --nocapture

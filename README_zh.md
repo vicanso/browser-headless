@@ -205,6 +205,7 @@ curl -X POST http://localhost:3000/summary \
 | `BROWSER_HEADLESS_PROTECT_METRICS` | false | 为 true 时 `/metrics` 需要与 API 相同的 `X-Api-Key`。`/healthz` 仍开放。 |
 | `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` 或 `json`（k8s 友好结构化日志）。 |
 | `BROWSER_HEADLESS_ASYNC_JOBS` | true | 启用 `POST /jobs` + `GET /jobs/{id}`。设 `false` 隐藏路由。 |
+| `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` 本机池；`redis` 与 worker 共用 Stream；`auto` 有 `REDIS_URL` 则 redis 否则 local。 |
 | `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | 进程内异步任务结果 TTL。 |
 | `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | 异步任务并发/保留上限（先清理过期项）。 |
 | `screenshot` | bool | false | 截图（PNG）写入 `stat.screenshot`。 |
@@ -815,7 +816,9 @@ curl -X POST http://localhost:3000/summary/batch \
 
 ### `POST /jobs` · `GET /jobs/{id}`
 
-进程内异步抓取（默认开启；`BROWSER_HEADLESS_ASYNC_JOBS=false` 关闭）。请求体与 `POST /summary` 相同；服务立即返回 `{ "id", "status": "queued" }`，客户端轮询 `GET /jobs/{id}` 直到 `done` / `error`。结果在 `BROWSER_HEADLESS_JOB_TTL_SECS`（默认 1h）后过期。多机队列请用 Worker 模式。
+异步抓取（默认开启；`BROWSER_HEADLESS_ASYNC_JOBS=false` 关闭）。请求体与 `POST /summary` 相同；服务立即返回 `{ "id", "status": "queued" }`，客户端轮询 `GET /jobs/{id}` 直到 `done` / `error`。
+
+**后端**（`BROWSER_HEADLESS_JOBS_BACKEND`）：`local` 本机池内执行；`redis` 写入与 Worker 相同的 Redis Stream（`XADD`），由 `MODE=worker`/`all` 消费并写 `result:{id}`；`auto`（默认）在配置了 `BROWSER_HEADLESS_REDIS_URL` 时用 Redis，否则 local。多机扩容请用 Redis 后端 + 多个 worker。
 
 ### `GET /openapi.json`
 

@@ -1,0 +1,428 @@
+//! Shared Redis Streams job queue — producer side used by HTTP `POST /jobs`
+//! when the jobs backend is Redis, consumer side remains in [`crate::worker`].
+//!
+//! Wire format matches the worker:
+//! * Enqueue: `XADD` stream field `payload` = JSON
+//!   `{ "id": "…", "url": "…", …SummaryQuery… }`
+//! * Result key: `<result_prefix><id>` TTL'd JSON
+//!   `{ "id", "status": <http u16>, "data"?, "error"? }` on completion;
+//!   intermediate enqueue marker `{ "id", "phase": "queued" }`.
+
+use std::time::Duration;
+
+use redis::aio::{ConnectionLike, MultiplexedConnection};
+use redis::cluster::{ClusterClient, ClusterClientBuilder};
+use redis::cluster_async::ClusterConnection;
+use redis::{
+    AsyncCommands, AsyncConnectionConfig, ClientTlsConfig, Cmd, ErrorKind, Pipeline, RedisFuture,
+    RedisResult, TlsCertificates, Value,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::capture::SummaryQuery;
+use crate::config::{self, env_bool, env_opt, env_string, env_u64};
+use crate::error::CaptureError;
+use crate::jobs::{JobStatus, JobView};
+
+/// How HTTP `/jobs` is backed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JobsBackendKind {
+    /// In-process spawn (default when Redis is not configured).
+    Local,
+    /// XADD to the worker stream; GET result keys from Redis.
+    Redis,
+}
+
+impl JobsBackendKind {
+    /// `BROWSER_HEADLESS_JOBS_BACKEND`:
+    /// * `local` — always in-process
+    /// * `redis` — always Redis (fails submit if Redis unreachable)
+    /// * `auto` (default) — Redis when `BROWSER_HEADLESS_REDIS_URL` is set,
+    ///   otherwise local
+    pub(crate) fn from_env() -> Self {
+        match env_string("BROWSER_HEADLESS_JOBS_BACKEND", "auto")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "local" => JobsBackendKind::Local,
+            "redis" => JobsBackendKind::Redis,
+            _ => {
+                if std::env::var("BROWSER_HEADLESS_REDIS_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+                {
+                    JobsBackendKind::Redis
+                } else {
+                    JobsBackendKind::Local
+                }
+            }
+        }
+    }
+}
+
+/// Redis connection settings shared with the worker (same env vars).
+#[derive(Clone)]
+pub(crate) struct QueueConfig {
+    pub redis_url: String,
+    pub cluster: bool,
+    pub ca_cert_path: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    pub stream: String,
+    pub result_prefix: String,
+    pub result_ttl_secs: u64,
+    pub connect_timeout_ms: u64,
+}
+
+impl QueueConfig {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            redis_url: env_string("BROWSER_HEADLESS_REDIS_URL", "redis://127.0.0.1:6379"),
+            cluster: env_bool("BROWSER_HEADLESS_REDIS_CLUSTER", false),
+            ca_cert_path: env_opt("BROWSER_HEADLESS_REDIS_CA_CERT"),
+            client_cert_path: env_opt("BROWSER_HEADLESS_REDIS_CLIENT_CERT"),
+            client_key_path: env_opt("BROWSER_HEADLESS_REDIS_CLIENT_KEY"),
+            stream: env_string("BROWSER_HEADLESS_JOBS_STREAM", "browser_headless:jobs"),
+            result_prefix: env_string("BROWSER_HEADLESS_RESULT_PREFIX", "browser_headless:result:"),
+            result_ttl_secs: env_u64("BROWSER_HEADLESS_RESULT_TTL_SECS", 3600).max(1),
+            connect_timeout_ms: env_u64("BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS", 5000).max(1),
+        }
+    }
+
+    fn result_key(&self, id: &str) -> String {
+        format!("{}{id}", self.result_prefix)
+    }
+}
+
+/// Stored result shape (worker + HTTP enqueue marker).
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct StoredJobResult {
+    pub id: String,
+    /// Present on intermediate enqueue markers (`queued` / `running`).
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// HTTP status on terminal results (worker always writes this).
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl StoredJobResult {
+    pub(crate) fn into_job_view(self, age_ms: u64) -> JobView {
+        let (status, http_status) = match (
+            self.phase.as_deref(),
+            self.status,
+            self.data.is_some(),
+            self.error.is_some(),
+        ) {
+            (Some("queued"), _, _, _) => (JobStatus::Queued, None),
+            (Some("running"), _, _, _) => (JobStatus::Running, None),
+            (_, Some(s), true, _) if s < 400 => (JobStatus::Done, Some(s)),
+            (_, Some(s), _, true) => (JobStatus::Error, Some(s)),
+            (_, Some(s), _, _) if s >= 400 => (JobStatus::Error, Some(s)),
+            (_, Some(s), _, _) => (JobStatus::Done, Some(s)),
+            (Some("done"), _, _, _) => (JobStatus::Done, self.status),
+            (Some("error"), _, _, _) => (JobStatus::Error, self.status),
+            _ if self.error.is_some() => (JobStatus::Error, self.status.or(Some(500))),
+            _ if self.data.is_some() => (JobStatus::Done, self.status.or(Some(200))),
+            _ => (JobStatus::Queued, None),
+        };
+        JobView {
+            id: self.id,
+            status,
+            http_status,
+            data: self.data,
+            error: self.error,
+            age_ms,
+        }
+    }
+}
+
+enum Backend {
+    Single(redis::Client),
+    Cluster(ClusterClient),
+}
+
+impl Backend {
+    fn from_cfg(cfg: &QueueConfig) -> RedisResult<Self> {
+        let certs = build_tls_certificates(cfg)?;
+        if cfg.cluster {
+            let seeds: Vec<String> = cfg
+                .redis_url
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let mut builder = ClusterClientBuilder::new(seeds)
+                .connection_timeout(Duration::from_millis(cfg.connect_timeout_ms))
+                .response_timeout(Duration::from_millis(cfg.connect_timeout_ms + 5_000));
+            if let Some(certs) = certs {
+                builder = builder.certs(certs);
+            }
+            Ok(Backend::Cluster(builder.build()?))
+        } else {
+            match certs {
+                Some(certs) => Ok(Backend::Single(redis::Client::build_with_tls(
+                    cfg.redis_url.clone(),
+                    certs,
+                )?)),
+                None => Ok(Backend::Single(redis::Client::open(cfg.redis_url.clone())?)),
+            }
+        }
+    }
+}
+
+fn read_pem(path: &str) -> RedisResult<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| redis::RedisError::from((ErrorKind::Io, "read cert file", e.to_string())))
+}
+
+fn build_tls_certificates(cfg: &QueueConfig) -> RedisResult<Option<TlsCertificates>> {
+    if cfg.ca_cert_path.is_none() && cfg.client_cert_path.is_none() && cfg.client_key_path.is_none()
+    {
+        return Ok(None);
+    }
+    let root_cert = cfg.ca_cert_path.as_deref().map(read_pem).transpose()?;
+    let client_tls = match (&cfg.client_cert_path, &cfg.client_key_path) {
+        (Some(cert), Some(key)) => Some(ClientTlsConfig {
+            client_cert: read_pem(cert)?,
+            client_key: read_pem(key)?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(redis::RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "incomplete mTLS config",
+                "set BOTH BROWSER_HEADLESS_REDIS_CLIENT_CERT and \
+                 BROWSER_HEADLESS_REDIS_CLIENT_KEY (or neither)"
+                    .to_string(),
+            )));
+        }
+    };
+    Ok(Some(TlsCertificates {
+        client_tls,
+        root_cert,
+    }))
+}
+
+/// Thin async connection enum (single-node or cluster).
+#[derive(Clone)]
+enum Conn {
+    Single(MultiplexedConnection),
+    Cluster(ClusterConnection),
+}
+
+impl ConnectionLike for Conn {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        match self {
+            Conn::Single(c) => c.req_packed_command(cmd),
+            Conn::Cluster(c) => c.req_packed_command(cmd),
+        }
+    }
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        match self {
+            Conn::Single(c) => c.req_packed_commands(cmd, offset, count),
+            Conn::Cluster(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+    fn get_db(&self) -> i64 {
+        match self {
+            Conn::Single(c) => c.get_db(),
+            Conn::Cluster(c) => c.get_db(),
+        }
+    }
+}
+
+async fn connect(backend: &Backend, cfg: &QueueConfig) -> RedisResult<Conn> {
+    let timeout = Duration::from_millis(cfg.connect_timeout_ms);
+    match backend {
+        Backend::Single(c) => {
+            let conn_cfg = AsyncConnectionConfig::new()
+                .set_connection_timeout(Some(timeout))
+                .set_response_timeout(Some(timeout));
+            let conn = c
+                .get_multiplexed_async_connection_with_config(&conn_cfg)
+                .await?;
+            Ok(Conn::Single(conn))
+        }
+        Backend::Cluster(c) => Ok(Conn::Cluster(c.get_async_connection().await?)),
+    }
+}
+
+/// Producer handle for HTTP job enqueue / result lookup.
+#[derive(Clone)]
+pub(crate) struct QueueClient {
+    backend: std::sync::Arc<Backend>,
+    cfg: QueueConfig,
+}
+
+impl QueueClient {
+    pub(crate) async fn connect() -> Result<Self, CaptureError> {
+        let cfg = QueueConfig::from_env();
+        let backend = Backend::from_cfg(&cfg)
+            .map_err(|e| CaptureError::service_unavailable(format!("redis config invalid: {e}")))?;
+        // Prove connectivity once at startup.
+        let mut conn = connect(&backend, &cfg)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
+        let _: String = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis PING failed: {e}")))?;
+        tracing::info!(
+            stream = %cfg.stream,
+            result_prefix = %cfg.result_prefix,
+            "HTTP jobs backend: redis stream (shared with workers)"
+        );
+        Ok(Self {
+            backend: std::sync::Arc::new(backend),
+            cfg,
+        })
+    }
+
+    /// Enqueue a job; returns the job id.
+    pub(crate) async fn enqueue(&self, mut query: SummaryQuery) -> Result<String, CaptureError> {
+        let id = query
+            .request_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // Ensure the payload carries the same id the result key uses.
+        query.request_id = Some(id.clone());
+
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            id: &'a str,
+            #[serde(flatten)]
+            query: SummaryQuery,
+        }
+        let payload = serde_json::to_string(&Payload { id: &id, query })
+            .map_err(|e| CaptureError::internal(format!("job serialize: {e}")))?;
+
+        let mut conn = connect(&self.backend, &self.cfg)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
+
+        // Marker so GET /jobs/:id returns queued before a worker finishes.
+        let marker = serde_json::json!({ "id": id, "phase": "queued" }).to_string();
+        let key = self.cfg.result_key(&id);
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        pipe.cmd("XADD")
+            .arg(&self.cfg.stream)
+            .arg("*")
+            .arg("payload")
+            .arg(&payload)
+            .ignore();
+        pipe.set_ex(&key, &marker, self.cfg.result_ttl_secs)
+            .ignore();
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis enqueue failed: {e}")))?;
+
+        Ok(id)
+    }
+
+    pub(crate) async fn get(&self, id: &str) -> Result<Option<JobView>, CaptureError> {
+        let mut conn = connect(&self.backend, &self.cfg)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
+        let key = self.cfg.result_key(id);
+        let raw: Option<String> = conn
+            .get(&key)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis GET failed: {e}")))?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let stored: StoredJobResult = serde_json::from_str(&raw)
+            .map_err(|e| CaptureError::internal(format!("job result decode: {e}")))?;
+        // age_ms not tracked in Redis — use 0 (unknown) or TTL remaining not
+        // worth a second round-trip for the common poll path.
+        Ok(Some(stored.into_job_view(0)))
+    }
+}
+
+/// Resolve jobs backend at startup; `None` means async jobs disabled.
+pub(crate) async fn init_jobs_backend() -> Option<crate::jobs::JobsBackend> {
+    if !config::async_jobs_enabled() {
+        return None;
+    }
+    match JobsBackendKind::from_env() {
+        JobsBackendKind::Local => {
+            let store = crate::jobs::JobStore::new();
+            store.clone().spawn_sweeper(Duration::from_secs(60));
+            tracing::info!("HTTP jobs backend: local (in-process)");
+            Some(crate::jobs::JobsBackend::Local(store))
+        }
+        JobsBackendKind::Redis => match QueueClient::connect().await {
+            Ok(client) => Some(crate::jobs::JobsBackend::Redis(client)),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "JOBS_BACKEND=redis but Redis is unavailable; falling back to local jobs"
+                );
+                let store = crate::jobs::JobStore::new();
+                store.clone().spawn_sweeper(Duration::from_secs(60));
+                Some(crate::jobs::JobsBackend::Local(store))
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_job_queued_phase() {
+        let v = StoredJobResult {
+            id: "a".into(),
+            phase: Some("queued".into()),
+            status: None,
+            data: None,
+            error: None,
+        }
+        .into_job_view(1);
+        assert_eq!(v.status, JobStatus::Queued);
+    }
+
+    #[test]
+    fn stored_job_worker_ok() {
+        let v = StoredJobResult {
+            id: "a".into(),
+            phase: None,
+            status: Some(200),
+            data: Some(serde_json::json!({"x": 1})),
+            error: None,
+        }
+        .into_job_view(0);
+        assert_eq!(v.status, JobStatus::Done);
+        assert_eq!(v.http_status, Some(200));
+    }
+
+    #[test]
+    fn stored_job_worker_err() {
+        let v = StoredJobResult {
+            id: "a".into(),
+            phase: None,
+            status: Some(502),
+            data: None,
+            error: Some("upstream".into()),
+        }
+        .into_job_view(0);
+        assert_eq!(v.status, JobStatus::Error);
+        assert_eq!(v.http_status, Some(502));
+    }
+}

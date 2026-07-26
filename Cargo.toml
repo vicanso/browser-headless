@@ -29,3 +29,10 @@ redis = { version = "1.4.1", features = ["tokio-comp", "streams", "tokio-rustls-
 # so we enable + install `ring` ourselves (see main.rs). `ring` avoids the
 # cmake/C build deps that `aws-lc-rs` needs.
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+[dev-dependencies]
+# Used by tests/e2e_chrome.rs (ignored by default; CI smoke job enables it).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
+serde_json = "1.0.151"
+tower = { version = "0.5", features = ["util"] }

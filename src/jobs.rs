@@ -1,9 +1,10 @@
-//! In-process async job store for `POST /jobs` + `GET /jobs/:id`.
+//! Async job store for `POST /jobs` + `GET /jobs/:id`.
 //!
-//! Captures that would otherwise hold an HTTP connection for the full page
-//! load can be submitted as a job; the client polls (or the worker Redis path
-//! can still be used for multi-node). Results expire after
-//! [`config::job_ttl`]. Bounded by [`config::max_async_jobs`].
+//! Two backends (selected by `BROWSER_HEADLESS_JOBS_BACKEND`):
+//! * **Local** — in-process spawn on the shared browser pool (default when
+//!   Redis is not configured).
+//! * **Redis** — `XADD` to the same stream workers consume, poll
+//!   `result:{id}` keys (horizontal scale with `MODE=worker`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
 use crate::config;
 use crate::error::CaptureError;
+use crate::queue::QueueClient;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,7 +38,8 @@ pub(crate) struct JobView {
     pub(crate) data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
-    /// Age of the job in milliseconds (from submit).
+    /// Age of the job in milliseconds (from submit). Redis backend may
+    /// report `0` when age is not tracked server-side.
     pub(crate) age_ms: u64,
 }
 
@@ -46,7 +49,6 @@ struct JobRecord {
     data: Option<serde_json::Value>,
     error: Option<String>,
     created: Instant,
-    /// When the result becomes eligible for eviction.
     expires: Instant,
 }
 
@@ -61,8 +63,6 @@ impl JobStore {
         Self::default()
     }
 
-    /// Submit a capture job. Returns the job id, or an error if the map is
-    /// full (after a best-effort purge of expired entries).
     pub(crate) async fn submit(
         &self,
         ctx: CaptureCtx,
@@ -118,7 +118,6 @@ impl JobStore {
         let Some(rec) = map.get_mut(&id) else {
             return;
         };
-        // Extend TTL from completion so a slow poller still has a window.
         rec.expires = Instant::now() + config::job_ttl();
         match result {
             Ok(Captured::Content(c)) => match serde_json::to_value(c) {
@@ -173,7 +172,6 @@ impl JobStore {
         map.retain(|_, rec| rec.expires > now);
     }
 
-    /// Background sweeper — drops expired jobs every `interval`.
     pub(crate) fn spawn_sweeper(self, interval: Duration) {
         tokio::spawn(async move {
             loop {
@@ -181,5 +179,36 @@ impl JobStore {
                 self.purge_expired().await;
             }
         });
+    }
+}
+
+/// Unified jobs backend for the HTTP layer.
+#[derive(Clone)]
+pub(crate) enum JobsBackend {
+    Local(JobStore),
+    Redis(QueueClient),
+}
+
+impl JobsBackend {
+    pub(crate) async fn submit(
+        &self,
+        ctx: CaptureCtx,
+        query: SummaryQuery,
+    ) -> Result<String, CaptureError> {
+        match self {
+            JobsBackend::Local(store) => store.submit(ctx, query).await,
+            // Redis path: workers own the pool; HTTP only enqueues.
+            JobsBackend::Redis(q) => {
+                let _ = ctx; // pool unused for enqueue
+                q.enqueue(query).await
+            }
+        }
+    }
+
+    pub(crate) async fn get(&self, id: &str) -> Result<Option<JobView>, CaptureError> {
+        match self {
+            JobsBackend::Local(store) => Ok(store.get(id).await),
+            JobsBackend::Redis(q) => q.get(id).await,
+        }
     }
 }

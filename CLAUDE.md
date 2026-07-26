@@ -109,8 +109,15 @@ capture engine is reusable outside HTTP:
   resource summary, font/image audits, TLS inventory) live here.
 - **`error.rs`** — transport-neutral `CaptureError` (no axum). HTTP maps to
   status codes; worker writes `status_u16` into Redis results.
-- **`jobs.rs`** — in-process async job store for `POST /jobs` + `GET /jobs/:id`.
+- **`jobs.rs`** — async job store for `POST /jobs` + `GET /jobs/:id` (local
+  in-process or Redis-backed via `queue.rs`).
+- **`queue.rs`** — Redis Streams producer + result reader shared with
+  `worker` (same stream / `result:{id}` keys). Selected by
+  `BROWSER_HEADLESS_JOBS_BACKEND` (`local` / `redis` / `auto`).
 - **`rate_limit.rs`** — optional token-bucket for capture routes.
+- **Resource free-early** — when the caller does not need `resources[]` /
+  HAR / image_sizing / security_scan, collect builds `resource_summary` then
+  drops the detailed list before the format stage.
 
 **Request flow:** `http` handler → `capture::capture_one(&ctx, q)` →
 `pool.checkout()` → `browser::capture(&browser, ua, req)` → `WebPageStat` →

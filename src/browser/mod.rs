@@ -4740,6 +4740,14 @@ pub struct CollectCaptures {
     /// (`access-control-allow-origin` / `-credentials`). Only the
     /// `security_scan` CORS-misconfig derive consumes them.
     pub cors_headers: bool,
+    /// Keep the full `resources[]` vector after collect. When false (the
+    /// common case: caller only wants `resource_summary` aggregates), the
+    /// summary is derived at the end of collect and the detailed array is
+    /// freed immediately — so the format stage and response serialisation
+    /// never hold multi-MB resource inventories. Forced on for consumers
+    /// that need the list (`resources` / `har` / `image_sizing` /
+    /// `security_scan` CORS).
+    pub retain_resources: bool,
 }
 
 /// Lean collect path for `content_only`: navigate + wait gates, track only
@@ -5535,7 +5543,7 @@ pub async fn collect_summary(
         );
     }
     let total_size: u64 = resources.values().map(|r| r.content_size).sum();
-    let resources_vec: Vec<WebPageResource> = resources.into_values().collect();
+    let mut resources_vec: Vec<WebPageResource> = resources.into_values().collect();
     let resource_count = resources_vec.len() as u64;
 
     // Bucketed exceptions: count desc, ties broken by name asc, top 10.
@@ -5563,6 +5571,7 @@ pub async fn collect_summary(
     // buckets. Status 0 happens for the "request canceled before response"
     // edge case — we leave those to `network_failures` since CDP would
     // have fired `loadingFailed` for them. Only built when feature is on.
+    // Must run BEFORE we drop `resources_vec` for the free-early path.
     let http_errors = if captures.http_errors {
         let mut failed_4xx: Vec<FailedRequest> = Vec::new();
         let mut failed_5xx: Vec<FailedRequest> = Vec::new();
@@ -5597,6 +5606,16 @@ pub async fn collect_summary(
     } else {
         None
     };
+
+    // Derive resource_summary while we still hold the detailed list, then
+    // free the list when the caller doesn't need it (retain_resources=false).
+    // Format stage + response serialisation then never hold multi-MB
+    // inventories for summary-only captures.
+    let early_resource_summary = build_resource_summary(&resources_vec, url);
+    if !captures.retain_resources {
+        resources_vec.clear();
+        resources_vec.shrink_to_fit();
+    }
 
     let security_audit = build_security_audit(security_headers.as_ref(), &cookies);
 
@@ -5727,7 +5746,7 @@ pub async fn collect_summary(
         dom_snapshot: None,
         web_vitals: None,
         metrics: None,
-        resource_summary: ResourceSummary::default(),
+        resource_summary: early_resource_summary,
         metadata: None,
         render_blocking_resources: None,
         security_headers,
@@ -5771,7 +5790,7 @@ pub(crate) fn is_real_resource(url: &str) -> bool {
 
 /// Format the `data` field is populated in. Owned by browser module so the
 /// HTTP layer doesn't have to know about htmd or DOM walkers.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DataFormat {
     #[default]
@@ -5788,7 +5807,7 @@ pub enum DataFormat {
 /// `"short_max_age"`, etc.), and machine-readable strings stay English
 /// regardless of `lang`, so downstream code that branches on those
 /// values keeps working across languages.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
     #[default]
@@ -6115,6 +6134,11 @@ pub async fn capture(
             // which content-only mode skips.
             resource_headers: !req.content_only,
             cors_headers: req.security_scan,
+            // Keep the full list only when a later stage needs it. Otherwise
+            // collect builds resource_summary and drops the array so format
+            // never holds multi-MB inventories (边收边聚合 / free-early).
+            retain_resources: !req.content_only
+                && (req.resources || req.har || req.image_sizing || req.security_scan),
         },
     )
     .await?;
@@ -6405,10 +6429,12 @@ pub async fn capture(
         stat.har = Some(build_har(&stat, &req.url));
     }
 
-    // Free derive from already-collected `resources` — computed for every
-    // normal request. Skipped in `content_only` mode: the lean response
-    // never serialises `resource_summary`, so there's nothing to build.
-    if !req.content_only {
+    // Resource summary is built at the end of collect (and the detailed
+    // list may already have been freed when retain_resources=false). Only
+    // rebuild here when the list is still present — e.g. after Phase B
+    // consumers mutated nothing but we kept the array for HAR / image /
+    // CORS. content_only leaves the default empty summary.
+    if !req.content_only && !stat.resources.is_empty() {
         stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
     }
 
@@ -6423,13 +6449,14 @@ pub async fn capture(
         ));
     }
 
-    // Drop the detailed array unless explicitly requested. `resource_count`
-    // and `total_size` (scalars) plus `resource_summary` (aggregates) are
-    // preserved for functional-validation use. Must happen AFTER every
-    // downstream consumer (HAR build, image_sizing enrichment,
-    // resource_summary derive) has run.
+    // Drop the detailed array unless explicitly requested. Collect may
+    // already have cleared it when retain_resources=false; this also
+    // covers the retain=true path where HAR/image/CORS needed the list
+    // but the caller didn't ask for `resources` in the response.
+    // `resource_count` / `total_size` / `resource_summary` stay.
     if !req.resources {
         stat.resources.clear();
+        stat.resources.shrink_to_fit();
     }
 
     record_stage("format", t_format);

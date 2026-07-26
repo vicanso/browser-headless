@@ -22,7 +22,7 @@ use crate::capture::{
 };
 use crate::config::{self, max_batch_urls};
 use crate::error::CaptureError;
-use crate::jobs::{JobStore, JobView};
+use crate::jobs::{JobView, JobsBackend};
 use crate::rate_limit::RateLimiter;
 
 #[derive(Clone)]
@@ -36,8 +36,9 @@ pub(crate) struct AppState {
     pub(crate) metrics_handle: PrometheusHandle,
     /// Process-wide rate limiter (may be a no-op when RPS is 0).
     pub(crate) rate_limiter: Arc<RateLimiter>,
-    /// In-process async job store for `POST /jobs`.
-    pub(crate) jobs: JobStore,
+    /// Async job backend for `POST /jobs` (local in-process or Redis stream).
+    /// `None` when `BROWSER_HEADLESS_ASYNC_JOBS=false`.
+    pub(crate) jobs: Option<JobsBackend>,
 }
 
 /// State for the probe/metrics routes — the pool (for readiness) plus the
@@ -86,7 +87,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/summary/batch", post(summary_batch_handler))
         .route("/openapi.json", get(openapi_json));
 
-    if config::async_jobs_enabled() {
+    // Routes always registered when the backend is Some (init in main).
+    if state.jobs.is_some() {
         r = r
             .route("/jobs", post(jobs_submit))
             .route("/jobs/{id}", get(jobs_get));
@@ -291,7 +293,11 @@ async fn jobs_submit(
     if q.url.is_empty() {
         return Err(CaptureError::bad_request("`url` must not be empty"));
     }
-    let id = state.jobs.submit(state.ctx.clone(), q).await?;
+    let jobs = state
+        .jobs
+        .as_ref()
+        .ok_or_else(|| CaptureError::service_unavailable("async jobs disabled"))?;
+    let id = jobs.submit(state.ctx.clone(), q).await?;
     Ok(Json(serde_json::json!({ "id": id, "status": "queued" })))
 }
 
@@ -302,10 +308,12 @@ async fn jobs_get(
     Path(id): Path<String>,
 ) -> Result<Json<JobView>, CaptureError> {
     check_auth(&state, &headers)?;
-    state
+    let jobs = state
         .jobs
-        .get(&id)
-        .await
+        .as_ref()
+        .ok_or_else(|| CaptureError::service_unavailable("async jobs disabled"))?;
+    jobs.get(&id)
+        .await?
         .map(Json)
         .ok_or_else(|| CaptureError::not_found(format!("job `{id}` not found or expired")))
 }
@@ -460,5 +468,53 @@ async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, Cap
             )
                 .into_response(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[test]
+    fn openapi_document_is_valid_json() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("openapi.json")).expect("openapi.json parses");
+        assert!(v["paths"]["/summary"].is_object());
+        assert!(v["paths"]["/jobs"].is_object());
+        assert_eq!(v["openapi"], "3.0.3");
+    }
+
+    #[test]
+    fn capture_error_maps_status_codes() {
+        use axum::response::IntoResponse;
+        let resp = CaptureError::too_many_requests("slow down").into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let resp = CaptureError::forbidden("blocked").into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Router-level integration without a real browser pool: only the static
+    /// `/openapi.json` route is exercised (no CDP).
+    #[tokio::test]
+    async fn openapi_route_serves_json() {
+        let app = Router::new().route("/openapi.json", get(openapi_json));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["paths"]["/healthz"].is_object());
     }
 }
