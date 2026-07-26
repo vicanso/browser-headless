@@ -30,6 +30,7 @@ use chromiumoxide::Browser;
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
 
 use crate::browser;
+use crate::config::{env_u64, env_usize};
 
 const M_POOL_SIZE: &str = "browser_headless_pool_size";
 const M_ACTIVE_INSTANCES: &str = "browser_headless_pool_active_instances";
@@ -81,20 +82,6 @@ impl PoolConfig {
             ),
         }
     }
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
 }
 
 /// Routing state for one instance. Only `Active` instances receive new

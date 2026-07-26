@@ -36,6 +36,7 @@ use tokio::sync::watch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
+use crate::config::{env_bool, env_opt, env_string, env_u64};
 
 const M_WORKER_JOBS: &str = "browser_headless_worker_jobs_total";
 const M_WORKER_JOB_DURATION: &str = "browser_headless_worker_job_duration_seconds";
@@ -141,31 +142,6 @@ impl WorkerConfig {
             drain_ms: env_u64("BROWSER_HEADLESS_WORKER_DRAIN_MS", 30_000).max(1),
         }
     }
-}
-
-fn env_string(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(default)
-}
-
-fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Mask credentials in a Redis URL (or comma-separated cluster seed list) for
@@ -837,8 +813,8 @@ async fn capture_to_result(
                 return JobResult::ok(id, serde_json::to_value(content));
             }
             Ok(Captured::Full(stat)) => return JobResult::ok(id, serde_json::to_value(stat)),
-            Err((code, msg)) => {
-                let status = code.as_u16();
+            Err(e) => {
+                let status = e.status_u16();
                 if is_retryable(status) && attempt < cfg.job_max_retries {
                     attempt += 1;
                     metrics::counter!(M_WORKER_RETRIES).increment(1);
@@ -852,7 +828,7 @@ async fn capture_to_result(
                     tokio::time::sleep(Duration::from_millis(cfg.job_retry_backoff_ms)).await;
                     continue;
                 }
-                return JobResult::err(id, status, msg);
+                return JobResult::err(id, status, e.message);
             }
         }
     }

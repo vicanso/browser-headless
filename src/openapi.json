@@ -1,0 +1,172 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "browser-headless",
+    "version": "0.1.1",
+    "description": "Headless-Chrome HTTP service. Full parameter tables live in README.md; this document lists the public routes and the most important request fields."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Liveness probe",
+        "responses": { "200": { "description": "ok" } }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Readiness probe (CDP Browser.getVersion)",
+        "responses": {
+          "200": { "description": "browser ready" },
+          "503": { "description": "pool unavailable" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus exposition",
+        "responses": { "200": { "description": "text/plain exposition" } }
+      }
+    },
+    "/summary": {
+      "get": {
+        "summary": "Capture a page (query params)",
+        "parameters": [
+          { "name": "url", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "timeout_ms", "in": "query", "schema": { "type": "integer", "default": 30000 } },
+          { "name": "content_only", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "profile", "in": "query", "schema": { "type": "string", "enum": ["content", "scrape", "audit", "lighthouse"] } },
+          { "name": "data_format", "in": "query", "schema": { "type": "string", "enum": ["html", "text", "markdown"] } },
+          { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["json", "markdown"] } },
+          { "name": "all_metrics", "in": "query", "schema": { "type": "boolean" } }
+        ],
+        "responses": {
+          "200": { "description": "WebPageStat JSON, markdown, or content-only object" },
+          "400": { "description": "bad request" },
+          "401": { "description": "missing/invalid API key" },
+          "403": { "description": "SSRF blocked" },
+          "429": { "description": "rate limited" },
+          "503": { "description": "pool saturated" },
+          "504": { "description": "deadline exceeded" }
+        }
+      },
+      "post": {
+        "summary": "Capture a page (JSON body)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SummaryQuery" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "capture result" }
+        }
+      }
+    },
+    "/summary/batch": {
+      "post": {
+        "summary": "Capture many URLs concurrently",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["urls"],
+                "properties": {
+                  "urls": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "per-URL results array" }
+        }
+      }
+    },
+    "/jobs": {
+      "post": {
+        "summary": "Enqueue an async capture (poll GET /jobs/{id})",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SummaryQuery" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "queued job id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "status": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": {
+        "summary": "Poll async job status/result",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "job view" },
+          "404": { "description": "unknown or expired job" }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This OpenAPI document",
+        "responses": { "200": { "description": "OpenAPI 3 JSON" } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "SummaryQuery": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string" },
+          "timeout_ms": { "type": "integer" },
+          "content_only": { "type": "boolean" },
+          "profile": {
+            "type": "string",
+            "enum": ["content", "scrape", "audit", "lighthouse"],
+            "description": "Named flag preset (OR-merged with individual flags)"
+          },
+          "data_format": { "type": "string", "enum": ["html", "text", "markdown"] },
+          "format": { "type": "string", "enum": ["json", "markdown"] },
+          "all_metrics": { "type": "boolean" },
+          "screenshot": { "type": "boolean" },
+          "pdf": { "type": "boolean" },
+          "har": { "type": "boolean" },
+          "wait_until_load": { "type": "boolean" },
+          "script": { "type": "string" },
+          "cookie": { "type": "string" },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      }
+    },
+    "securitySchemes": {
+      "ApiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key"
+      }
+    }
+  }
+}

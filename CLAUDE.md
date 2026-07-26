@@ -98,13 +98,19 @@ capture engine is reusable outside HTTP:
   `watch` shutdown signal to both serve + worker, and `all` mode awaits the
   worker after the HTTP server drains. Never imports `http` — the health/metrics
   listener is wired up in `main.rs`; horizontal scaling = more worker processes.
-- **`browser.rs`** — the CDP engine (~9k lines; the bulk of the codebase).
-  `launch()` starts a Chromium and returns `(Browser, default_ua,
-  disconnect_rx, UserDataDir)`; `capture()` runs the full pipeline
-  (apply overrides → collect lifecycle/network/exceptions → wait gates →
-  extract data → optional PDF/HAR/snapshot) and returns a `WebPageStat`. Every
-  analytical feature (web vitals, security scan, resource summary, font/image
-  audits, TLS inventory) lives here.
+- **`browser/`** — the CDP engine (bulk of the codebase). Split into
+  `mod.rs` (launch / apply / collect / capture), `security.rs` (CSP/HSTS/CORS
+  pure functions), and `markdown.rs` (`WebPageStat::to_markdown`). `launch()`
+  starts a Chromium and returns `(Browser, default_ua, disconnect_rx,
+  UserDataDir)`; `capture()` runs the full pipeline (apply overrides →
+  collect lifecycle/network/exceptions → wait gates → extract data → optional
+  PDF/HAR/snapshot). `content_only` uses a lean collect path that skips the
+  full resource inventory. Analytical features (web vitals, security scan,
+  resource summary, font/image audits, TLS inventory) live here.
+- **`error.rs`** — transport-neutral `CaptureError` (no axum). HTTP maps to
+  status codes; worker writes `status_u16` into Redis results.
+- **`jobs.rs`** — in-process async job store for `POST /jobs` + `GET /jobs/:id`.
+- **`rate_limit.rs`** — optional token-bucket for capture routes.
 
 **Request flow:** `http` handler → `capture::capture_one(&ctx, q)` →
 `pool.checkout()` → `browser::capture(&browser, ua, req)` → `WebPageStat` →
@@ -140,10 +146,11 @@ rendered as JSON / markdown / compact content object.
 - **Per-capture metering is inside `capture_one`** (requests_total / duration /
   in-flight), so single `/summary` and each `/summary/batch` item are metered
   identically. Don't re-record in the HTTP wrapper.
-- **The capture error type is `(StatusCode, String)`** end to end — transport-
-  neutral, reused as the per-item status in batch results. `SummaryQuery.url` is
-  `#[serde(default)]` so `BatchQuery` can `#[serde(flatten)]` the shared params
-  without a top-level url.
+- **The capture error type is `CaptureError`** end to end — transport-neutral
+  (no axum), with `status_u16()` for HTTP/worker mapping. Reused as the
+  per-item status in batch results. `SummaryQuery.url` is `#[serde(default)]`
+  so `BatchQuery` can `#[serde(flatten)]` the shared params without a
+  top-level url.
 - **The JSON envelope is never translated.** `lang` only affects
   `WebPageStat::to_markdown(lang)` prose; all field names / enum tag values stay
   English so downstream code that branches on them keeps working.

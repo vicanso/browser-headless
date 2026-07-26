@@ -119,6 +119,15 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   request (shared param template), scheduling concurrency across the pool
   and returning a per-URL result array (one bad URL never fails the batch).
   Ideal for "AI-validate a batch of pages".
+- **Named profiles** — `profile=content|scrape|audit|lighthouse` expands to
+  common flag sets (OR-merged with explicit flags). `content` is a true
+  lean path (no full resource inventory).
+- **Async jobs** — `POST /jobs` + `GET /jobs/{id}` run captures without
+  holding the HTTP connection (in-process store, TTL'd).
+- **OpenAPI** — `GET /openapi.json` for the public route surface.
+- **Admission controls** — max `timeout_ms` / `settle_ms`, request body
+  size limit, optional RPS rate limit, optional script disable and
+  required API key for multi-tenant deploys.
 
 ---
 
@@ -182,6 +191,8 @@ network layer if the operational data is sensitive. Exposes:
 | `browser_headless_worker_retries_total` | counter | — | transient capture failures (408/502/503/504) retried before a terminal result |
 | `browser_headless_worker_stream_length` | gauge | — | jobs stream length (`XLEN`) at last sample |
 | `browser_headless_worker_pending` | gauge | — | pending (delivered, unacked) entries for the consumer group at last sample |
+| `browser_headless_checkout_wait_seconds` | histogram | — | time spent waiting for a free browser-pool slot |
+| `browser_headless_stage_duration_seconds` | histogram | `stage` (`apply`/`collect`/`capture`/`format`) | per-capture pipeline stage latency |
 
 `in_flight` riding at the `pool_size × pages_per_instance` ceiling means
 requests are queueing on the concurrency semaphores (and, past
@@ -236,7 +247,8 @@ curl -X POST http://localhost:3000/summary \
 | `security_scan` | bool | false | Deep client-side security scan into `stat.security_scan`: **SRI coverage** on cross-origin `<script>`/`<link>` (missing-`integrity` supply-chain risks), **`target=_blank`** links with an explicit `rel=opener` (high-severity reverse-tabnabbing; bare missing-`noopener` is not flagged since modern browsers imply it), **form security** (cleartext `action` / password fields on non-HTTPS pages), **JS library + version fingerprint** (jQuery / React / Vue / Angular / …, cross-reference against CVE ranges offline), and passively-detected **CORS** `Access-Control-Allow-Origin: *`-with-credentials misconfigurations. One extra `page.evaluate` DOM walk (~2–5ms) plus a pure server-side CORS derive. OR-merged with `all_metrics`. Distinct from the always-on `security_audit` (header/cookie config scorecard). |
 | `cookies` | bool | false | Report the page's cookie jar at snapshot time into `stat.cookies` (`Page.getCookies`, one CDP round-trip). Distinct from the `cookie` INPUT param (cookies SET on the request) — this one READS the jar after the page ran, e.g. for session-continuation flows. When off, `stat.cookies` is empty and its JSON/markdown sections are absent. OR-merged with `all_metrics`. |
 | `all_metrics` | bool | false | Convenience master switch that turns ON every **analytical** flag in one shot: `web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan` / `cookies`. Designed for AI-comparison / regression-audit workflows where you want everything analysable. **Does NOT enable binary captures** (`screenshot` / `pdf` / `har` / `save_dom_snapshot`) or `coverage` — both have real per-request cost so they stay on explicit opt-in. OR-merged with individual flags, so anything already `true` stays `true`. |
-| `content_only` | bool | false | Lean **content-only** mode — "just give me the page content". The body is returned in the caller's chosen `data_format` (`html` default / `text` / `markdown`); this flag does **not** force markdown — pick the format via `data_format`. Suppresses every analytical flag + `all_metrics` + binary captures (`screenshot`/`pdf`/`har`/`save_dom_snapshot`) + `coverage`, and skips the `resource_summary` derive. Returns a compact JSON object `{ status, final_url, char_count, data }` (the `format`/`lang` params are ignored) — `status` + a non-trivial `char_count` (and `final_url` not landing somewhere unexpected) doubles as a cheap render-correctness check without shipping the full `WebPageStat`. JS still runs, so SPA content is captured; a blank/skeleton page shows up as a near-empty `data`. |
+| `content_only` | bool | false | Lean **content-only** mode — "just give me the page content". The body is returned in the caller's chosen `data_format` (`html` default / `text` / `markdown`); this flag does **not** force markdown — pick the format via `data_format`. Suppresses every analytical flag + `all_metrics` + binary captures (`screenshot`/`pdf`/`har`/`save_dom_snapshot`) + `coverage`, and skips the `resource_summary` derive. Uses a **lean collect path** (no full resource inventory / TLS inventory / exception streams — only Document status + final URL). Returns a compact JSON object `{ status, final_url, char_count, data }` (the `format`/`lang` params are ignored) — `status` + a non-trivial `char_count` (and `final_url` not landing somewhere unexpected) doubles as a cheap render-correctness check without shipping the full `WebPageStat`. JS still runs, so SPA content is captured; a blank/skeleton page shows up as a near-empty `data`. |
+| `profile` | string | — | Named flag preset, OR-merged with individual flags: `content` (`content_only` + `wait_until_load`), `scrape` (`content` + `disable_javascript`), `audit` (`all_metrics`), `lighthouse` (`all_metrics` + `coverage`). |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | Format of `stat.data` field. |
 | `format` | `json`\|`markdown` | `json` | Response envelope. `markdown` renders the whole `WebPageStat` for LLM use. |
 | `lang` | `en`\|`zh` | `en` | Language for the **markdown rendering** (section headings, prose, warning labels). The JSON envelope is **never** translated — all field names, enum tag values (`missing_immutable`, `short_max_age`, etc.), and machine-readable strings stay English so downstream code that branches on them keeps working across languages. Ignored when `format=json`. |
@@ -839,6 +851,30 @@ Max URLs per request: `BROWSER_HEADLESS_MAX_BATCH_URLS` (default 100); an
 empty `urls` or over-limit list returns 400. This is the efficient shape for
 "AI-validate a batch of pages": one request, server-scheduled concurrency.
 
+### `POST /jobs` · `GET /jobs/{id}`
+
+In-process async captures (enabled by default; disable with
+`BROWSER_HEADLESS_ASYNC_JOBS=false`). Same body as `POST /summary`; the
+server returns `{ "id", "status": "queued" }` immediately and you poll
+`GET /jobs/{id}` until `status` is `done` or `error`. Results expire after
+`BROWSER_HEADLESS_JOB_TTL_SECS` (default 1h). For multi-node queues use
+[Worker mode](#worker-mode-redis-queue) instead.
+
+```bash
+curl -X POST http://localhost:3000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","profile":"content"}'
+# → {"id":"…","status":"queued"}
+
+curl http://localhost:3000/jobs/<id>
+# → {"id":"…","status":"done","http_status":200,"data":{…},"age_ms":1234}
+```
+
+### `GET /openapi.json`
+
+OpenAPI 3 document for the public routes (full parameter tables remain in
+this README).
+
 ---
 
 ## Configuration
@@ -859,6 +895,18 @@ empty `urls` or over-limit list returns 400. This is the efficient shape for
 | `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` | 30000 | Per-request default for `timeout_ms` (the soft page-wait budget) when the caller omits it. Ignored if empty / non-numeric / `0`. The hard cap stays `timeout_ms + buffer` (buffer default 10s). Per-call `?timeout_ms=` still overrides this. |
 | `BROWSER_HEADLESS_REQUEST_TIMEOUT_MS` | `max(default_timeout + 30s, 120000)` | chromiumoxide's per-navigation CDP command-chain timeout (raised from its 30s default so a large `timeout_ms` isn't capped at the navigation layer). **Caveat:** chromiumoxide 0.9 hardcodes the timeout for *discrete* `page.execute` calls to 30s regardless of this — but page-load waiting uses our own event loop bounded by `timeout_ms`, so slow loads honour `timeout_ms` independently. |
 | `BROWSER_HEADLESS_DEADLINE_BUFFER_MS` | 10000 | Headroom added on top of `timeout_ms` to form the hard request deadline (`total = timeout_ms + buffer`), covering chromium overhead outside the page-wait budget (context create / page open / dispose). `0` allowed (no headroom). On hard-deadline fire the request returns `504`. |
+| `BROWSER_HEADLESS_MAX_TIMEOUT_MS` | 120000 | Hard ceiling for per-request `timeout_ms` (clamped with a warning). `0` disables the clamp. |
+| `BROWSER_HEADLESS_MAX_SETTLE_MS` | 30000 | Hard ceiling for `settle_ms`. `0` disables. |
+| `BROWSER_HEADLESS_MAX_BODY_BYTES` | 2097152 (2 MiB) | Max POST body size for `/summary` and `/summary/batch`. |
+| `BROWSER_HEADLESS_RATE_LIMIT_RPS` | 0 (off) | Process-wide token-bucket rate limit for capture/job routes. Health probes are not limited. |
+| `BROWSER_HEADLESS_RATE_LIMIT_BURST` | max(rps, 1) | Burst capacity when rate limiting is on. |
+| `BROWSER_HEADLESS_DISABLE_SCRIPT` | false | When true, reject requests that include a `script` param (403). Multi-tenant hardening. |
+| `BROWSER_HEADLESS_REQUIRE_API_KEY` | false | When true, refuse to start serve/all without `BROWSER_HEADLESS_API_KEY`. |
+| `BROWSER_HEADLESS_PROTECT_METRICS` | false | When true, `/metrics` requires the same `X-Api-Key` as the API. `/healthz` stays open. |
+| `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` or `json` (structured logs for k8s). |
+| `BROWSER_HEADLESS_ASYNC_JOBS` | true | Enable `POST /jobs` + `GET /jobs/{id}`. Set `false` to hide the routes. |
+| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | TTL for in-process async job results. |
+| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | Cap on concurrent/retained async jobs (purge expired first). |
 | `CHROME` | (auto-detect) | Path to the Chrome / Chromium binary. The provided Dockerfile sets `/usr/bin/chromium`. |
 | `RUST_LOG` | `info,chromiumoxide::conn=off,chromiumoxide::handler=off` | Standard `tracing_subscriber` filter. Set `browser_headless=debug` to see per-stage timings. |
 

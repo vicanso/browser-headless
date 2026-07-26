@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use axum::{
     Json, Router,
-    extract::{FromRef, State},
+    extract::{DefaultBodyLimit, FromRef, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,7 +20,10 @@ use tracing::Instrument;
 use crate::capture::{
     self, BatchQuery, BatchResponse, CaptureCtx, Captured, ResponseFormat, SummaryQuery,
 };
-use crate::config::max_batch_urls;
+use crate::config::{self, max_batch_urls};
+use crate::error::CaptureError;
+use crate::jobs::{JobStore, JobView};
+use crate::rate_limit::RateLimiter;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -31,6 +34,10 @@ pub(crate) struct AppState {
     pub(crate) api_key: Option<Arc<String>>,
     /// Prometheus exposition handle; `render()` produces the `/metrics` body.
     pub(crate) metrics_handle: PrometheusHandle,
+    /// Process-wide rate limiter (may be a no-op when RPS is 0).
+    pub(crate) rate_limiter: Arc<RateLimiter>,
+    /// In-process async job store for `POST /jobs`.
+    pub(crate) jobs: JobStore,
 }
 
 /// State for the probe/metrics routes — the pool (for readiness) plus the
@@ -42,6 +49,9 @@ pub(crate) struct AppState {
 pub(crate) struct HealthState {
     pub(crate) ctx: CaptureCtx,
     pub(crate) metrics_handle: PrometheusHandle,
+    /// When set and `protect_metrics` is on, metrics require this key.
+    pub(crate) api_key: Option<Arc<String>>,
+    pub(crate) protect_metrics: bool,
 }
 
 impl FromRef<AppState> for HealthState {
@@ -49,19 +59,40 @@ impl FromRef<AppState> for HealthState {
         HealthState {
             ctx: app.ctx.clone(),
             metrics_handle: app.metrics_handle.clone(),
+            api_key: app.api_key.clone(),
+            protect_metrics: config::protect_metrics(),
         }
+    }
+}
+
+/// Map a transport-neutral capture error to an axum response.
+impl IntoResponse for CaptureError {
+    fn into_response(self) -> Response {
+        let status =
+            StatusCode::from_u16(self.status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, self.message).into_response()
     }
 }
 
 /// Build the axum router with all routes wired to `state`. The probe/metrics
 /// handlers take `State<HealthState>`, extracted from `AppState` via `FromRef`.
 pub(crate) fn router(state: AppState) -> Router {
-    Router::new()
+    let body_limit = config::max_body_bytes();
+    let mut r = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_endpoint))
         .route("/summary", get(summary_handler).post(summary_handler_post))
         .route("/summary/batch", post(summary_batch_handler))
+        .route("/openapi.json", get(openapi_json));
+
+    if config::async_jobs_enabled() {
+        r = r
+            .route("/jobs", post(jobs_submit))
+            .route("/jobs/{id}", get(jobs_get));
+    }
+
+    r.layer(DefaultBodyLimit::max(body_limit))
         // gzip/br/zstd response compression, negotiated per request via
         // Accept-Encoding. The capture payloads are large text (HTML /
         // markdown / WebPageStat JSON) that typically compresses 5-10×;
@@ -73,7 +104,11 @@ pub(crate) fn router(state: AppState) -> Router {
 /// Health-only router for worker mode: `/healthz`, `/readyz`, `/metrics` and
 /// nothing else (no `/summary*`, no API-key auth). serve / all modes use
 /// [`router`], which serves these same probes alongside the capture API.
-pub(crate) fn health_router(ctx: CaptureCtx, metrics_handle: PrometheusHandle) -> Router {
+pub(crate) fn health_router(
+    ctx: CaptureCtx,
+    metrics_handle: PrometheusHandle,
+    api_key: Option<Arc<String>>,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -84,6 +119,8 @@ pub(crate) fn health_router(ctx: CaptureCtx, metrics_handle: PrometheusHandle) -
         .with_state(HealthState {
             ctx,
             metrics_handle,
+            api_key,
+            protect_metrics: config::protect_metrics(),
         })
 }
 
@@ -125,6 +162,16 @@ pub(crate) fn init_metrics() -> PrometheusHandle {
         "browser_headless_recycles_total",
         "Voluntary instance recycles, labelled by reason (age / count)"
     );
+    describe_histogram!(
+        "browser_headless_checkout_wait_seconds",
+        Unit::Seconds,
+        "Time spent waiting for a free browser-pool slot"
+    );
+    describe_histogram!(
+        "browser_headless_stage_duration_seconds",
+        Unit::Seconds,
+        "Per-capture stage duration (apply / collect / capture / format)"
+    );
     handle
 }
 
@@ -135,31 +182,34 @@ async fn healthz() -> &'static str {
 }
 
 /// Prometheus scrape endpoint. Open (no `X-Api-Key`) like the health probes,
-/// so an in-cluster Prometheus can scrape it without sharing the API key;
-/// restrict at the network layer if the operational metrics are sensitive.
-async fn metrics_endpoint(State(state): State<HealthState>) -> Response {
+/// unless `BROWSER_HEADLESS_PROTECT_METRICS` is set — then the same API key
+/// is required. Health probes stay open so k8s liveness keeps working.
+async fn metrics_endpoint(
+    State(state): State<HealthState>,
+    headers: HeaderMap,
+) -> Result<Response, CaptureError> {
+    if state.protect_metrics {
+        check_api_key(state.api_key.as_ref(), &headers)?;
+    }
     use axum::http::header::CONTENT_TYPE;
-    (
+    Ok((
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         state.metrics_handle.render(),
     )
-        .into_response()
+        .into_response())
 }
 
 /// Readiness probe — sends `Browser.getVersion` over CDP to confirm an active
 /// pool instance is reachable. Returns 503 when no instance is active (all
 /// crashed / recycling) or the CDP socket is broken.
-async fn readyz(State(state): State<HealthState>) -> Result<&'static str, (StatusCode, String)> {
-    let browser = state.ctx.pool.any_active_browser().await.ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "no active browser instance (pool recycling/respawning)".to_string(),
-    ))?;
-    browser.version().await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("browser CDP unreachable: {e}"),
-        )
+async fn readyz(State(state): State<HealthState>) -> Result<&'static str, CaptureError> {
+    let browser = state.ctx.pool.any_active_browser().await.ok_or_else(|| {
+        CaptureError::service_unavailable("no active browser instance (pool recycling/respawning)")
     })?;
+    browser
+        .version()
+        .await
+        .map_err(|e| CaptureError::service_unavailable(format!("browser CDP unreachable: {e}")))?;
     Ok("ok")
 }
 
@@ -168,8 +218,9 @@ async fn summary_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<SummaryQuery>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, CaptureError> {
     check_auth(&state, &headers)?;
+    check_rate(&state)?;
     let request_id = resolve_request_id(q.request_id.as_deref(), &headers);
     summary(state, q, request_id).await
 }
@@ -181,8 +232,9 @@ async fn summary_handler_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(q): Json<SummaryQuery>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, CaptureError> {
     check_auth(&state, &headers)?;
+    check_rate(&state)?;
     let request_id = resolve_request_id(q.request_id.as_deref(), &headers);
     summary(state, q, request_id).await
 }
@@ -197,20 +249,18 @@ async fn summary_batch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(batch): Json<BatchQuery>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, CaptureError> {
     check_auth(&state, &headers)?;
+    check_rate(&state)?;
     if batch.urls.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "`urls` must not be empty".to_string(),
-        ));
+        return Err(CaptureError::bad_request("`urls` must not be empty"));
     }
     let max = max_batch_urls();
     if batch.urls.len() > max {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("too many urls ({}, max {max})", batch.urls.len()),
-        ));
+        return Err(CaptureError::bad_request(format!(
+            "too many urls ({}, max {max})",
+            batch.urls.len()
+        )));
     }
 
     let started = Instant::now();
@@ -230,24 +280,76 @@ async fn summary_batch_handler(
     .into_response())
 }
 
-/// Shared-secret API key check. No-op when `state.api_key` is `None`
-/// (auth disabled). When enabled, compares the `X-Api-Key` header against
-/// the configured key in **constant time** (`subtle::ConstantTimeEq`), so a
-/// correct prefix can't be recovered byte-by-byte from response-timing
-/// differences. (Length still short-circuits, so use a fixed-length,
-/// high-entropy key — 32+ random bytes.)
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+/// POST `/jobs` — enqueue an async capture; returns `{ id }` immediately.
+async fn jobs_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(q): Json<SummaryQuery>,
+) -> Result<Json<serde_json::Value>, CaptureError> {
+    check_auth(&state, &headers)?;
+    check_rate(&state)?;
+    if q.url.is_empty() {
+        return Err(CaptureError::bad_request("`url` must not be empty"));
+    }
+    let id = state.jobs.submit(state.ctx.clone(), q).await?;
+    Ok(Json(serde_json::json!({ "id": id, "status": "queued" })))
+}
+
+/// GET `/jobs/:id` — poll an async job result.
+async fn jobs_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<JobView>, CaptureError> {
+    check_auth(&state, &headers)?;
+    state
+        .jobs
+        .get(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| CaptureError::not_found(format!("job `{id}` not found or expired")))
+}
+
+/// Minimal OpenAPI 3 document for the public surface (not a full schema of
+/// every `WebPageStat` field — that lives in the README).
+async fn openapi_json() -> Response {
+    let body = include_str!("openapi.json");
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+fn check_rate(state: &AppState) -> Result<(), CaptureError> {
+    if state.rate_limiter.try_acquire() {
+        Ok(())
+    } else {
+        Err(CaptureError::too_many_requests(
+            "rate limit exceeded; retry shortly",
+        ))
+    }
+}
+
+fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), CaptureError> {
+    check_api_key(state.api_key.as_ref(), headers)
+}
+
+/// Shared-secret API key check. No-op when `api_key` is `None` (auth disabled).
+/// When enabled, compares the `X-Api-Key` header against the configured key in
+/// **constant time** (`subtle::ConstantTimeEq`).
+fn check_api_key(api_key: Option<&Arc<String>>, headers: &HeaderMap) -> Result<(), CaptureError> {
     use subtle::ConstantTimeEq;
-    let Some(required) = &state.api_key else {
+    let Some(required) = api_key else {
         return Ok(());
     };
     match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         Some(provided) if bool::from(provided.as_bytes().ct_eq(required.as_bytes())) => Ok(()),
-        Some(_) => Err((StatusCode::UNAUTHORIZED, "invalid X-Api-Key".to_string())),
-        None => Err((
-            StatusCode::UNAUTHORIZED,
-            "missing X-Api-Key header".to_string(),
-        )),
+        Some(_) => Err(CaptureError::unauthorized("invalid X-Api-Key")),
+        None => Err(CaptureError::unauthorized("missing X-Api-Key header")),
     }
 }
 
@@ -274,7 +376,7 @@ async fn summary(
     state: AppState,
     q: SummaryQuery,
     request_id: String,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, CaptureError> {
     let span = tracing::info_span!(
         "summary",
         request_id = %request_id,
@@ -312,10 +414,10 @@ async fn summary(
                 disable_cache,
                 "request complete"
             ),
-            Err((code, msg)) => tracing::warn!(
+            Err(e) => tracing::warn!(
                 duration_ms,
-                status = code.as_u16(),
-                error = %msg,
+                status = e.status_u16(),
+                error = %e.message,
                 data_format = ?data_format,
                 response_format = ?response_format,
                 timeout_ms,
@@ -339,7 +441,10 @@ async fn summary(
 /// Render the HTTP envelope from a capture: the compact content object for
 /// `content_only`, otherwise the full snapshot as JSON or markdown per
 /// `format` / `lang`.
-async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, (StatusCode, String)> {
+async fn summary_inner(state: AppState, q: SummaryQuery) -> Result<Response, CaptureError> {
+    if q.url.is_empty() {
+        return Err(CaptureError::bad_request("`url` must not be empty"));
+    }
     let format = q.format;
     let lang = q.lang;
     match capture::capture_one(&state.ctx, q).await? {

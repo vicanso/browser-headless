@@ -99,6 +99,10 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
 - **批量端点** —— `POST /summary/batch` 一次请求抓 N 个 URL（共享参数模板），
   在池上统一排并发，返回逐 URL 的结果数组（单个坏 URL 不会让整批失败）。
   正适合「AI 批量判断一堆页面是否正常」。
+- **命名 profile** —— `profile=content|scrape|audit|lighthouse` 展开为常用 flag 组合（与显式 flag OR 合并）。`content` 走真正的 lean 采集路径。
+- **异步任务** —— `POST /jobs` + `GET /jobs/{id}` 无需长连接持有（进程内存储，带 TTL）。
+- **OpenAPI** —— `GET /openapi.json` 提供公共路由面。
+- **准入控制** —— `timeout_ms`/`settle_ms` 上限、请求体大小限制、可选 RPS 限流、可选禁用 script / 强制 API key（多租户）。
 
 ---
 
@@ -158,6 +162,8 @@ Prometheus 文本格式指标。与健康探针一样开放、无需 `X-Api-Key`
 | `browser_headless_worker_retries_total` | counter | — | 写终态结果前重试的瞬时失败（408/502/503/504）次数 |
 | `browser_headless_worker_stream_length` | gauge | — | 上次采样时任务 stream 的长度（`XLEN`） |
 | `browser_headless_worker_pending` | gauge | — | 上次采样时该 consumer group 的 pending（已投递未 ack）条目数 |
+| `browser_headless_checkout_wait_seconds` | histogram | — | 等待空闲浏览器池槽位的时间 |
+| `browser_headless_stage_duration_seconds` | histogram | `stage` (`apply`/`collect`/`capture`/`format`) | 各抓取阶段耗时 |
 
 `in_flight` 长期顶在 `pool_size × pages_per_instance` 上限 = 请求在并发
 semaphore 上排队（超过 `BROWSER_HEADLESS_CHECKOUT_WAIT_MS` 后会以 503 丢弃）；
@@ -189,6 +195,18 @@ curl -X POST http://localhost:3000/summary \
 |---|---|---|---|
 | `url` | string | — | **必填**。目标 URL（仅 http/https）。 |
 | `timeout_ms` | u64 | 30000 | 内部等待的软上限。整体硬上限 = `timeout_ms + buffer`（buffer 默认 10s，见 `BROWSER_HEADLESS_DEADLINE_BUFFER_MS`）。30000 这个默认值本身可经 `BROWSER_HEADLESS_DEFAULT_TIMEOUT_MS` 覆盖。 |
+| `BROWSER_HEADLESS_MAX_TIMEOUT_MS` | 120000 | 单请求 `timeout_ms` 硬上限（超出 clamp 并打 warn）。`0` 关闭。 |
+| `BROWSER_HEADLESS_MAX_SETTLE_MS` | 30000 | `settle_ms` 硬上限。`0` 关闭。 |
+| `BROWSER_HEADLESS_MAX_BODY_BYTES` | 2097152 (2 MiB) | POST `/summary` 与 `/summary/batch` 请求体上限。 |
+| `BROWSER_HEADLESS_RATE_LIMIT_RPS` | 0（关） | 进程级 token-bucket 限流（仅 capture/job 路由；health 不受限）。 |
+| `BROWSER_HEADLESS_RATE_LIMIT_BURST` | max(rps, 1) | 限流开启时的突发容量。 |
+| `BROWSER_HEADLESS_DISABLE_SCRIPT` | false | 为 true 时拒绝带 `script` 参数的请求（403）。多租户加固。 |
+| `BROWSER_HEADLESS_REQUIRE_API_KEY` | false | 为 true 时 serve/all 启动必须配置 `BROWSER_HEADLESS_API_KEY`。 |
+| `BROWSER_HEADLESS_PROTECT_METRICS` | false | 为 true 时 `/metrics` 需要与 API 相同的 `X-Api-Key`。`/healthz` 仍开放。 |
+| `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` 或 `json`（k8s 友好结构化日志）。 |
+| `BROWSER_HEADLESS_ASYNC_JOBS` | true | 启用 `POST /jobs` + `GET /jobs/{id}`。设 `false` 隐藏路由。 |
+| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | 进程内异步任务结果 TTL。 |
+| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | 异步任务并发/保留上限（先清理过期项）。 |
 | `screenshot` | bool | false | 截图（PNG）写入 `stat.screenshot`。 |
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |
@@ -211,6 +229,7 @@ curl -X POST http://localhost:3000/summary \
 | `cookies` | bool | false | 快照时读取页面的 cookie jar，写入 `stat.cookies`（`Page.getCookies`，一次 CDP 往返）。与 `cookie` **输入**参数（往请求上设置 cookie）不同 —— 这个是在页面运行后**读取** jar，例如会话续期场景。关闭时 `stat.cookies` 为空，JSON/markdown 中对应段落不出现。与 `all_metrics` OR 合并。 |
 | `all_metrics` | bool | false | 总开关，一次性启用所有 **分析类** flag：`web_vitals` / `metrics` / `metadata` / `render_blocking` / `service_worker` / `initiators` / `console_messages` / `image_sizing` / `dom_mutations` / `resources` / `http_errors` / `resource_hints` / `font_audit` / `security_scan` / `cookies`。专为 AI 比对 / 回归审计场景设计，避免长查询串。**不会**自动启用大体积二进制（`screenshot` / `pdf` / `har` / `save_dom_snapshot`）或 `coverage` —— 两者都有真实的每次请求开销，保持显式 opt-in。与单 flag 是 OR 合并，已经为 `true` 的不变。 |
 | `content_only` | bool | false | 精简的**只取内容**模式 —— "我只想拿页面内容"。正文按调用方选择的 `data_format` 返回（默认 `html` / `text` / `markdown`）；此 flag **不会**强制 markdown —— 需要哪种格式由 `data_format` 决定。抑制所有分析类 flag + `all_metrics` + 二进制采集（`screenshot`/`pdf`/`har`/`save_dom_snapshot`）+ `coverage`，并跳过 `resource_summary` 派生。返回一个紧凑 JSON 对象 `{ status, final_url, char_count, data }`（忽略 `format`/`lang` 参数）—— `status` + 非平凡的 `char_count`（外加 `final_url` 没有跳到意外位置）顺带就是一个廉价的"是否正确渲染"检查，无需返回完整 `WebPageStat`。JS 仍会执行，所以 SPA 内容可被捕获；空白/骨架页会表现为接近空的 `data`。 |
+| `profile` | string | — | 命名 flag 预设，与单独 flag OR 合并：`content`（`content_only` + `wait_until_load`）、`scrape`（content + `disable_javascript`）、`audit`（`all_metrics`）、`lighthouse`（`all_metrics` + `coverage`）。 |
 | `data_format` | `html`\|`markdown`\|`text` | `html` | `stat.data` 字段的格式。 |
 | `format` | `json`\|`markdown` | `json` | 响应封装格式。`markdown` 把整个 `WebPageStat` 渲染成 LLM 可读的文档。 |
 | `lang` | `en`\|`zh` | `en` | **markdown 渲染**的语言（section 标题、说明文字、警告标签）。JSON 封装**绝不**翻译 —— 字段名、enum 标签值（`missing_immutable` / `short_max_age` 等）以及其它机器可读字符串始终保持英文，让下游基于这些值做分支的代码跨语言依然能工作。`format=json` 时该参数被忽略。 |
@@ -792,6 +811,15 @@ curl -X POST http://localhost:3000/summary/batch \
 这正是「AI 批量判断一堆页面是否正常」的高效形态：一次请求、服务端统一排并发。
 
 ---
+
+
+### `POST /jobs` · `GET /jobs/{id}`
+
+进程内异步抓取（默认开启；`BROWSER_HEADLESS_ASYNC_JOBS=false` 关闭）。请求体与 `POST /summary` 相同；服务立即返回 `{ "id", "status": "queued" }`，客户端轮询 `GET /jobs/{id}` 直到 `done` / `error`。结果在 `BROWSER_HEADLESS_JOB_TTL_SECS`（默认 1h）后过期。多机队列请用 Worker 模式。
+
+### `GET /openapi.json`
+
+公共路由的 OpenAPI 3 文档（完整参数表仍以本 README 为准）。
 
 ## 配置
 

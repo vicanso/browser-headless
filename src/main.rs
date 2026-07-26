@@ -1,28 +1,41 @@
 mod browser;
 mod capture;
 mod config;
+mod error;
 mod http;
+mod jobs;
 mod pool;
+mod rate_limit;
 mod ssrf;
 mod worker;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::capture::CaptureCtx;
+use crate::config::LogFormat;
 use crate::http::AppState;
+use crate::jobs::JobStore;
+use crate::rate_limit::RateLimiter;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,chromiumoxide::conn=off,chromiumoxide::handler=off".into()
-            }),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,chromiumoxide::conn=off,chromiumoxide::handler=off".into());
+    match config::log_format() {
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        LogFormat::Text => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
 
     // Redis TLS (`rediss://` / custom certs in worker mode) goes through rustls
     // 0.23, which needs a process-wide crypto provider chosen explicitly before
@@ -115,10 +128,15 @@ async fn run_serve() {
 async fn run_worker() {
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
+    let api_key = std::env::var("BROWSER_HEADLESS_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
     tokio::spawn(serve_health(
         ctx.clone(),
         metrics_handle,
         config::health_port(),
+        api_key,
     ));
     worker::run(ctx, install_shutdown()).await;
 }
@@ -154,19 +172,39 @@ async fn serve_http(
         .map(Arc::new);
     if api_key.is_some() {
         tracing::info!("API key auth enabled (X-Api-Key header required)");
+    } else if config::require_api_key() {
+        panic!(
+            "BROWSER_HEADLESS_REQUIRE_API_KEY is set but BROWSER_HEADLESS_API_KEY is empty — refusing to start open"
+        );
     } else {
         tracing::warn!("API key auth disabled — /summary is open to anyone");
+    }
+    if config::disable_script() {
+        tracing::info!("script parameter disabled (BROWSER_HEADLESS_DISABLE_SCRIPT)");
+    }
+    if config::protect_metrics() {
+        tracing::info!("/metrics requires X-Api-Key (BROWSER_HEADLESS_PROTECT_METRICS)");
+    }
+
+    let jobs = JobStore::new();
+    if config::async_jobs_enabled() {
+        jobs.clone().spawn_sweeper(Duration::from_secs(60));
+        tracing::info!("async job API enabled at POST /jobs + GET /jobs/:id");
     }
 
     let state = AppState {
         ctx,
         api_key,
         metrics_handle,
+        rate_limiter: Arc::new(RateLimiter::from_env()),
+        jobs,
     };
 
     let addr = "0.0.0.0:3000";
     let listener = TcpListener::bind(addr).await.expect("failed to bind");
     tracing::info!(
+        max_timeout_ms = config::max_timeout_ms(),
+        max_body_bytes = config::max_body_bytes(),
         "listening on {addr} with {} worker threads",
         num_cpus::get()
     );
@@ -214,12 +252,19 @@ async fn shutdown_future(mut shutdown: watch::Receiver<bool>) {
 /// `/metrics`) on `0.0.0.0:port`. A bind failure is logged but NON-fatal — the
 /// worker keeps consuming jobs; only the probes/metrics go dark. Spawned as a
 /// background task by `run_worker`.
-async fn serve_health(ctx: CaptureCtx, metrics_handle: PrometheusHandle, port: u16) {
+async fn serve_health(
+    ctx: CaptureCtx,
+    metrics_handle: PrometheusHandle,
+    port: u16,
+    api_key: Option<Arc<String>>,
+) {
     let addr = format!("0.0.0.0:{port}");
     match TcpListener::bind(&addr).await {
         Ok(listener) => {
             tracing::info!("worker health/metrics listening on {addr}");
-            if let Err(e) = axum::serve(listener, http::health_router(ctx, metrics_handle)).await {
+            if let Err(e) =
+                axum::serve(listener, http::health_router(ctx, metrics_handle, api_key)).await
+            {
                 tracing::error!(error = %e, "worker health server error");
             }
         }

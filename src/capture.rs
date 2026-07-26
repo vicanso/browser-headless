@@ -2,21 +2,24 @@
 //!
 //! Holds the request params (`SummaryQuery`), the single + batch capture
 //! engine, the result shapes, and URL/SSRF validation. It depends only on
-//! `browser`, `pool`, and `config` — **no axum** — so the same engine can be
-//! driven by the HTTP layer ([`crate::http`]) or, later, a queue worker.
-//! [`capture_one`] is the unit of work both paths share.
+//! `browser`, `pool`, `config`, and [`crate::error`] — **no axum** — so the
+//! same engine can be driven by the HTTP layer ([`crate::http`]) or the queue
+//! worker. [`capture_one`] is the unit of work both paths share.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::http::StatusCode;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::browser;
-use crate::config::{checkout_wait_ms, deadline_buffer_ms, default_timeout_ms};
+use crate::config::{
+    self, checkout_wait_ms, clamp_settle_ms, clamp_timeout_ms, deadline_buffer_ms,
+    default_timeout_ms,
+};
+use crate::error::{self, CaptureError};
 use crate::pool::BrowserPool;
 use crate::ssrf;
 
@@ -407,6 +410,27 @@ pub(crate) struct SummaryQuery {
     /// `format=json`.
     #[serde(default)]
     pub(crate) lang: browser::Lang,
+
+    /// Named flag preset applied **before** individual flags (OR-merged, so
+    /// an explicit `true` still wins). See [`CaptureProfile`].
+    /// Backwards-compatible: absent / unknown → no preset.
+    #[serde(default)]
+    pub(crate) profile: Option<CaptureProfile>,
+}
+
+/// Named capture presets. Each expands to a set of analytical / content
+/// flags so callers don't have to remember long query strings.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CaptureProfile {
+    /// Lean content fetch: `content_only=true`, `wait_until_load=true`.
+    Content,
+    /// Static scrape: `content_only` + `disable_javascript` + `wait_until_load`.
+    Scrape,
+    /// Full analytical suite (same OR-mask as `all_metrics=true`), no binaries.
+    Audit,
+    /// Audit + explicit `coverage` (instrumentation cost).
+    Lighthouse,
 }
 
 /// RAII guard for the in-flight gauge: increments on construction, decrements
@@ -442,13 +466,13 @@ pub(crate) enum Captured {
 pub(crate) async fn capture_one(
     ctx: &CaptureCtx,
     q: SummaryQuery,
-) -> Result<Captured, (StatusCode, String)> {
+) -> Result<Captured, CaptureError> {
     let _in_flight = InFlightGuard::new();
     let started = Instant::now();
     let result = capture_one_unmetered(ctx, q).await;
     let status = match &result {
         Ok(_) => 200u16,
-        Err((code, _)) => code.as_u16(),
+        Err(e) => e.status_u16(),
     };
     let outcome = if result.is_ok() { "ok" } else { "error" };
     metrics::counter!("browser_headless_requests_total", "status" => status.to_string())
@@ -460,8 +484,17 @@ pub(crate) async fn capture_one(
 
 async fn capture_one_unmetered(
     ctx: &CaptureCtx,
-    q: SummaryQuery,
-) -> Result<Captured, (StatusCode, String)> {
+    mut q: SummaryQuery,
+) -> Result<Captured, CaptureError> {
+    apply_profile(&mut q);
+    apply_clamps(&mut q);
+
+    if config::disable_script() && q.script.is_some() {
+        return Err(CaptureError::forbidden(
+            "script parameter disabled by BROWSER_HEADLESS_DISABLE_SCRIPT",
+        ));
+    }
+
     // Cheap validation BEFORE permit acquisition — bad URLs shouldn't burn
     // queue slots. Reject non-http(s) schemes and private/loopback hosts
     // unless the operator explicitly opted out via env var.
@@ -482,6 +515,7 @@ async fn capture_one_unmetered(
     // On timeout we shed the request with 503 so a saturated service fails
     // fast. `0` disables the bound (wait forever — original behaviour).
     let wait_ms = checkout_wait_ms();
+    let t_checkout = Instant::now();
     let checkout = {
         let acquire = ctx.pool.checkout();
         let acquired = if wait_ms == 0 {
@@ -492,19 +526,19 @@ async fn capture_one_unmetered(
         match acquired {
             Ok(Ok(checkout)) => checkout,
             Ok(Err(())) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "browser pool unavailable; retry shortly".to_string(),
+                return Err(CaptureError::service_unavailable(
+                    "browser pool unavailable; retry shortly",
                 ));
             }
             Err(_elapsed) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("browser pool saturated; no slot within {wait_ms}ms, retry shortly"),
-                ));
+                return Err(CaptureError::service_unavailable(format!(
+                    "browser pool saturated; no slot within {wait_ms}ms, retry shortly"
+                )));
             }
         }
     };
+    metrics::histogram!("browser_headless_checkout_wait_seconds")
+        .record(t_checkout.elapsed().as_secs_f64());
 
     let cookies = q
         .cookie
@@ -527,10 +561,11 @@ async fn capture_one_unmetered(
     // Kept for the lean response's `final_url` fallback (q.url is moved into
     // the request below). `document_timing.url` is preferred when present.
     let requested_url = q.url.clone();
+    let timeout_ms = q.timeout_ms;
 
     let req = browser::SummaryRequest {
         url: q.url,
-        timeout: Duration::from_millis(q.timeout_ms),
+        timeout: Duration::from_millis(timeout_ms),
         screenshot: q.screenshot && !lean,
         wait_for_request: q.wait_for_request,
         wait_until_load: q.wait_until_load,
@@ -600,24 +635,21 @@ async fn capture_one_unmetered(
     // create / page open / dispose). When this fires, the future is dropped,
     // the checkout is RAII-released, and we return 504.
     let buffer_ms = deadline_buffer_ms();
-    let total_deadline = Duration::from_millis(q.timeout_ms) + Duration::from_millis(buffer_ms);
+    let total_deadline = Duration::from_millis(timeout_ms) + Duration::from_millis(buffer_ms);
     let stat = tokio::time::timeout(
         total_deadline,
         browser::capture(checkout.browser(), checkout.default_user_agent(), req),
     )
     .await
     .map_err(|_| {
-        (
-            StatusCode::GATEWAY_TIMEOUT,
-            format!(
-                "total request deadline {}ms exceeded (timeout_ms={} + {}ms buffer)",
-                total_deadline.as_millis(),
-                q.timeout_ms,
-                buffer_ms
-            ),
-        )
+        CaptureError::gateway_timeout(format!(
+            "total request deadline {}ms exceeded (timeout_ms={} + {}ms buffer)",
+            total_deadline.as_millis(),
+            timeout_ms,
+            buffer_ms
+        ))
     })?
-    .map_err(browser_error)?;
+    .map_err(error::from_browser)?;
 
     // Content-only mode → the compact content object; otherwise the full
     // snapshot (rendering to JSON / markdown is the HTTP layer's job). `status`
@@ -639,6 +671,56 @@ async fn capture_one_unmetered(
     }
 
     Ok(Captured::Full(Box::new(stat)))
+}
+
+/// Expand a named [`CaptureProfile`] into individual flags (OR-merge).
+fn apply_profile(q: &mut SummaryQuery) {
+    let Some(profile) = q.profile else {
+        return;
+    };
+    match profile {
+        CaptureProfile::Content => {
+            q.content_only = true;
+            q.wait_until_load = true;
+        }
+        CaptureProfile::Scrape => {
+            q.content_only = true;
+            q.disable_javascript = true;
+            q.wait_until_load = true;
+        }
+        CaptureProfile::Audit => {
+            q.all_metrics = true;
+        }
+        CaptureProfile::Lighthouse => {
+            q.all_metrics = true;
+            q.coverage = true;
+        }
+    }
+}
+
+/// Clamp timeout / settle to process-wide ceilings so a single request can't
+/// occupy a pool slot for hours.
+fn apply_clamps(q: &mut SummaryQuery) {
+    let t = clamp_timeout_ms(q.timeout_ms);
+    if t != q.timeout_ms {
+        tracing::warn!(
+            requested = q.timeout_ms,
+            clamped = t,
+            "timeout_ms clamped by BROWSER_HEADLESS_MAX_TIMEOUT_MS"
+        );
+        q.timeout_ms = t;
+    }
+    if let Some(s) = q.settle_ms {
+        let c = clamp_settle_ms(s);
+        if c != s {
+            tracing::warn!(
+                requested = s,
+                clamped = c,
+                "settle_ms clamped by BROWSER_HEADLESS_MAX_SETTLE_MS"
+            );
+            q.settle_ms = Some(c);
+        }
+    }
 }
 
 /// Body for `POST /summary/batch`. `urls` are captured concurrently (bounded
@@ -722,7 +804,7 @@ pub(crate) async fn run_batch(ctx: &CaptureCtx, batch: BatchQuery) -> Vec<BatchI
                         BatchItem::success(url, serde_json::to_value(content))
                     }
                     Ok(Captured::Full(stat)) => BatchItem::success(url, serde_json::to_value(stat)),
-                    Err((code, msg)) => BatchItem::failure(url, code.as_u16(), msg),
+                    Err(e) => BatchItem::failure(url, e.status_u16(), e.message),
                 };
                 (idx, item)
             }
@@ -740,15 +822,14 @@ pub(crate) async fn run_batch(ctx: &CaptureCtx, batch: BatchQuery) -> Vec<BatchI
 
 /// Parse + scheme-restrict the incoming URL. Reject anything other than
 /// `http` / `https` (no `file:` / `chrome:` / `javascript:` / etc.).
-fn validate_url(raw: &str) -> Result<Url, (StatusCode, String)> {
+fn validate_url(raw: &str) -> Result<Url, CaptureError> {
     let url =
-        Url::parse(raw).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid URL: {e}")))?;
+        Url::parse(raw).map_err(|e| CaptureError::bad_request(format!("invalid URL: {e}")))?;
     match url.scheme() {
         "http" | "https" => Ok(url),
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            format!("scheme `{other}` not allowed; only http/https"),
-        )),
+        other => Err(CaptureError::bad_request(format!(
+            "scheme `{other}` not allowed; only http/https"
+        ))),
     }
 }
 
@@ -761,17 +842,17 @@ fn validate_url(raw: &str) -> Result<Url, (StatusCode, String)> {
 /// the same blocklist to every navigation hop (so a public URL can't 3xx-bounce
 /// into an internal host). For DNS-rebinding-grade threats, still combine with
 /// an egress firewall / proxy.
-async fn check_ssrf(url: &Url) -> Result<(), (StatusCode, String)> {
+async fn check_ssrf(url: &Url) -> Result<(), CaptureError> {
     use ssrf::SsrfError;
     ssrf::check_url(url).await.map_err(|e| match e {
-        SsrfError::NoHost | SsrfError::DnsFailed(_) => (StatusCode::BAD_REQUEST, e.to_string()),
-        SsrfError::Blocked(_) => (StatusCode::FORBIDDEN, e.to_string()),
+        SsrfError::NoHost | SsrfError::DnsFailed(_) => CaptureError::bad_request(e.to_string()),
+        SsrfError::Blocked(_) => CaptureError::forbidden(e.to_string()),
     })
 }
 
 /// Parse a standard HTTP `Cookie` header into `(name, value)` pairs.
 /// Whitespace around `;` and `=` is trimmed; entries without `=` are skipped.
-fn parse_cookie_header(header: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_cookie_header(header: &str) -> Vec<(String, String)> {
     header
         .split(';')
         .filter_map(|pair| {
@@ -785,13 +866,66 @@ fn parse_cookie_header(header: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn browser_error(e: browser::Error) -> (StatusCode, String) {
-    let status = match &e {
-        browser::Error::NotFound(_) => StatusCode::NOT_FOUND,
-        browser::Error::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
-        browser::Error::UpstreamFailure { .. } => StatusCode::BAD_GATEWAY,
-        browser::Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
-        browser::Error::Cdp(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, e.to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cookie_header_basic() {
+        let pairs = parse_cookie_header("a=1; b=two; c=");
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "two".into()),
+                ("c".into(), "".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cookie_skips_malformed() {
+        let pairs = parse_cookie_header("novalue; ok=1;;");
+        assert_eq!(pairs, vec![("ok".into(), "1".into())]);
+    }
+
+    #[test]
+    fn validate_url_rejects_file() {
+        let err = validate_url("file:///etc/passwd").unwrap_err();
+        assert_eq!(err.status_u16(), 400);
+    }
+
+    #[test]
+    fn validate_url_accepts_https() {
+        assert!(validate_url("https://example.com/path").is_ok());
+    }
+
+    #[test]
+    fn apply_profile_content() {
+        let mut q = SummaryQuery {
+            url: "https://x".into(),
+            profile: Some(CaptureProfile::Content),
+            ..empty_query()
+        };
+        apply_profile(&mut q);
+        assert!(q.content_only);
+        assert!(q.wait_until_load);
+    }
+
+    #[test]
+    fn apply_profile_lighthouse_enables_coverage() {
+        let mut q = SummaryQuery {
+            url: "https://x".into(),
+            profile: Some(CaptureProfile::Lighthouse),
+            ..empty_query()
+        };
+        apply_profile(&mut q);
+        assert!(q.all_metrics);
+        assert!(q.coverage);
+    }
+
+    fn empty_query() -> SummaryQuery {
+        // Deserialize empty JSON so defaults match the HTTP path.
+        serde_json::from_value(serde_json::json!({})).expect("defaults")
+    }
 }
