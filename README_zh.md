@@ -155,6 +155,8 @@ Prometheus 文本格式指标。与健康探针一样开放、无需 `X-Api-Key`
 | `browser_headless_pool_active_instances` | gauge | — | 当前 `Active`（未在排空 / 重启）的实例数 |
 | `browser_headless_browser_respawns_total` | counter | — | 崩溃实例被重启的次数 |
 | `browser_headless_recycles_total` | counter | `reason`（`age`/`count`） | 主动回收实例的次数 |
+| `browser_headless_async_jobs_total` | counter | `outcome`（`ok`/`error`） | local 后端处理的异步任务数（`POST /jobs`） |
+| `browser_headless_async_job_duration_seconds` | histogram | — | local 异步任务耗时（排队等待 + 抓取） |
 | `browser_headless_worker_jobs_total` | counter | `outcome`（`ok`/`error`） | worker 处理的任务数（worker / all 模式） |
 | `browser_headless_worker_job_duration_seconds` | histogram | — | 单任务 worker 处理耗时（capture + 写结果） |
 | `browser_headless_worker_jobs_in_flight` | gauge | — | 当前正在运行的 worker capture 数 |
@@ -208,6 +210,8 @@ curl -X POST http://localhost:3000/summary \
 | `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` 本机池；`redis` 与 worker 共用 Stream —— Redis 连不上时**拒绝启动**（不再静默降级为 local）；`auto` 有 `REDIS_URL` 则 redis 否则 local。job id 一律服务端生成 UUID（`request_id` 只是关联字段，不作为 id）。 |
 | `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | **local** 后端的任务结果 TTL（Redis 后端用 `BROWSER_HEADLESS_RESULT_TTL_SECS`）；同时是排队中的 local 任务等待 pool 槽位的上限。 |
 | `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | local 异步任务的**在途**（排队+运行中）上限。已完成的结果不计入——保留结果占满时驱逐最老的已完成项腾位。 |
+| `BROWSER_HEADLESS_JOBS_DRAIN_MS` | 30000 | 关停时 serve/all 模式等待在途 **local** 异步任务完成的时长，超时则直接退出。 |
+| `BROWSER_HEADLESS_JOBS_MAXLEN` | 100000 | Redis 后端 `XADD MAXLEN ~` 兜底上限（`0` 不限）。主要修剪靠 worker 的 `delete_on_ack`；此项防止无 worker 消费时无限堆积。 |
 | `screenshot` | bool | false | 截图（PNG）写入 `stat.screenshot`。 |
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |

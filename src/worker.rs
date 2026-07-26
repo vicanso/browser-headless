@@ -20,16 +20,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use redis::aio::{ConnectionLike, MultiplexedConnection};
-use redis::cluster::{ClusterClient, ClusterClientBuilder};
-use redis::cluster_async::ClusterConnection;
+use redis::AsyncCommands;
 use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamPendingReply, StreamReadOptions,
     StreamReadReply,
-};
-use redis::{
-    AsyncCommands, AsyncConnectionConfig, ClientTlsConfig, Cmd, ErrorKind, Pipeline, RedisFuture,
-    RedisResult, TlsCertificates, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -37,6 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
 use crate::config::{env_bool, env_opt, env_string, env_u64};
+use crate::redis_conn::{Backend, Conn, RedisConnOpts};
 
 const M_WORKER_JOBS: &str = "browser_headless_worker_jobs_total";
 const M_WORKER_JOB_DURATION: &str = "browser_headless_worker_job_duration_seconds";
@@ -168,165 +163,21 @@ fn redact_redis_url(raw: &str) -> String {
         .join(",")
 }
 
-/// Read a PEM file into bytes for TLS configuration, mapping IO errors into a
-/// `RedisError` that names the path (the worker panics on it at startup).
-fn read_pem(path: &str) -> RedisResult<Vec<u8>> {
-    std::fs::read(path).map_err(|e| {
-        redis::RedisError::from((
-            ErrorKind::Io,
-            "failed to read TLS PEM file",
-            format!("{path}: {e}"),
-        ))
-    })
-}
-
-/// Build `TlsCertificates` from the configured PEM paths, or `None` when no
-/// custom TLS material is set (system trust store / plain `rediss://`). mTLS
-/// requires BOTH client cert and key.
-fn build_tls_certificates(cfg: &WorkerConfig) -> RedisResult<Option<TlsCertificates>> {
-    if cfg.ca_cert_path.is_none() && cfg.client_cert_path.is_none() && cfg.client_key_path.is_none()
-    {
-        return Ok(None);
-    }
-    let root_cert = cfg.ca_cert_path.as_deref().map(read_pem).transpose()?;
-    let client_tls = match (&cfg.client_cert_path, &cfg.client_key_path) {
-        (Some(cert), Some(key)) => Some(ClientTlsConfig {
-            client_cert: read_pem(cert)?,
-            client_key: read_pem(key)?,
-        }),
-        (None, None) => None,
-        _ => {
-            return Err(redis::RedisError::from((
-                ErrorKind::InvalidClientConfig,
-                "incomplete mTLS config",
-                "set BOTH BROWSER_HEADLESS_REDIS_CLIENT_CERT and \
-                 BROWSER_HEADLESS_REDIS_CLIENT_KEY (or neither)"
-                    .to_string(),
-            )));
-        }
-    };
-    Ok(Some(TlsCertificates {
-        client_tls,
-        root_cert,
-    }))
-}
-
-/// A Redis connection that is either single-node (multiplexed) or cluster.
-/// Both inner types implement [`ConnectionLike`], so `AsyncCommands` — and thus
-/// every stream command the worker issues — works uniformly through this enum.
-/// All worker commands are single-key (the stream, or one `result:{id}`), so
-/// cluster routing never hits a cross-slot error.
-#[derive(Clone)]
-enum Conn {
-    Single(MultiplexedConnection),
-    Cluster(ClusterConnection),
-}
-
-impl ConnectionLike for Conn {
-    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-        match self {
-            Conn::Single(c) => c.req_packed_command(cmd),
-            Conn::Cluster(c) => c.req_packed_command(cmd),
-        }
-    }
-
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a Pipeline,
-        offset: usize,
-        count: usize,
-    ) -> RedisFuture<'a, Vec<Value>> {
-        match self {
-            Conn::Single(c) => c.req_packed_commands(cmd, offset, count),
-            Conn::Cluster(c) => c.req_packed_commands(cmd, offset, count),
-        }
-    }
-
-    fn get_db(&self) -> i64 {
-        match self {
-            Conn::Single(c) => c.get_db(),
-            Conn::Cluster(c) => c.get_db(),
-        }
-    }
-}
-
-/// Client-side response timeout for worker connections. It MUST exceed the
-/// `XREADGROUP` block window: a blocking read on an idle stream should return
-/// empty (the server's BLOCK nil) rather than tripping a premature client-side
-/// timeout that the loop would mistake for a dead connection. Writes are fast,
-/// so the generous ceiling is only ever hit on a genuinely hung connection.
-fn read_response_timeout(cfg: &WorkerConfig) -> Duration {
-    Duration::from_millis(cfg.block_ms as u64 + 5_000)
-}
-
-/// Handshake (TCP + TLS + auth) timeout for opening a connection.
-fn connect_timeout(cfg: &WorkerConfig) -> Duration {
-    Duration::from_millis(cfg.connect_timeout_ms)
-}
-
-/// The Redis client — single-node or cluster — that hands out [`Conn`]s.
-enum Backend {
-    Single(redis::Client),
-    Cluster(ClusterClient),
-}
-
-impl Backend {
-    fn from_cfg(cfg: &WorkerConfig) -> RedisResult<Self> {
-        let certs = build_tls_certificates(cfg)?;
-        if cfg.cluster {
-            // Comma-separated seed nodes, e.g.
-            // "redis://10.0.0.1:6379,redis://10.0.0.2:6379".
-            let nodes: Vec<String> = cfg
-                .redis_url
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            // The cluster client bakes the timeouts into every connection (no
-            // per-connection setter), so set them here.
-            let mut builder = ClusterClientBuilder::new(nodes)
-                .connection_timeout(connect_timeout(cfg))
-                .response_timeout(read_response_timeout(cfg));
-            if let Some(certs) = certs {
-                builder = builder.certs(certs);
-            }
-            Ok(Backend::Cluster(builder.build()?))
-        } else {
-            match certs {
-                Some(certs) => Ok(Backend::Single(redis::Client::build_with_tls(
-                    cfg.redis_url.clone(),
-                    certs,
-                )?)),
-                None => Ok(Backend::Single(redis::Client::open(cfg.redis_url.clone())?)),
-            }
-        }
-    }
-
-    /// Open a connection. `connect_timeout` bounds the TCP+TLS+auth handshake
-    /// and is used as the handshake-command response timeout; `response_timeout`
-    /// is then applied for normal operation (long, to span `XREADGROUP BLOCK`).
-    /// Both args are for single-node connections — cluster bakes its timeouts in
-    /// at build time, so they're unused there.
-    async fn connect(
-        &self,
-        connect_timeout: Duration,
-        response_timeout: Duration,
-    ) -> redis::RedisResult<Conn> {
-        match self {
-            Backend::Single(c) => {
-                // Raise the connect + handshake-response timeout above redis-rs's
-                // 1s / 500ms defaults so a slow link finishes authenticating.
-                let conn_cfg = AsyncConnectionConfig::new()
-                    .set_connection_timeout(Some(connect_timeout))
-                    .set_response_timeout(Some(connect_timeout));
-                let mut conn = c
-                    .get_multiplexed_async_connection_with_config(&conn_cfg)
-                    .await?;
-                // Switch to the long operational response timeout for blocking reads.
-                conn.set_response_timeout(response_timeout);
-                Ok(Conn::Single(conn))
-            }
-            Backend::Cluster(c) => Ok(Conn::Cluster(c.get_async_connection().await?)),
+impl WorkerConfig {
+    /// Connection options for the shared [`crate::redis_conn`] plumbing. The
+    /// response timeout MUST exceed the `XREADGROUP` block window: a blocking
+    /// read on an idle stream should return empty (the server's BLOCK nil)
+    /// rather than tripping a premature client-side timeout that the loop
+    /// would mistake for a dead connection.
+    fn conn_opts(&self) -> RedisConnOpts {
+        RedisConnOpts {
+            url: self.redis_url.clone(),
+            cluster: self.cluster,
+            ca_cert_path: self.ca_cert_path.clone(),
+            client_cert_path: self.client_cert_path.clone(),
+            client_key_path: self.client_key_path.clone(),
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            response_timeout: Duration::from_millis(self.block_ms as u64 + 5_000),
         }
     }
 }
@@ -399,7 +250,7 @@ pub(crate) async fn run(ctx: CaptureCtx, mut shutdown: watch::Receiver<bool>) {
         "worker mode starting"
     );
 
-    let backend = Arc::new(Backend::from_cfg(&cfg).expect("invalid redis config"));
+    let backend = Arc::new(Backend::new(&cfg.conn_opts()).expect("invalid redis config"));
 
     ensure_group(&backend, &cfg).await;
 
@@ -536,10 +387,7 @@ async fn shutdown_requested(rx: &mut watch::Receiver<bool>) {
 /// Retries until Redis is reachable; a pre-existing group (`BUSYGROUP`) is fine.
 async fn ensure_group(backend: &Backend, cfg: &WorkerConfig) {
     loop {
-        match backend
-            .connect(connect_timeout(cfg), read_response_timeout(cfg))
-            .await
-        {
+        match backend.connect(&cfg.conn_opts()).await {
             Ok(mut conn) => {
                 let res: redis::RedisResult<()> = conn
                     .xgroup_create_mkstream(
@@ -567,10 +415,7 @@ async fn ensure_group(backend: &Backend, cfg: &WorkerConfig) {
 /// reachable.
 async fn connect(backend: &Backend, cfg: &WorkerConfig) -> Conn {
     loop {
-        match backend
-            .connect(connect_timeout(cfg), read_response_timeout(cfg))
-            .await
-        {
+        match backend.connect(&cfg.conn_opts()).await {
             Ok(conn) => return conn,
             Err(e) => {
                 tracing::error!(error = %e, "redis connect failed; retrying in 2s");
@@ -675,6 +520,24 @@ async fn process_one(ctx: &CaptureCtx, cfg: &WorkerConfig, mut conn: Conn, entry
     let url = job.query.url.clone();
     let started = Instant::now();
     tracing::info!(entry = %entry_id, id = %id, url = %url, "job started");
+
+    // Progress marker: flip the result key to `running` and RESET its TTL.
+    // Two jobs done at once: pollers see the true state instead of a stale
+    // `queued`, and a job that sat in a backlog longer than the result TTL
+    // no longer 404s ("expired") moments before its result appears — the
+    // enqueue-time clock restarts when processing actually begins.
+    // Unconditional SET is safe under at-least-once: if a redelivered entry
+    // briefly overwrites an already-written result, the completion SETEX
+    // below rewrites it — pollers transiently see `running`, never lose the
+    // final result. Best-effort (failure only degrades the progress signal).
+    let running = serde_json::json!({ "id": id, "phase": "running" }).to_string();
+    let marker_key = format!("{}{}", cfg.result_prefix, id);
+    let marked: redis::RedisResult<()> = conn
+        .set_ex(&marker_key, &running, cfg.result_ttl_secs)
+        .await;
+    if let Err(e) = marked {
+        tracing::debug!(entry = %entry_id, error = %e, "running marker write failed");
+    }
     let result = capture_to_result(ctx, cfg, id, job.query).await;
     let duration_ms = started.elapsed().as_millis() as u64;
 

@@ -8,10 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 use crate::capture::{self, CaptureCtx, Captured, SummaryQuery};
@@ -52,10 +54,42 @@ struct JobRecord {
     expires: Instant,
 }
 
+const M_ASYNC_JOBS: &str = "browser_headless_async_jobs_total";
+const M_ASYNC_JOB_DURATION: &str = "browser_headless_async_job_duration_seconds";
+
 /// Process-local job map. Cheap to clone (`Arc`).
 #[derive(Clone, Default)]
 pub(crate) struct JobStore {
     inner: Arc<RwLock<HashMap<String, JobRecord>>>,
+    /// In-flight local job tasks, tracked for shutdown drain.
+    active: Arc<AtomicUsize>,
+    /// Pinged whenever `active` drops to zero (see [`JobStore::drain`]).
+    idle: Arc<Notify>,
+}
+
+/// RAII in-flight marker for one spawned job task: decrements `active` on
+/// drop (surviving panics during unwind) and wakes drainers at zero.
+struct ActiveGuard {
+    active: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+}
+
+impl ActiveGuard {
+    fn new(store: &JobStore) -> Self {
+        store.active.fetch_add(1, SeqCst);
+        ActiveGuard {
+            active: store.active.clone(),
+            idle: store.idle.clone(),
+        }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, SeqCst) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
 }
 
 impl JobStore {
@@ -127,12 +161,19 @@ impl JobStore {
         let store = self.clone();
         let job_id = id.clone();
         tokio::spawn(async move {
+            // Guard OUTSIDE run_job so the in-flight count survives any
+            // panic path (drop runs during unwind) and shutdown drain can't
+            // wedge on a lost decrement.
+            let _active = ActiveGuard::new(&store);
             store.run_job(job_id, ctx, query).await;
         });
         Ok(id)
     }
 
     async fn run_job(&self, id: String, ctx: CaptureCtx, query: SummaryQuery) {
+        let url = query.url.clone();
+        let started = Instant::now();
+        tracing::info!(id = %id, url = %url, "async job started");
         {
             let mut map = self.inner.write().await;
             if let Some(rec) = map.get_mut(&id) {
@@ -143,11 +184,32 @@ impl JobStore {
         // Queued-capture variant: pool-slot wait bounded by the job TTL, not
         // the interactive 30s admission cut — an async job is supposed to
         // wait out a busy pool instead of being shed with a terminal 503.
-        let result = capture::capture_one_queued(&ctx, query).await;
+        //
+        // catch_unwind: a panicking capture must write a terminal error
+        // record, not die silently — the detached task's panic is otherwise
+        // swallowed and the client polls `running` until TTL, then 404s.
+        let result = std::panic::AssertUnwindSafe(capture::capture_one_queued(&ctx, query))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                tracing::error!(id = %id, url = %url, "async job panicked during capture");
+                Err(CaptureError::internal("capture panicked"))
+            });
+
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        metrics::counter!(M_ASYNC_JOBS, "outcome" => outcome).increment(1);
+        metrics::histogram!(M_ASYNC_JOB_DURATION).record(started.elapsed().as_secs_f64());
+        let duration_ms = started.elapsed().as_millis() as u64;
+
         let mut map = self.inner.write().await;
         let Some(rec) = map.get_mut(&id) else {
+            // Record purged (TTL / eviction) while the capture ran: the pool
+            // slot was spent for nothing — say so instead of dropping the
+            // result silently.
+            tracing::warn!(id = %id, url = %url, duration_ms, "async job record gone; result dropped");
             return;
         };
+        tracing::info!(id = %id, outcome, duration_ms, "async job done");
         rec.expires = Instant::now() + config::job_ttl();
         match result {
             Ok(Captured::Content(c)) => match serde_json::to_value(c) {
@@ -183,9 +245,15 @@ impl JobStore {
     }
 
     pub(crate) async fn get(&self, id: &str) -> Option<JobView> {
-        self.purge_expired().await;
+        // No full-map purge here: `get` is the hot polling path, and a
+        // write-lock O(n) sweep per poll would serialize pollers against
+        // job-completion writes. Per-record expiry check instead; bulk
+        // eviction belongs to the background sweeper (and submit).
         let map = self.inner.read().await;
         let rec = map.get(id)?;
+        if rec.expires <= Instant::now() {
+            return None;
+        }
         Some(JobView {
             id: id.to_string(),
             status: rec.status,
@@ -209,6 +277,32 @@ impl JobStore {
                 self.purge_expired().await;
             }
         });
+    }
+
+    /// Shutdown drain: wait until no local job tasks are in flight, bounded
+    /// by `timeout`. Mirrors the worker's drain — without it, `main` returns
+    /// right after the HTTP listener stops and the runtime drop cancels
+    /// every in-flight capture mid-CDP-call.
+    pub(crate) async fn drain(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.active.load(SeqCst) == 0 {
+                return;
+            }
+            // Register BEFORE re-checking so a decrement between the check
+            // and the await can't be missed.
+            let notified = self.idle.notified();
+            if self.active.load(SeqCst) == 0 {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                tracing::warn!(
+                    in_flight = self.active.load(SeqCst),
+                    "async-jobs drain timed out; exiting with jobs still in flight"
+                );
+                return;
+            }
+        }
     }
 }
 

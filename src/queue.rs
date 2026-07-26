@@ -10,13 +10,7 @@
 
 use std::time::Duration;
 
-use redis::aio::{ConnectionLike, MultiplexedConnection};
-use redis::cluster::{ClusterClient, ClusterClientBuilder};
-use redis::cluster_async::ClusterConnection;
-use redis::{
-    AsyncCommands, AsyncConnectionConfig, ClientTlsConfig, Cmd, ErrorKind, Pipeline, RedisFuture,
-    RedisResult, TlsCertificates, Value,
-};
+use redis::{AsyncCommands, RedisResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -24,6 +18,7 @@ use crate::capture::SummaryQuery;
 use crate::config::{self, env_bool, env_opt, env_string, env_u64};
 use crate::error::CaptureError;
 use crate::jobs::{JobStatus, JobView};
+use crate::redis_conn::{Backend, Conn, RedisConnOpts};
 
 /// How HTTP `/jobs` is backed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,9 +69,18 @@ pub(crate) struct QueueConfig {
     pub client_cert_path: Option<String>,
     pub client_key_path: Option<String>,
     pub stream: String,
+    /// Consumer group to pre-create (idempotently) at startup, so jobs
+    /// enqueued before any worker has ever run aren't lost to a later
+    /// `GROUP_START=$` group creation.
+    pub group: String,
+    pub group_start: String,
     pub result_prefix: String,
     pub result_ttl_secs: u64,
     pub connect_timeout_ms: u64,
+    /// `XADD MAXLEN ~ N` backstop (`BROWSER_HEADLESS_JOBS_MAXLEN`, default
+    /// 100_000; `0` = unlimited). The worker's `delete_on_ack` is the primary
+    /// trim; this caps growth when no worker is consuming at all.
+    pub maxlen: u64,
 }
 
 impl QueueConfig {
@@ -88,9 +92,12 @@ impl QueueConfig {
             client_cert_path: env_opt("BROWSER_HEADLESS_REDIS_CLIENT_CERT"),
             client_key_path: env_opt("BROWSER_HEADLESS_REDIS_CLIENT_KEY"),
             stream: env_string("BROWSER_HEADLESS_JOBS_STREAM", "browser_headless:jobs"),
+            group: env_string("BROWSER_HEADLESS_CONSUMER_GROUP", "workers"),
+            group_start: env_string("BROWSER_HEADLESS_GROUP_START", "0"),
             result_prefix: env_string("BROWSER_HEADLESS_RESULT_PREFIX", "browser_headless:result:"),
             result_ttl_secs: env_u64("BROWSER_HEADLESS_RESULT_TTL_SECS", 3600).max(1),
             connect_timeout_ms: env_u64("BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS", 5000).max(1),
+            maxlen: env_u64("BROWSER_HEADLESS_JOBS_MAXLEN", 100_000),
         }
     }
 
@@ -148,120 +155,21 @@ impl StoredJobResult {
     }
 }
 
-enum Backend {
-    Single(redis::Client),
-    Cluster(ClusterClient),
-}
-
-impl Backend {
-    fn from_cfg(cfg: &QueueConfig) -> RedisResult<Self> {
-        let certs = build_tls_certificates(cfg)?;
-        if cfg.cluster {
-            let seeds: Vec<String> = cfg
-                .redis_url
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-            let mut builder = ClusterClientBuilder::new(seeds)
-                .connection_timeout(Duration::from_millis(cfg.connect_timeout_ms))
-                .response_timeout(Duration::from_millis(cfg.connect_timeout_ms + 5_000));
-            if let Some(certs) = certs {
-                builder = builder.certs(certs);
-            }
-            Ok(Backend::Cluster(builder.build()?))
-        } else {
-            match certs {
-                Some(certs) => Ok(Backend::Single(redis::Client::build_with_tls(
-                    cfg.redis_url.clone(),
-                    certs,
-                )?)),
-                None => Ok(Backend::Single(redis::Client::open(cfg.redis_url.clone())?)),
-            }
+impl QueueConfig {
+    /// Connection options for the shared [`crate::redis_conn`] plumbing.
+    /// The producer only issues fast commands (XADD / SET / GET), so its
+    /// operational response timeout is `connect + 5s` headroom — no blocking
+    /// reads to span, unlike the worker.
+    fn conn_opts(&self) -> RedisConnOpts {
+        RedisConnOpts {
+            url: self.redis_url.clone(),
+            cluster: self.cluster,
+            ca_cert_path: self.ca_cert_path.clone(),
+            client_cert_path: self.client_cert_path.clone(),
+            client_key_path: self.client_key_path.clone(),
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            response_timeout: Duration::from_millis(self.connect_timeout_ms + 5_000),
         }
-    }
-}
-
-fn read_pem(path: &str) -> RedisResult<Vec<u8>> {
-    std::fs::read(path)
-        .map_err(|e| redis::RedisError::from((ErrorKind::Io, "read cert file", e.to_string())))
-}
-
-fn build_tls_certificates(cfg: &QueueConfig) -> RedisResult<Option<TlsCertificates>> {
-    if cfg.ca_cert_path.is_none() && cfg.client_cert_path.is_none() && cfg.client_key_path.is_none()
-    {
-        return Ok(None);
-    }
-    let root_cert = cfg.ca_cert_path.as_deref().map(read_pem).transpose()?;
-    let client_tls = match (&cfg.client_cert_path, &cfg.client_key_path) {
-        (Some(cert), Some(key)) => Some(ClientTlsConfig {
-            client_cert: read_pem(cert)?,
-            client_key: read_pem(key)?,
-        }),
-        (None, None) => None,
-        _ => {
-            return Err(redis::RedisError::from((
-                ErrorKind::InvalidClientConfig,
-                "incomplete mTLS config",
-                "set BOTH BROWSER_HEADLESS_REDIS_CLIENT_CERT and \
-                 BROWSER_HEADLESS_REDIS_CLIENT_KEY (or neither)"
-                    .to_string(),
-            )));
-        }
-    };
-    Ok(Some(TlsCertificates {
-        client_tls,
-        root_cert,
-    }))
-}
-
-/// Thin async connection enum (single-node or cluster).
-#[derive(Clone)]
-enum Conn {
-    Single(MultiplexedConnection),
-    Cluster(ClusterConnection),
-}
-
-impl ConnectionLike for Conn {
-    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-        match self {
-            Conn::Single(c) => c.req_packed_command(cmd),
-            Conn::Cluster(c) => c.req_packed_command(cmd),
-        }
-    }
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a Pipeline,
-        offset: usize,
-        count: usize,
-    ) -> RedisFuture<'a, Vec<Value>> {
-        match self {
-            Conn::Single(c) => c.req_packed_commands(cmd, offset, count),
-            Conn::Cluster(c) => c.req_packed_commands(cmd, offset, count),
-        }
-    }
-    fn get_db(&self) -> i64 {
-        match self {
-            Conn::Single(c) => c.get_db(),
-            Conn::Cluster(c) => c.get_db(),
-        }
-    }
-}
-
-async fn connect(backend: &Backend, cfg: &QueueConfig) -> RedisResult<Conn> {
-    let timeout = Duration::from_millis(cfg.connect_timeout_ms);
-    match backend {
-        Backend::Single(c) => {
-            let conn_cfg = AsyncConnectionConfig::new()
-                .set_connection_timeout(Some(timeout))
-                .set_response_timeout(Some(timeout));
-            let conn = c
-                .get_multiplexed_async_connection_with_config(&conn_cfg)
-                .await?;
-            Ok(Conn::Single(conn))
-        }
-        Backend::Cluster(c) => Ok(Conn::Cluster(c.get_async_connection().await?)),
     }
 }
 
@@ -275,23 +183,44 @@ async fn connect(backend: &Backend, cfg: &QueueConfig) -> RedisResult<Conn> {
 #[derive(Clone)]
 pub(crate) struct QueueClient {
     backend: std::sync::Arc<Backend>,
-    cfg: QueueConfig,
+    /// Arc'd so the client stays pointer-sized (it lives inside the
+    /// `JobsBackend` enum cloned into every request's state).
+    cfg: std::sync::Arc<QueueConfig>,
     conn: std::sync::Arc<tokio::sync::Mutex<Option<Conn>>>,
 }
 
 impl QueueClient {
     pub(crate) async fn connect() -> Result<Self, CaptureError> {
         let cfg = QueueConfig::from_env();
-        let backend = Backend::from_cfg(&cfg)
+        let backend = Backend::new(&cfg.conn_opts())
             .map_err(|e| CaptureError::service_unavailable(format!("redis config invalid: {e}")))?;
         // Prove connectivity once at startup; keep the connection for reuse.
-        let mut conn = connect(&backend, &cfg)
+        let mut conn = backend
+            .connect(&cfg.conn_opts())
             .await
             .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
         let _: String = redis::cmd("PING")
             .query_async(&mut conn)
             .await
             .map_err(|e| CaptureError::service_unavailable(format!("redis PING failed: {e}")))?;
+        // Pre-create the consumer group (and the stream via MKSTREAM),
+        // idempotently — same call the worker makes. Without it, jobs
+        // enqueued before the FIRST worker ever runs are permanently
+        // invisible when that worker creates the group with `GROUP_START=$`.
+        let created: RedisResult<()> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&cfg.stream)
+            .arg(&cfg.group)
+            .arg(&cfg.group_start)
+            .arg("MKSTREAM")
+            .query_async(&mut conn)
+            .await;
+        match created {
+            Ok(()) => tracing::info!(group = %cfg.group, "created consumer group"),
+            Err(e) if e.code() == Some("BUSYGROUP") => {}
+            // Non-fatal: the worker's own ensure_group retries; log and go.
+            Err(e) => tracing::warn!(error = %e, "XGROUP CREATE failed"),
+        }
         tracing::info!(
             stream = %cfg.stream,
             result_prefix = %cfg.result_prefix,
@@ -299,7 +228,7 @@ impl QueueClient {
         );
         Ok(Self {
             backend: std::sync::Arc::new(backend),
-            cfg,
+            cfg: std::sync::Arc::new(cfg),
             conn: std::sync::Arc::new(tokio::sync::Mutex::new(Some(conn))),
         })
     }
@@ -312,7 +241,9 @@ impl QueueClient {
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let c = connect(&self.backend, &self.cfg)
+        let c = self
+            .backend
+            .connect(&self.cfg.conn_opts())
             .await
             .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
         *guard = Some(c.clone());
@@ -377,8 +308,14 @@ impl QueueClient {
                 "job id collision on `{id}`; not overwriting"
             )));
         }
-        let added: Result<String, redis::RedisError> = redis::cmd("XADD")
-            .arg(&self.cfg.stream)
+        // `MAXLEN ~` backstop so the stream can't grow unbounded when no
+        // worker is consuming (the worker's delete_on_ack is the real trim).
+        let mut xadd = redis::cmd("XADD");
+        xadd.arg(&self.cfg.stream);
+        if self.cfg.maxlen > 0 {
+            xadd.arg("MAXLEN").arg("~").arg(self.cfg.maxlen);
+        }
+        let added: Result<String, redis::RedisError> = xadd
             .arg("*")
             .arg("payload")
             .arg(&payload)

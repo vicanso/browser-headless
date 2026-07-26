@@ -1044,7 +1044,20 @@ pub async fn collect_security_scan(page: &Page) -> Result<SecurityScan, Error> {
     Ok(scan)
 }
 
-/// Per-image sizing collector. Reads natural vs display size in the page.
+/// Per-image sizing collector. Reads `naturalWidth/Height` (decoded pixel
+/// dimensions, populated by the browser as a side effect of decoding the
+/// image bytes — no extra IO on our side) and the laid-out display
+/// dimensions via `getBoundingClientRect()`. Both are already-computed
+/// browser state, so the cost is just a DOM walk — typically <2ms for 100
+/// images. `currentSrc` reflects the URL the browser actually picked from
+/// any `srcset`/`sizes` candidates.
+///
+/// Filters:
+/// - Skips `naturalWidth === 0 && !loading==='lazy'`: image failed to load.
+///   Lazy images outside viewport legitimately have 0×0 naturals and are
+///   kept with `loaded: false` so the caller can audit them separately.
+/// - `in_viewport` is computed against `innerWidth/Height` so the caller
+///   can distinguish above-the-fold waste (high-impact) from below-the-fold.
 const IMAGE_SIZING_JS: &str = r#"
 (function() {
   const vw = window.innerWidth || 0;
@@ -4740,14 +4753,51 @@ pub struct CollectCaptures {
     /// (`access-control-allow-origin` / `-credentials`). Only the
     /// `security_scan` CORS-misconfig derive consumes them.
     pub cors_headers: bool,
-    /// Keep the full `resources[]` vector after collect. When false (the
-    /// common case: caller only wants `resource_summary` aggregates), the
-    /// summary is derived at the end of collect and the detailed array is
-    /// freed immediately — so the format stage and response serialisation
-    /// never hold multi-MB resource inventories. Forced on for consumers
-    /// that need the list (`resources` / `har` / `image_sizing` /
-    /// `security_scan` CORS).
-    pub retain_resources: bool,
+    /// Free the full `resources[]` vector right after the resource-summary
+    /// derive at the end of collect, so the format stage and response
+    /// serialisation never hold multi-MB inventories. INTENTIONALLY the
+    /// opt-in direction: the `Default` (false) preserves the historical
+    /// "collect returns the full list" contract, so a caller using
+    /// `..Default::default()` can never silently end up with
+    /// `resource_count > 0` but `resources: []`. `capture()` turns it on
+    /// whenever no later stage needs the list (`resources` / `har` /
+    /// `image_sizing` / `security_scan` CORS all force it off).
+    pub free_resources: bool,
+}
+
+/// Hard cap on the post-gate grace window: even a page that keeps
+/// chattering (analytics beacons, websockets) can't stretch the tail past
+/// this. See [`collect_stop_at`].
+const POST_IDLE_GRACE: Duration = Duration::from_millis(500);
+/// Quiescence window: once the gate has fired, exit as soon as the event
+/// streams have been quiet this long (enough to drain response events still
+/// sitting in their channels). See [`collect_stop_at`].
+const QUIET_GRACE: Duration = Duration::from_millis(100);
+
+/// Quiescence-based exit policy — the SINGLE owner shared by the full and
+/// lean collect loops (tune it here, both paths follow).
+///
+/// Before the gate fires (or while `wait_for_request` patterns are still
+/// pending) the loop runs to `deadline`. Once ready, stop at the earliest
+/// of: `QUIET_GRACE` past the last processed event (but never earlier than
+/// `QUIET_GRACE` past the gate itself — `last_event_at.max(gate)` guards
+/// the theoretical stale-stamp case), `POST_IDLE_GRACE` past the gate, and
+/// `deadline`. Callers stamp `last_event_at` at the top of each loop
+/// iteration: every arrival there except the very first follows exactly one
+/// delivered event (the sleep arm breaks instead of looping), so the stamp
+/// genuinely tracks stream quiescence.
+fn collect_stop_at(
+    deadline: Instant,
+    gate_at: Option<Instant>,
+    patterns_pending: bool,
+    last_event_at: Instant,
+) -> Instant {
+    match gate_at {
+        Some(t) if !patterns_pending => deadline
+            .min(t + POST_IDLE_GRACE)
+            .min(last_event_at.max(t) + QUIET_GRACE),
+        _ => deadline,
+    }
 }
 
 /// Lean collect path for `content_only`: navigate + wait gates, track only
@@ -4761,10 +4811,18 @@ async fn collect_summary_lean(
     wait_for_request: &[String],
     wait_until_load: bool,
 ) -> Result<WebPageStat, Error> {
-    // Page + Network + lifecycle only — no Runtime (exceptions/console unused).
+    // Same enables as the full path. Runtime looks unused here (no
+    // exception/console capture in lean mode), but `Page::evaluate` — which
+    // every data-extraction path goes through — resolves its execution
+    // context from `Runtime.executionContextCreated` events; without the
+    // enable it silently falls through to a chromiumoxide-internal default.
+    // Keep it explicit: the join pipelines all four in ~1 RTT anyway, so
+    // omitting it saves nothing and bets `content_only`'s entire output on
+    // an un-asserted library internal.
     tokio::try_join!(
         page.execute(NetworkEnableParams::default()),
         page.execute(PageEnableParams::default()),
+        page.execute(RuntimeEnableParams::default()),
         page.execute(SetLifecycleEventsEnabledParams::new(true)),
     )?;
 
@@ -4777,8 +4835,6 @@ async fn collect_summary_lean(
     let mut pending_patterns: Vec<&str> = wait_for_request.iter().map(String::as_str).collect();
     let total_patterns = pending_patterns.len();
 
-    const POST_IDLE_GRACE: Duration = Duration::from_millis(500);
-    const QUIET_GRACE: Duration = Duration::from_millis(100);
     let deadline = Instant::now() + timeout;
     let mut idle_at: Option<Instant> = None;
     let mut load_at: Option<Instant> = None;
@@ -4788,15 +4844,16 @@ async fn collect_summary_lean(
     let mut init_ts: Option<f64> = None;
 
     loop {
+        // Exit policy shared with the full collect loop — see
+        // [`collect_stop_at`] for the quiescence semantics.
         let last_event_at = Instant::now();
         let gate_at = if wait_until_load { load_at } else { idle_at };
-        let ready_to_finish = gate_at.is_some() && pending_patterns.is_empty();
-        let stop_at = match (ready_to_finish, gate_at) {
-            (true, Some(t)) => deadline
-                .min(t + POST_IDLE_GRACE)
-                .min(last_event_at.max(t) + QUIET_GRACE),
-            _ => deadline,
-        };
+        let stop_at = collect_stop_at(
+            deadline,
+            gate_at,
+            !pending_patterns.is_empty(),
+            last_event_at,
+        );
         let remaining = stop_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -4857,7 +4914,12 @@ async fn collect_summary_lean(
                             document_timing = Some(build_document_timing(
                                 &resp_url, s, from_cache, &protocol, t,
                             ));
-                        } else {
+                        } else if from_cache {
+                            // Same policy as the full collect loop: only
+                            // synthesize an all-zero timing for CACHED
+                            // documents (where "no CDP timing" is expected).
+                            // A non-cached response without timing stays
+                            // `None` rather than masquerading as a 0ms fetch.
                             document_timing = Some(DocumentTiming {
                                 url: resp_url,
                                 status: s,
@@ -5079,18 +5141,11 @@ pub async fn collect_summary(
     // - Otherwise, gate on `networkIdle` lifecycle (Chrome emits this after
     //   ≥500ms with zero in-flight requests, i.e. all responses have already
     //   fired).
-    // - After the chosen gate fires, exit as soon as the event streams have
-    //   been *quiet* for `QUIET_GRACE` — long enough to drain any response
-    //   events still sitting in their channels — capped at `POST_IDLE_GRACE`
-    //   past the gate so a page that keeps chattering (analytics beacons,
-    //   websockets) can't stretch the tail. The old behaviour was a flat
-    //   500ms wait after the gate on every request; quiescence-based exit
-    //   reclaims most of that on the common quiet path.
+    // - After the chosen gate fires, the quiescence exit in
+    //   [`collect_stop_at`] (shared with the lean loop) decides when to stop.
     // - `wait_for_request` patterns (if any) always need to be matched
     //   regardless of which gate is active.
     // - Soft cap: `timeout` (the page never settles → return best-effort).
-    const POST_IDLE_GRACE: Duration = Duration::from_millis(500);
-    const QUIET_GRACE: Duration = Duration::from_millis(100);
     let deadline = Instant::now() + timeout;
     let mut idle_at: Option<Instant> = None;
     let mut load_at: Option<Instant> = None;
@@ -5106,22 +5161,16 @@ pub async fn collect_summary(
         // shorter than `QUIET_GRACE`.
         let last_event_at = Instant::now();
 
-        // Pick the gate marker per strategy. Grace period only kicks in once
-        // the gate has fired AND all wait_for_request patterns have matched.
-        // If patterns are still pending after the gate, keep waiting (up to
-        // timeout) for them.
+        // Pick the gate marker per strategy; [`collect_stop_at`] only lets
+        // the grace window kick in once the gate has fired AND all
+        // wait_for_request patterns have matched.
         let gate_at = if wait_until_load { load_at } else { idle_at };
-        let ready_to_finish = gate_at.is_some() && pending_patterns.is_empty();
-        let stop_at = match (ready_to_finish, gate_at) {
-            // Quiet exit: `QUIET_GRACE` past the last event, never earlier
-            // than `QUIET_GRACE` past the gate itself (`.max(t)` guards the
-            // theoretical case of a stale `last_event_at`), never later than
-            // `POST_IDLE_GRACE` past the gate, and always within `deadline`.
-            (true, Some(t)) => deadline
-                .min(t + POST_IDLE_GRACE)
-                .min(last_event_at.max(t) + QUIET_GRACE),
-            _ => deadline,
-        };
+        let stop_at = collect_stop_at(
+            deadline,
+            gate_at,
+            !pending_patterns.is_empty(),
+            last_event_at,
+        );
         let remaining = stop_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -5616,11 +5665,11 @@ pub async fn collect_summary(
     };
 
     // Derive resource_summary while we still hold the detailed list, then
-    // free the list when the caller doesn't need it (retain_resources=false).
-    // Format stage + response serialisation then never hold multi-MB
-    // inventories for summary-only captures.
+    // free the list when the caller opted in (free_resources=true). Format
+    // stage + response serialisation then never hold multi-MB inventories
+    // for summary-only captures.
     let early_resource_summary = build_resource_summary(&resources_vec, url);
-    if !captures.retain_resources {
+    if captures.free_resources {
         resources_vec.clear();
         resources_vec.shrink_to_fit();
     }
@@ -5823,6 +5872,8 @@ pub enum Lang {
     Zh,
 }
 
+/// All knobs `capture` accepts. Owned fields so callers don't juggle
+/// lifetimes; the struct is consumed by `capture`.
 pub struct SummaryRequest {
     pub url: String,
     pub timeout: Duration,
@@ -6142,11 +6193,10 @@ pub async fn capture(
             // which content-only mode skips.
             resource_headers: !req.content_only,
             cors_headers: req.security_scan,
-            // Keep the full list only when a later stage needs it. Otherwise
-            // collect builds resource_summary and drops the array so format
-            // never holds multi-MB inventories (边收边聚合 / free-early).
-            retain_resources: !req.content_only
-                && (req.resources || req.har || req.image_sizing || req.security_scan),
+            // Free the list right after the summary derive unless a later
+            // stage needs it (边收边聚合 / free-early). content_only never
+            // reaches this collect path, so no `!content_only` term.
+            free_resources: !(req.resources || req.har || req.image_sizing || req.security_scan),
         },
     )
     .await?;
@@ -6457,9 +6507,9 @@ pub async fn capture(
     }
 
     // Drop the detailed array unless explicitly requested. Collect may
-    // already have cleared it when retain_resources=false; this also
-    // covers the retain=true path where HAR/image/CORS needed the list
-    // but the caller didn't ask for `resources` in the response.
+    // already have cleared it when free_resources=true; this also covers
+    // the retained path where HAR/image/CORS needed the list but the
+    // caller didn't ask for `resources` in the response.
     // `resource_count` / `total_size` / `resource_summary` stay.
     if !req.resources {
         stat.resources.clear();

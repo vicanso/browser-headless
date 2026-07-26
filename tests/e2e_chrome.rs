@@ -134,10 +134,28 @@ async fn smoke_health_and_content_only() {
         summary.text().await
     );
     let body: serde_json::Value = summary.json().await.unwrap();
-    assert!(
-        body.get("data").is_some(),
-        "content_only envelope missing data: {body}"
+    // Assert VALUES, not mere presence: `data` serializes even when empty
+    // and `final_url` falls back to the requested URL, so presence-only
+    // checks pass on a completely broken lean path (e.g. an evaluate that
+    // silently returns "" would still emit data:"", char_count:0).
+    assert_eq!(
+        body["status"].as_u64(),
+        Some(200),
+        "lean status should be the document's 200: {body}"
     );
-    assert!(body.get("char_count").is_some());
-    assert!(body.get("final_url").is_some());
+    let chars = body["char_count"].as_u64().unwrap_or(0);
+    assert!(
+        chars > 100,
+        "content_only returned a near-empty body (char_count={chars}): {body}"
+    );
+    let final_url = body["final_url"].as_str().unwrap_or_default();
+    assert!(
+        final_url.starts_with("https://example.com"),
+        "unexpected final_url {final_url:?}"
+    );
+    let data = body["data"].as_str().unwrap_or_default();
+    assert!(
+        data.contains("Example Domain"),
+        "extracted content missing expected text: {data:?}"
+    );
 }

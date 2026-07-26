@@ -113,7 +113,12 @@ capture engine is reusable outside HTTP:
   in-process or Redis-backed via `queue.rs`).
 - **`queue.rs`** — Redis Streams producer + result reader shared with
   `worker` (same stream / `result:{id}` keys). Selected by
-  `BROWSER_HEADLESS_JOBS_BACKEND` (`local` / `redis` / `auto`).
+  `BROWSER_HEADLESS_JOBS_BACKEND` (`local` / `redis` / `auto`). Job ids are
+  always server-minted UUIDs; explicit `redis` refuses to start without Redis.
+- **`redis_conn.rs`** — the ONE single-node/cluster connection layer
+  (`Backend` / `Conn` / TLS + timeouts via `RedisConnOpts`) shared by
+  `worker` and `queue`. Connection-handling changes go here, never as copies
+  in the two callers (they diverged once before — that's why this exists).
 - **`rate_limit.rs`** — optional token-bucket for capture routes.
 - **Resource free-early** — when the caller does not need `resources[]` /
   HAR / image_sizing / security_scan, collect builds `resource_summary` then

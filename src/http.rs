@@ -174,6 +174,15 @@ pub(crate) fn init_metrics() -> PrometheusHandle {
         Unit::Seconds,
         "Per-capture stage duration (apply / collect / capture / format)"
     );
+    describe_counter!(
+        "browser_headless_async_jobs_total",
+        "Local async jobs processed, labelled by outcome (ok / error)"
+    );
+    describe_histogram!(
+        "browser_headless_async_job_duration_seconds",
+        Unit::Seconds,
+        "Per-job local async capture time (queue wait + capture)"
+    );
     handle
 }
 

@@ -245,6 +245,16 @@ pub(crate) fn max_async_jobs() -> usize {
     *V.get_or_init(|| env_usize("BROWSER_HEADLESS_MAX_ASYNC_JOBS", 256).max(1))
 }
 
+/// On shutdown, how long serve/all mode waits for in-flight LOCAL async jobs
+/// to finish before exiting anyway (`BROWSER_HEADLESS_JOBS_DRAIN_MS`, default
+/// 30_000 — matches the worker's drain default). Jobs still running at the
+/// deadline are cancelled by runtime teardown; Redis-backed jobs are
+/// unaffected (workers own their own drain).
+pub(crate) fn jobs_drain_ms() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| env_u64("BROWSER_HEADLESS_JOBS_DRAIN_MS", 30_000).max(1))
+}
+
 /// Whether the async job API is enabled (`BROWSER_HEADLESS_ASYNC_JOBS`,
 /// default true). Set `false` to hide `/jobs` routes entirely.
 pub(crate) fn async_jobs_enabled() -> bool {

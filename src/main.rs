@@ -7,6 +7,7 @@ mod jobs;
 mod pool;
 mod queue;
 mod rate_limit;
+mod redis_conn;
 mod ssrf;
 mod worker;
 
@@ -111,11 +112,13 @@ async fn build_capture_ctx() -> CaptureCtx {
 
 /// HTTP API mode: serve `/summary*` + probes + `/metrics` on `0.0.0.0:3000`.
 async fn run_serve() {
+    // Fail-fast on config errors BEFORE the (expensive) pool launch.
+    let api_key = resolve_api_key();
     // Install the Prometheus recorder BEFORE launching the pool so the pool's
     // startup gauges (pool_size / active_instances) are recorded.
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
-    serve_http(ctx, metrics_handle, install_shutdown()).await;
+    serve_http(ctx, metrics_handle, api_key, install_shutdown()).await;
 }
 
 /// Queue worker mode: consume capture jobs from Redis. Binds no API port, but
@@ -148,33 +151,44 @@ async fn run_worker() {
 /// jobs; we await the worker AFTER the server returns so the process doesn't
 /// exit (killing the worker) mid-drain.
 async fn run_all() {
+    // Fail-fast on config errors BEFORE the (expensive) pool launch.
+    let api_key = resolve_api_key();
     let metrics_handle = http::init_metrics();
     let ctx = build_capture_ctx().await;
     let shutdown = install_shutdown();
     // Background queue consumer, sharing the pool. A fatal worker config error
     // panics this task (logged by tokio) without taking down the HTTP server.
     let worker = tokio::spawn(worker::run(ctx.clone(), shutdown.clone()));
-    serve_http(ctx, metrics_handle, shutdown).await;
+    serve_http(ctx, metrics_handle, api_key, shutdown).await;
     let _ = worker.await;
 }
 
 /// Build `AppState` from the shared capture context and serve the HTTP API
 /// until `shutdown` fires, then drain connections. Shared by `serve` and `all`.
-async fn serve_http(
-    ctx: CaptureCtx,
-    metrics_handle: PrometheusHandle,
-    shutdown: watch::Receiver<bool>,
-) {
+/// Resolve the API key, enforcing `BROWSER_HEADLESS_REQUIRE_API_KEY`.
+/// Called BEFORE the browser pool launches (fail-fast: a config error must
+/// not burn a full Chromium fleet startup before being reported).
+fn resolve_api_key() -> Option<Arc<String>> {
     let api_key = std::env::var("BROWSER_HEADLESS_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
         .map(Arc::new);
-    if api_key.is_some() {
-        tracing::info!("API key auth enabled (X-Api-Key header required)");
-    } else if config::require_api_key() {
+    if api_key.is_none() && config::require_api_key() {
         panic!(
             "BROWSER_HEADLESS_REQUIRE_API_KEY is set but BROWSER_HEADLESS_API_KEY is empty — refusing to start open"
         );
+    }
+    api_key
+}
+
+async fn serve_http(
+    ctx: CaptureCtx,
+    metrics_handle: PrometheusHandle,
+    api_key: Option<Arc<String>>,
+    shutdown: watch::Receiver<bool>,
+) {
+    if api_key.is_some() {
+        tracing::info!("API key auth enabled (X-Api-Key header required)");
     } else {
         tracing::warn!("API key auth disabled — /summary is open to anyone");
     }
@@ -189,6 +203,8 @@ async fn serve_http(
     if jobs.is_some() {
         tracing::info!("async job API enabled at POST /jobs + GET /jobs/:id");
     }
+    // Kept for the post-serve drain — `state` is consumed by the router.
+    let jobs_drain = jobs.clone();
 
     let state = AppState {
         ctx,
@@ -210,6 +226,16 @@ async fn serve_http(
         .with_graceful_shutdown(shutdown_future(shutdown))
         .await
         .expect("server error");
+
+    // Local async jobs run as detached tasks the HTTP graceful-shutdown
+    // knows nothing about — drain them before returning (mirrors the
+    // worker's drain), else runtime teardown cancels them mid-capture.
+    if let Some(jobs::JobsBackend::Local(store)) = &jobs_drain {
+        tracing::info!("draining in-flight local async jobs");
+        store
+            .drain(std::time::Duration::from_millis(config::jobs_drain_ms()))
+            .await;
+    }
     tracing::info!("server shut down cleanly");
 }
 

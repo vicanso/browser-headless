@@ -184,6 +184,8 @@ network layer if the operational data is sensitive. Exposes:
 | `browser_headless_pool_active_instances` | gauge | — | instances currently `Active` (not draining / respawning) |
 | `browser_headless_browser_respawns_total` | counter | — | crashed instances respawned |
 | `browser_headless_recycles_total` | counter | `reason` (`age`/`count`) | voluntary instance recycles |
+| `browser_headless_async_jobs_total` | counter | `outcome` (`ok`/`error`) | local async jobs processed (`POST /jobs`, local backend) |
+| `browser_headless_async_job_duration_seconds` | histogram | — | per-job local async capture time (queue wait + capture) |
 | `browser_headless_worker_jobs_total` | counter | `outcome` (`ok`/`error`) | worker jobs processed (worker / all modes) |
 | `browser_headless_worker_job_duration_seconds` | histogram | — | per-job worker processing time (capture + result write) |
 | `browser_headless_worker_jobs_in_flight` | gauge | — | worker captures currently running |
@@ -918,6 +920,8 @@ this README).
 | `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` = in-process capture on this node's pool; `redis` = `XADD` to the worker stream (same as `MODE=worker` consumers) — the process **refuses to start** if Redis is unreachable (no silent local fallback); `auto` = Redis when `BROWSER_HEADLESS_REDIS_URL` is set, otherwise local. Use `redis` (or `auto` + Redis URL) so HTTP API and workers share one queue. Job ids are always server-minted UUIDs (`request_id` is correlation metadata, never the id). |
 | `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | TTL for **local** async job results (the Redis backend uses `BROWSER_HEADLESS_RESULT_TTL_SECS`). Also bounds how long a queued local job may wait for a pool slot. |
 | `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | Cap on **in-flight** (queued + running) local async jobs. Completed results don't count against it — when the retained-result map is full, the oldest completed result is evicted to make room (Redis-backed queues are bounded by workers + stream length). |
+| `BROWSER_HEADLESS_JOBS_DRAIN_MS` | 30000 | On shutdown, how long serve/all mode waits for in-flight **local** async jobs to finish before exiting anyway. |
+| `BROWSER_HEADLESS_JOBS_MAXLEN` | 100000 | `XADD MAXLEN ~` backstop on the jobs stream for the Redis backend (`0` = unlimited). The worker's `delete_on_ack` is the primary trim; this caps growth when no worker is consuming. |
 | `CHROME` | (auto-detect) | Path to the Chrome / Chromium binary. The provided Dockerfile sets `/usr/bin/chromium`. |
 | `RUST_LOG` | `info,chromiumoxide::conn=off,chromiumoxide::handler=off` | Standard `tracing_subscriber` filter. Set `browser_headless=debug` to see per-stage timings. |
 

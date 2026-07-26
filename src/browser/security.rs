@@ -1,6 +1,12 @@
 //! Security header parsing, TLS helpers, and CORS audit derives.
 use super::*;
 
+/// Project CDP `SecurityDetails` into our compact `TlsInfo`. `days_remaining`
+/// is computed at capture time from wall clock; negative if expired.
+/// `host` identifies which origin the certificate was observed on.
+/// `remote_ip` / `remote_port` come from the same Network.responseReceived —
+/// the IP the browser actually connected to (already resolved, no extra DNS
+/// lookup needed on our side; safe from SSRF surface since it's observation).
 pub(crate) fn extract_tls_info(
     sd: &CdpSecurityDetails,
     host: String,
@@ -257,6 +263,11 @@ pub(crate) fn extract_security_headers(headers: &Headers) -> Option<HashMap<Stri
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Derive passive CORS misconfiguration findings from observed responses.
+/// Flags the one unambiguous server bug: `Access-Control-Allow-Origin`
+/// of `*` or `null` together with `Access-Control-Allow-Credentials:
+/// true` (browsers reject the combo, but the server is misconfigured and
+/// it's reportable). Deduplicated by URL, capped at 20.
 pub(crate) fn build_cors_issues(resources: &[WebPageResource]) -> Vec<CorsIssue> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut out = Vec::new();
