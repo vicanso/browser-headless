@@ -915,9 +915,9 @@ this README).
 | `BROWSER_HEADLESS_PROTECT_METRICS` | false | When true, `/metrics` requires the same `X-Api-Key` as the API. `/healthz` stays open. |
 | `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` or `json` (structured logs for k8s). |
 | `BROWSER_HEADLESS_ASYNC_JOBS` | true | Enable `POST /jobs` + `GET /jobs/{id}`. Set `false` to hide the routes. |
-| `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` = in-process capture on this node's pool; `redis` = `XADD` to the worker stream (same as `MODE=worker` consumers); `auto` = Redis when `BROWSER_HEADLESS_REDIS_URL` is set, otherwise local. Use `redis` (or `auto` + Redis URL) so HTTP API and workers share one queue. |
-| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | TTL for async job results (local map expiry / Redis result-key TTL). |
-| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | Cap on concurrent/retained **local** async jobs (Redis-backed queues are bounded by workers + stream length). |
+| `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` = in-process capture on this node's pool; `redis` = `XADD` to the worker stream (same as `MODE=worker` consumers) — the process **refuses to start** if Redis is unreachable (no silent local fallback); `auto` = Redis when `BROWSER_HEADLESS_REDIS_URL` is set, otherwise local. Use `redis` (or `auto` + Redis URL) so HTTP API and workers share one queue. Job ids are always server-minted UUIDs (`request_id` is correlation metadata, never the id). |
+| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | TTL for **local** async job results (the Redis backend uses `BROWSER_HEADLESS_RESULT_TTL_SECS`). Also bounds how long a queued local job may wait for a pool slot. |
+| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | Cap on **in-flight** (queued + running) local async jobs. Completed results don't count against it — when the retained-result map is full, the oldest completed result is evicted to make room (Redis-backed queues are bounded by workers + stream length). |
 | `CHROME` | (auto-detect) | Path to the Chrome / Chromium binary. The provided Dockerfile sets `/usr/bin/chromium`. |
 | `RUST_LOG` | `info,chromiumoxide::conn=off,chromiumoxide::handler=off` | Standard `tracing_subscriber` filter. Set `browser_headless=debug` to see per-stage timings. |
 

@@ -228,15 +228,18 @@ pub(crate) enum LogFormat {
 }
 
 /// TTL for in-process async job results (`BROWSER_HEADLESS_JOB_TTL_SECS`,
-/// default 3600).
+/// default 3600). LOCAL backend only — the Redis backend's result keys use
+/// `BROWSER_HEADLESS_RESULT_TTL_SECS`. Also bounds how long a queued local
+/// job may wait for a pool slot (`capture_one_queued`).
 pub(crate) fn job_ttl() -> Duration {
     static V: OnceLock<Duration> = OnceLock::new();
     *V.get_or_init(|| Duration::from_secs(env_u64("BROWSER_HEADLESS_JOB_TTL_SECS", 3600).max(1)))
 }
 
-/// Max concurrent in-process async jobs (`BROWSER_HEADLESS_MAX_ASYNC_JOBS`,
-/// default = pool will bound captures; this caps the job map size, default
-/// 256).
+/// Max IN-FLIGHT (queued + running) in-process async jobs
+/// (`BROWSER_HEADLESS_MAX_ASYNC_JOBS`, default 256). Completed results don't
+/// count against it; the retained-result map is bounded at the same size by
+/// evicting the oldest completed entry when full.
 pub(crate) fn max_async_jobs() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| env_usize("BROWSER_HEADLESS_MAX_ASYNC_JOBS", 256).max(1))

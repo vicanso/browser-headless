@@ -468,9 +468,31 @@ pub(crate) async fn capture_one(
     ctx: &CaptureCtx,
     q: SummaryQuery,
 ) -> Result<Captured, CaptureError> {
+    capture_one_metered(ctx, q, checkout_wait_ms()).await
+}
+
+/// [`capture_one`] variant for QUEUED (async-job) captures: the pool-slot
+/// wait is bounded by the job TTL instead of `checkout_wait_ms()`. The
+/// interactive admission cut (default 30s → 503) exists to shed *synchronous*
+/// callers who are actively waiting on the response; an enqueued job is
+/// expected to sit out a busy pool — that's the entire point of the queue.
+/// Shedding it records a terminal error for work that was never attempted.
+pub(crate) async fn capture_one_queued(
+    ctx: &CaptureCtx,
+    q: SummaryQuery,
+) -> Result<Captured, CaptureError> {
+    let wait_ms = config::job_ttl().as_millis() as u64;
+    capture_one_metered(ctx, q, wait_ms).await
+}
+
+async fn capture_one_metered(
+    ctx: &CaptureCtx,
+    q: SummaryQuery,
+    checkout_wait: u64,
+) -> Result<Captured, CaptureError> {
     let _in_flight = InFlightGuard::new();
     let started = Instant::now();
-    let result = capture_one_unmetered(ctx, q).await;
+    let result = capture_one_unmetered(ctx, q, checkout_wait).await;
     let status = match &result {
         Ok(_) => 200u16,
         Err(e) => e.status_u16(),
@@ -486,6 +508,7 @@ pub(crate) async fn capture_one(
 async fn capture_one_unmetered(
     ctx: &CaptureCtx,
     mut q: SummaryQuery,
+    checkout_wait: u64,
 ) -> Result<Captured, CaptureError> {
     apply_profile(&mut q);
     apply_clamps(&mut q);
@@ -510,12 +533,14 @@ async fn capture_one_unmetered(
     // covers the full capture lifecycle so concurrency stays bounded and the
     // instance's in-flight / served counters stay accurate.
     //
-    // Admission control: bound the queue wait by `checkout_wait_ms()`. Without
-    // it, demand above pool capacity parks callers (and their futures) here
-    // indefinitely — under load that is an unbounded backlog, not backpressure.
-    // On timeout we shed the request with 503 so a saturated service fails
-    // fast. `0` disables the bound (wait forever — original behaviour).
-    let wait_ms = checkout_wait_ms();
+    // Admission control: bound the queue wait by `checkout_wait` (the
+    // interactive `checkout_wait_ms()` for sync callers, the job TTL for
+    // queued jobs — see `capture_one_queued`). Without it, demand above pool
+    // capacity parks callers (and their futures) here indefinitely — under
+    // load that is an unbounded backlog, not backpressure. On timeout we shed
+    // the request with 503 so a saturated service fails fast. `0` disables
+    // the bound (wait forever — original behaviour).
+    let wait_ms = checkout_wait;
     let t_checkout = Instant::now();
     let checkout = {
         let acquire = ctx.pool.checkout();

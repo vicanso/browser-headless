@@ -4823,6 +4823,14 @@ async fn collect_summary_lean(
                 }
             }
             Some(ev) = response_stream.next() => {
+                // Same pseudo-scheme filter as the full collect loop:
+                // data:/blob:/about: "responses" never touched the network and
+                // must not satisfy `wait_for_request` (a JS-created
+                // `blob:…/api/v2` would false-match), trip UpstreamFailure,
+                // or overwrite `document_timing` / `final_url`.
+                if !is_real_resource(&ev.response.url) {
+                    continue;
+                }
                 let status = ev.response.status;
                 let resp_url = ev.response.url.clone();
                 if let Some(pos) = pending_patterns.iter().position(|p| resp_url.contains(*p)) {
@@ -6429,14 +6437,13 @@ pub async fn capture(
         stat.har = Some(build_har(&stat, &req.url));
     }
 
-    // Resource summary is built at the end of collect (and the detailed
-    // list may already have been freed when retain_resources=false). Only
-    // rebuild here when the list is still present — e.g. after Phase B
-    // consumers mutated nothing but we kept the array for HAR / image /
-    // CORS. content_only leaves the default empty summary.
-    if !req.content_only && !stat.resources.is_empty() {
-        stat.resource_summary = build_resource_summary(&stat.resources, &req.url);
-    }
+    // Resource summary: the early build at the end of collect_summary is the
+    // single authoritative one — nothing between there and here mutates
+    // `stat.resources` (Phase A is read-only CDP; Phase B consumers all take
+    // `&`), so rebuilding it in the format stage would just run the whole
+    // ~300-line derive a second time on exactly the heaviest requests
+    // (all_metrics / har / resources / image_sizing / security_scan, where
+    // the list is retained). content_only keeps the default empty summary.
 
     // Resource-hint audit Phase B: combine the raw `<head>` scrape
     // (from Phase A) with the now-built `top_third_party_domains`

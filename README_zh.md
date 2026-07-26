@@ -205,9 +205,9 @@ curl -X POST http://localhost:3000/summary \
 | `BROWSER_HEADLESS_PROTECT_METRICS` | false | 为 true 时 `/metrics` 需要与 API 相同的 `X-Api-Key`。`/healthz` 仍开放。 |
 | `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` 或 `json`（k8s 友好结构化日志）。 |
 | `BROWSER_HEADLESS_ASYNC_JOBS` | true | 启用 `POST /jobs` + `GET /jobs/{id}`。设 `false` 隐藏路由。 |
-| `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` 本机池；`redis` 与 worker 共用 Stream；`auto` 有 `REDIS_URL` 则 redis 否则 local。 |
-| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | 进程内异步任务结果 TTL。 |
-| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | 异步任务并发/保留上限（先清理过期项）。 |
+| `BROWSER_HEADLESS_JOBS_BACKEND` | `auto` | `local` 本机池；`redis` 与 worker 共用 Stream —— Redis 连不上时**拒绝启动**（不再静默降级为 local）；`auto` 有 `REDIS_URL` 则 redis 否则 local。job id 一律服务端生成 UUID（`request_id` 只是关联字段，不作为 id）。 |
+| `BROWSER_HEADLESS_JOB_TTL_SECS` | 3600 | **local** 后端的任务结果 TTL（Redis 后端用 `BROWSER_HEADLESS_RESULT_TTL_SECS`）；同时是排队中的 local 任务等待 pool 槽位的上限。 |
+| `BROWSER_HEADLESS_MAX_ASYNC_JOBS` | 256 | local 异步任务的**在途**（排队+运行中）上限。已完成的结果不计入——保留结果占满时驱逐最老的已完成项腾位。 |
 | `screenshot` | bool | false | 截图（PNG）写入 `stat.screenshot`。 |
 | `pdf` | bool | false | `Page.printToPDF` 写入 `stat.pdf`。 |
 | `har` | bool | false | HAR 1.2 归档写入 `stat.har`（可在 Chrome DevTools 导入）。 |

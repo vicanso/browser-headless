@@ -68,22 +68,49 @@ impl JobStore {
         ctx: CaptureCtx,
         query: SummaryQuery,
     ) -> Result<String, CaptureError> {
-        self.purge_expired().await;
         let max = config::max_async_jobs();
-        {
-            let map = self.inner.read().await;
-            if map.len() >= max {
-                return Err(CaptureError::service_unavailable(format!(
-                    "async job queue full ({max}); retry later or raise BROWSER_HEADLESS_MAX_ASYNC_JOBS"
-                )));
-            }
-        }
-
         let id = Uuid::new_v4().to_string();
         let now = Instant::now();
         let ttl = config::job_ttl();
         {
+            // One write lock for the whole check → evict → insert sequence, so
+            // concurrent submits can't all pass the cap check (the old split
+            // read-then-write was a TOCTOU that overshot the cap).
             let mut map = self.inner.write().await;
+            map.retain(|_, rec| rec.expires > now);
+
+            // The cap bounds ACTIVE work (queued + running) only. Counting
+            // every retained record — the old behaviour — throttled
+            // throughput to `max` jobs per TTL window: 256 jobs that finished
+            // in seconds blocked all submits for the rest of the hour.
+            let active = map
+                .values()
+                .filter(|r| matches!(r.status, JobStatus::Queued | JobStatus::Running))
+                .count();
+            if active >= max {
+                return Err(CaptureError::service_unavailable(format!(
+                    "async job queue full ({active}/{max} in flight); retry later or raise BROWSER_HEADLESS_MAX_ASYNC_JOBS"
+                )));
+            }
+
+            // Memory stays bounded at the same `max` records as before: make
+            // room by evicting the OLDEST COMPLETED result instead of
+            // rejecting the submit. `active < max` guarantees a completed
+            // record exists whenever the map is full, so this always finds
+            // one; a poller that comes back after its result was evicted gets
+            // the same 404 an expired TTL would have produced.
+            while map.len() >= max {
+                let Some(oldest) = map
+                    .iter()
+                    .filter(|(_, r)| matches!(r.status, JobStatus::Done | JobStatus::Error))
+                    .min_by_key(|(_, r)| r.created)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                map.remove(&oldest);
+            }
+
             map.insert(
                 id.clone(),
                 JobRecord {
@@ -113,7 +140,10 @@ impl JobStore {
             }
         }
 
-        let result = capture::capture_one(&ctx, query).await;
+        // Queued-capture variant: pool-slot wait bounded by the job TTL, not
+        // the interactive 30s admission cut — an async job is supposed to
+        // wait out a busy pool instead of being shed with a terminal 503.
+        let result = capture::capture_one_queued(&ctx, query).await;
         let mut map = self.inner.write().await;
         let Some(rec) = map.get_mut(&id) else {
             return;

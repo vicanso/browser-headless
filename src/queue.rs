@@ -37,7 +37,10 @@ pub(crate) enum JobsBackendKind {
 impl JobsBackendKind {
     /// `BROWSER_HEADLESS_JOBS_BACKEND`:
     /// * `local` — always in-process
-    /// * `redis` — always Redis (fails submit if Redis unreachable)
+    /// * `redis` — always Redis; the process REFUSES TO START if Redis is
+    ///   unreachable (an explicit setting must never silently degrade to a
+    ///   node-local store — jobs would bypass the worker fleet and ids would
+    ///   only resolve on one node behind a load balancer)
     /// * `auto` (default) — Redis when `BROWSER_HEADLESS_REDIS_URL` is set,
     ///   otherwise local
     pub(crate) fn from_env() -> Self {
@@ -114,22 +117,24 @@ pub(crate) struct StoredJobResult {
 
 impl StoredJobResult {
     pub(crate) fn into_job_view(self, age_ms: u64) -> JobView {
+        // Terminal evidence (`status` / `data` / `error`) ALWAYS wins over a
+        // `phase` hint: a stale or replayed "queued"/"running" marker must
+        // never mask a result that is already present in the document. Phase
+        // is only consulted when no terminal field exists.
         let (status, http_status) = match (
             self.phase.as_deref(),
             self.status,
             self.data.is_some(),
             self.error.is_some(),
         ) {
-            (Some("queued"), _, _, _) => (JobStatus::Queued, None),
-            (Some("running"), _, _, _) => (JobStatus::Running, None),
             (_, Some(s), true, _) if s < 400 => (JobStatus::Done, Some(s)),
             (_, Some(s), _, true) => (JobStatus::Error, Some(s)),
             (_, Some(s), _, _) if s >= 400 => (JobStatus::Error, Some(s)),
             (_, Some(s), _, _) => (JobStatus::Done, Some(s)),
-            (Some("done"), _, _, _) => (JobStatus::Done, self.status),
-            (Some("error"), _, _, _) => (JobStatus::Error, self.status),
-            _ if self.error.is_some() => (JobStatus::Error, self.status.or(Some(500))),
-            _ if self.data.is_some() => (JobStatus::Done, self.status.or(Some(200))),
+            (_, None, _, true) => (JobStatus::Error, Some(500)),
+            (_, None, true, _) => (JobStatus::Done, Some(200)),
+            (Some("running"), None, _, _) => (JobStatus::Running, None),
+            // "queued" marker or anything unrecognized without terminal data.
             _ => (JobStatus::Queued, None),
         };
         JobView {
@@ -261,10 +266,17 @@ async fn connect(backend: &Backend, cfg: &QueueConfig) -> RedisResult<Conn> {
 }
 
 /// Producer handle for HTTP job enqueue / result lookup.
+///
+/// Holds ONE cached connection (opened at startup, cloned per call —
+/// multiplexed/cluster connections are designed for concurrent shared use)
+/// instead of dialing TCP+TLS+AUTH per request: the documented usage is
+/// *polling* `GET /jobs/{id}`, which would otherwise be a handshake storm.
+/// On a command error the cache is invalidated and the next call reconnects.
 #[derive(Clone)]
 pub(crate) struct QueueClient {
     backend: std::sync::Arc<Backend>,
     cfg: QueueConfig,
+    conn: std::sync::Arc<tokio::sync::Mutex<Option<Conn>>>,
 }
 
 impl QueueClient {
@@ -272,7 +284,7 @@ impl QueueClient {
         let cfg = QueueConfig::from_env();
         let backend = Backend::from_cfg(&cfg)
             .map_err(|e| CaptureError::service_unavailable(format!("redis config invalid: {e}")))?;
-        // Prove connectivity once at startup.
+        // Prove connectivity once at startup; keep the connection for reuse.
         let mut conn = connect(&backend, &cfg)
             .await
             .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
@@ -288,18 +300,45 @@ impl QueueClient {
         Ok(Self {
             backend: std::sync::Arc::new(backend),
             cfg,
+            conn: std::sync::Arc::new(tokio::sync::Mutex::new(Some(conn))),
         })
     }
 
+    /// Clone the cached connection, reconnecting lazily if a previous call
+    /// invalidated it. The mutex is held only for the clone/connect, never
+    /// across a command.
+    async fn conn(&self) -> Result<Conn, CaptureError> {
+        let mut guard = self.conn.lock().await;
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let c = connect(&self.backend, &self.cfg)
+            .await
+            .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
+        *guard = Some(c.clone());
+        Ok(c)
+    }
+
+    /// Drop the cached connection so the next call redials. Called on any
+    /// command error — a multiplexed connection does not self-heal.
+    async fn invalidate(&self) {
+        *self.conn.lock().await = None;
+    }
+
     /// Enqueue a job; returns the job id.
+    ///
+    /// The id is ALWAYS server-minted (UUID v4). It must never come from the
+    /// caller: the id is the Redis result-key suffix, so a caller-chosen id
+    /// lets one client overwrite / poll-hijack another's result (and two
+    /// honest clients reusing a stable trace id would silently collide).
+    /// `request_id` stays what it is documented to be — an opaque correlation
+    /// field inside the payload — and defaults to the job id when absent so
+    /// worker-side logs still correlate.
     pub(crate) async fn enqueue(&self, mut query: SummaryQuery) -> Result<String, CaptureError> {
-        let id = query
-            .request_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        // Ensure the payload carries the same id the result key uses.
-        query.request_id = Some(id.clone());
+        let id = Uuid::new_v4().to_string();
+        if query.request_id.as_deref().is_none_or(str::is_empty) {
+            query.request_id = Some(id.clone());
+        }
 
         #[derive(Serialize)]
         struct Payload<'a> {
@@ -310,47 +349,76 @@ impl QueueClient {
         let payload = serde_json::to_string(&Payload { id: &id, query })
             .map_err(|e| CaptureError::internal(format!("job serialize: {e}")))?;
 
-        let mut conn = connect(&self.backend, &self.cfg)
-            .await
-            .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
+        let mut conn = self.conn().await?;
 
-        // Marker so GET /jobs/:id returns queued before a worker finishes.
+        // Two SEPARATE commands, marker first — deliberately NOT a MULTI/EXEC
+        // pipeline: the stream and the result key hash to different cluster
+        // slots, so an atomic pipeline is a guaranteed CROSSSLOT error under
+        // BROWSER_HEADLESS_REDIS_CLUSTER (the worker's own pipelines are
+        // single-key and unaffected). Ordering closes the race the old
+        // atomicity targeted: the marker lands BEFORE the job becomes visible
+        // to workers, so a fast worker result can never be clobbered by a
+        // late marker write. `NX` makes the marker write non-destructive as a
+        // final belt-and-braces (a v4 UUID collision is astronomically
+        // unlikely; if it ever fires, refuse rather than overwrite).
         let marker = serde_json::json!({ "id": id, "phase": "queued" }).to_string();
         let key = self.cfg.result_key(&id);
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        pipe.cmd("XADD")
+        let set: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(&marker)
+            .arg("NX")
+            .arg("EX")
+            .arg(self.cfg.result_ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.fail("redis marker write failed", e))?;
+        if set.is_none() {
+            return Err(CaptureError::internal(format!(
+                "job id collision on `{id}`; not overwriting"
+            )));
+        }
+        let added: Result<String, redis::RedisError> = redis::cmd("XADD")
             .arg(&self.cfg.stream)
             .arg("*")
             .arg("payload")
             .arg(&payload)
-            .ignore();
-        pipe.set_ex(&key, &marker, self.cfg.result_ttl_secs)
-            .ignore();
-        pipe.query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| CaptureError::service_unavailable(format!("redis enqueue failed: {e}")))?;
+            .query_async(&mut conn)
+            .await;
+        if let Err(e) = added {
+            // Best-effort marker cleanup so the failed submit doesn't linger
+            // as a phantom `queued` job until TTL.
+            let _: RedisResult<i64> = conn.del(&key).await;
+            return Err(self.fail("redis enqueue failed", e));
+        }
 
         Ok(id)
     }
 
     pub(crate) async fn get(&self, id: &str) -> Result<Option<JobView>, CaptureError> {
-        let mut conn = connect(&self.backend, &self.cfg)
-            .await
-            .map_err(|e| CaptureError::service_unavailable(format!("redis connect failed: {e}")))?;
+        let mut conn = self.conn().await?;
         let key = self.cfg.result_key(id);
-        let raw: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| CaptureError::service_unavailable(format!("redis GET failed: {e}")))?;
+        let raw: Option<String> = match conn.get(&key).await {
+            Ok(v) => v,
+            Err(e) => return Err(self.fail("redis GET failed", e)),
+        };
         let Some(raw) = raw else {
             return Ok(None);
         };
         let stored: StoredJobResult = serde_json::from_str(&raw)
             .map_err(|e| CaptureError::internal(format!("job result decode: {e}")))?;
-        // age_ms not tracked in Redis — use 0 (unknown) or TTL remaining not
-        // worth a second round-trip for the common poll path.
+        // age_ms is not tracked server-side for the Redis backend; report 0
+        // (documented as "unknown") rather than spending a second round-trip
+        // per poll on TTL arithmetic.
         Ok(Some(stored.into_job_view(0)))
+    }
+
+    /// Map a command error to a 503 and schedule a reconnect for the next
+    /// call. Fire-and-forget: invalidation only needs to happen before the
+    /// next `conn()` acquires the lock.
+    fn fail(&self, what: &str, e: redis::RedisError) -> CaptureError {
+        let this = self.clone();
+        tokio::spawn(async move { this.invalidate().await });
+        CaptureError::service_unavailable(format!("{what}: {e}"))
     }
 }
 
@@ -368,15 +436,18 @@ pub(crate) async fn init_jobs_backend() -> Option<crate::jobs::JobsBackend> {
         }
         JobsBackendKind::Redis => match QueueClient::connect().await {
             Ok(client) => Some(crate::jobs::JobsBackend::Redis(client)),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "JOBS_BACKEND=redis but Redis is unavailable; falling back to local jobs"
-                );
-                let store = crate::jobs::JobStore::new();
-                store.clone().spawn_sweeper(Duration::from_secs(60));
-                Some(crate::jobs::JobsBackend::Local(store))
-            }
+            // NO silent fallback to local. A node that degrades to an
+            // in-process store bypasses the worker fleet, runs captures on
+            // its own (typically minimal) pool, and mints ids that resolve
+            // only on itself — behind a load balancer that's jobs randomly
+            // 404ing with /readyz still green. When the operator explicitly
+            // chose `redis` (or set REDIS_URL under `auto`), refuse to start
+            // so the failure is visible at deploy time.
+            Err(e) => panic!(
+                "jobs backend is `redis` but Redis is unreachable: {e}. \
+                 Fix connectivity or set BROWSER_HEADLESS_JOBS_BACKEND=local \
+                 (or BROWSER_HEADLESS_ASYNC_JOBS=false)."
+            ),
         },
     }
 }
@@ -410,6 +481,35 @@ mod tests {
         .into_job_view(0);
         assert_eq!(v.status, JobStatus::Done);
         assert_eq!(v.http_status, Some(200));
+    }
+
+    // Regression: a stale/replayed `queued` phase must not mask a result
+    // that is already present in the same document (terminal wins).
+    #[test]
+    fn stored_job_terminal_beats_stale_phase() {
+        let v = StoredJobResult {
+            id: "a".into(),
+            phase: Some("queued".into()),
+            status: Some(200),
+            data: Some(serde_json::json!({"x": 1})),
+            error: None,
+        }
+        .into_job_view(0);
+        assert_eq!(v.status, JobStatus::Done);
+        assert_eq!(v.http_status, Some(200));
+    }
+
+    #[test]
+    fn stored_job_running_phase() {
+        let v = StoredJobResult {
+            id: "a".into(),
+            phase: Some("running".into()),
+            status: None,
+            data: None,
+            error: None,
+        }
+        .into_job_view(0);
+        assert_eq!(v.status, JobStatus::Running);
     }
 
     #[test]

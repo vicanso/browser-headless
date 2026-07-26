@@ -308,6 +308,10 @@ async fn jobs_get(
     Path(id): Path<String>,
 ) -> Result<Json<JobView>, CaptureError> {
     check_auth(&state, &headers)?;
+    // Rate-limited like every other capture route (the docs promise `/jobs*`
+    // is covered). Polling is cheap per call, but on the Redis backend each
+    // poll is still a Redis command — unbounded polling is a DoS vector.
+    check_rate(&state)?;
     let jobs = state
         .jobs
         .as_ref()
