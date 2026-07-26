@@ -14,6 +14,7 @@ use axum::{
 };
 use axum_extra::extract::Query;
 use metrics_exporter_prometheus::PrometheusHandle;
+use tower_http::compression::CompressionLayer;
 use tracing::Instrument;
 
 use crate::capture::{
@@ -61,6 +62,11 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_endpoint))
         .route("/summary", get(summary_handler).post(summary_handler_post))
         .route("/summary/batch", post(summary_batch_handler))
+        // gzip/br/zstd response compression, negotiated per request via
+        // Accept-Encoding. The capture payloads are large text (HTML /
+        // markdown / WebPageStat JSON) that typically compresses 5-10×;
+        // clients that don't send Accept-Encoding get identity as before.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
@@ -72,6 +78,9 @@ pub(crate) fn health_router(ctx: CaptureCtx, metrics_handle: PrometheusHandle) -
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_endpoint))
+        // Same negotiated compression as the API router — the Prometheus
+        // exposition text compresses well and scrapers send Accept-Encoding.
+        .layer(CompressionLayer::new())
         .with_state(HealthState {
             ctx,
             metrics_handle,

@@ -7,6 +7,9 @@ license = "Apache-2.0"
 [dependencies]
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
+# Response compression for the large HTML/markdown/JSON payloads /summary
+# returns — negotiated via Accept-Encoding, so plain clients are unaffected.
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-br", "compression-zstd"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync", "io-util"] }
 num_cpus = "1.17.0"
 tracing = "0.1.44"

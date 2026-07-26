@@ -75,7 +75,8 @@ client) + [axum](https://github.com/tokio-rs/axum) (HTTP server).
   or feed `data` (as markdown) to an LLM to judge whether the page is
   valid — at a fraction of the full-snapshot payload.
 - **SSRF guard** — rejects non-http(s) schemes and private / loopback /
-  link-local / ULA / multicast IPs (incl. cloud metadata `169.254.169.254`)
+  link-local / ULA / multicast / CGNAT (`100.64.0.0/10`) / documentation
+  (TEST-NET, `2001:db8::/32`) IPs (incl. cloud metadata `169.254.169.254`)
   before even acquiring a page slot, **and re-checks every in-browser
   navigation / redirect hop** so a public URL can't 3xx-bounce into an
   internal host. Disabled via env var for internal scraping.
@@ -142,6 +143,11 @@ The server listens on `0.0.0.0:3000`.
 ---
 
 ## API
+
+All responses support negotiated `gzip` / `br` / `zstd` compression: send an
+`Accept-Encoding` header and the (large, highly compressible) HTML /
+markdown / JSON payloads shrink 5-10×. Clients that omit the header get
+identity encoding, exactly as before.
 
 ### `GET /healthz`
 

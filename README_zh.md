@@ -62,7 +62,8 @@ console 日志、Cookie，以及可选的截图 / PDF / HAR / DOM snapshot。
   `char_count` 配对判断，或把 `data`（markdown）喂给 LLM 判断页面是否
   有效 —— 代价只是完整快照的一小部分。
 - **SSRF 防护** —— 拒绝非 http(s) 协议以及私有 / 回环 / 链路本地 / ULA /
-  组播 IP（含云元数据 `169.254.169.254`），在占用 page 名额之前就快速失败，
+  组播 / CGNAT（`100.64.0.0/10`）/ 文档保留段（TEST-NET、`2001:db8::/32`）
+  IP（含云元数据 `169.254.169.254`），在占用 page 名额之前就快速失败，
   **并对浏览器内每一次导航 / 重定向跳转重新校验**，使公网 URL 无法通过 3xx
   跳转到内网主机。内网部署可通过环境变量关闭。
 - **总体超时兜底** —— 整个 capture 流程硬上限 `timeout_ms + buffer`
@@ -122,6 +123,10 @@ cargo build --release
 ---
 
 ## API
+
+所有响应均支持协商式 `gzip` / `br` / `zstd` 压缩：请求带上 `Accept-Encoding`
+头即可，HTML / markdown / JSON 这类大而易压的载荷通常可缩小 5-10 倍。
+不带该头的客户端仍收到未压缩响应，行为与之前完全一致。
 
 ### `GET /healthz`
 

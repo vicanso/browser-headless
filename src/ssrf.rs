@@ -100,6 +100,18 @@ pub(crate) fn is_blocked_ipv4(ip: &Ipv4Addr) -> bool {
         || ip.is_broadcast()    // 255.255.255.255
         || ip.is_unspecified()  // 0.0.0.0
         || ip.octets()[0] == 0 // 0.0.0.0/8 reserved
+        // 100.64.0.0/10 shared address space (CGNAT, RFC 6598) — used inside
+        // carrier / cloud networks (e.g. Tailscale, some VPC fabrics), so it's
+        // internal-facing the same way RFC 1918 is. (`Ipv4Addr::is_shared` is
+        // still unstable, hence the manual mask.)
+        || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64)
+        // 192.0.2/24, 198.51.100/24, 203.0.113/24 (TEST-NET-1/2/3) — never
+        // routable on the public internet; a URL resolving here is at best
+        // misconfigured and at worst probing. NOTE: the 198.18.0.0/15
+        // benchmarking range is deliberately NOT blocked — it's routable on
+        // some lab/interface setups and our own e2e redirect tests use it as
+        // a public-looking local address.
+        || ip.is_documentation()
 }
 
 pub(crate) fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
@@ -113,6 +125,11 @@ pub(crate) fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
     }
     // fc00::/7 ULA (unique local addresses)
     if (segments[0] & 0xfe00) == 0xfc00 {
+        return true;
+    }
+    // 2001:db8::/32 documentation range — the v6 analogue of TEST-NET; never
+    // publicly routable. (`Ipv6Addr::is_documentation` is still unstable.)
+    if segments[0] == 0x2001 && segments[1] == 0xdb8 {
         return true;
     }
     // IPv4-mapped (::ffff:x.x.x.x) — check embedded v4
@@ -136,13 +153,29 @@ mod tests {
             "169.254.169.254",
             "0.0.0.0",
             "255.255.255.255",
+            // CGNAT 100.64.0.0/10 boundaries
+            "100.64.0.0",
+            "100.100.100.100",
+            "100.127.255.255",
+            // TEST-NET-1/2/3 documentation ranges
+            "192.0.2.1",
+            "198.51.100.7",
+            "203.0.113.9",
         ] {
             assert!(
                 is_blocked_ipv4(&ip.parse().unwrap()),
                 "{ip} should be blocked"
             );
         }
-        for ip in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "198.18.0.1"] {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "198.18.0.1",
+            // one address either side of the CGNAT /10
+            "100.63.255.255",
+            "100.128.0.0",
+        ] {
             assert!(
                 !is_blocked_ipv4(&ip.parse().unwrap()),
                 "{ip} should be allowed"
@@ -159,6 +192,9 @@ mod tests {
             "fd00::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            // documentation 2001:db8::/32 + a v4-mapped CGNAT address
+            "2001:db8::1",
+            "::ffff:100.64.0.1",
         ] {
             assert!(
                 is_blocked_ipv6(&ip.parse().unwrap()),

@@ -3,6 +3,7 @@
 //! their own response types.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chromiumoxide::cdp::browser_protocol::css::{
@@ -4986,11 +4987,17 @@ pub async fn collect_summary(
     wait_until_load: bool,
     captures: CollectCaptures,
 ) -> Result<WebPageStat, Error> {
-    page.execute(NetworkEnableParams::default()).await?;
-    page.execute(PageEnableParams::default()).await?;
-    page.execute(RuntimeEnableParams::default()).await?;
-    page.execute(SetLifecycleEventsEnabledParams::new(true))
-        .await?;
+    // The four always-on domain enables are independent (different CDP
+    // domains) — join them so chromiumoxide pipelines the commands over the
+    // WebSocket (~1 RTT total) instead of paying four serial RTTs on every
+    // capture's critical path. All complete before the event listeners are
+    // registered and `page.goto` runs, so event delivery is unaffected.
+    tokio::try_join!(
+        page.execute(NetworkEnableParams::default()),
+        page.execute(PageEnableParams::default()),
+        page.execute(RuntimeEnableParams::default()),
+        page.execute(SetLifecycleEventsEnabledParams::new(true)),
+    )?;
 
     let mut response_stream = page.event_listener::<EventResponseReceived>().await?;
     let mut loading_finished_stream = page.event_listener::<EventLoadingFinished>().await?;
@@ -5106,12 +5113,18 @@ pub async fn collect_summary(
     // - Otherwise, gate on `networkIdle` lifecycle (Chrome emits this after
     //   ≥500ms with zero in-flight requests, i.e. all responses have already
     //   fired).
-    // - After the chosen gate fires, give a 500ms grace window so the select
-    //   loop can drain any response events still sitting in their channels.
+    // - After the chosen gate fires, exit as soon as the event streams have
+    //   been *quiet* for `QUIET_GRACE` — long enough to drain any response
+    //   events still sitting in their channels — capped at `POST_IDLE_GRACE`
+    //   past the gate so a page that keeps chattering (analytics beacons,
+    //   websockets) can't stretch the tail. The old behaviour was a flat
+    //   500ms wait after the gate on every request; quiescence-based exit
+    //   reclaims most of that on the common quiet path.
     // - `wait_for_request` patterns (if any) always need to be matched
     //   regardless of which gate is active.
     // - Soft cap: `timeout` (the page never settles → return best-effort).
     const POST_IDLE_GRACE: Duration = Duration::from_millis(500);
+    const QUIET_GRACE: Duration = Duration::from_millis(100);
     let deadline = Instant::now() + timeout;
     let mut idle_at: Option<Instant> = None;
     let mut load_at: Option<Instant> = None;
@@ -5119,6 +5132,14 @@ pub async fn collect_summary(
     let total_patterns = pending_patterns.len();
 
     loop {
+        // Time of the last event processed: every arrival at the loop top
+        // except the very first follows exactly one delivered event (the
+        // sleep arm breaks instead of looping), so this per-iteration stamp
+        // tracks stream quiescence for the exit policy. Marking the gate (a
+        // lifecycle event) lands here too, so the post-gate wait is never
+        // shorter than `QUIET_GRACE`.
+        let last_event_at = Instant::now();
+
         // Pick the gate marker per strategy. Grace period only kicks in once
         // the gate has fired AND all wait_for_request patterns have matched.
         // If patterns are still pending after the gate, keep waiting (up to
@@ -5126,7 +5147,13 @@ pub async fn collect_summary(
         let gate_at = if wait_until_load { load_at } else { idle_at };
         let ready_to_finish = gate_at.is_some() && pending_patterns.is_empty();
         let stop_at = match (ready_to_finish, gate_at) {
-            (true, Some(t)) => deadline.min(t + POST_IDLE_GRACE),
+            // Quiet exit: `QUIET_GRACE` past the last event, never earlier
+            // than `QUIET_GRACE` past the gate itself (`.max(t)` guards the
+            // theoretical case of a stale `last_event_at`), never later than
+            // `POST_IDLE_GRACE` past the gate, and always within `deadline`.
+            (true, Some(t)) => deadline
+                .min(t + POST_IDLE_GRACE)
+                .min(last_event_at.max(t) + QUIET_GRACE),
             _ => deadline,
         };
         let remaining = stop_at.saturating_duration_since(Instant::now());
@@ -8059,8 +8086,12 @@ pub struct SummaryRequest {
 /// 4. optional post-load selector wait + settle delay
 /// 5. format the `data` field (html / markdown / text, optionally scoped)
 /// 6. close the page (chromium subprocess kept alive via the shared Browser)
+///
+/// Takes `&Arc<Browser>` (not `&Browser`) so the end-of-capture teardown can
+/// clone the handle into a detached task — closing the page and disposing the
+/// incognito context happen off the response's critical path.
 pub async fn capture(
-    browser: &Browser,
+    browser: &Arc<Browser>,
     default_user_agent: &str,
     req: SummaryRequest,
 ) -> Result<WebPageStat, Error> {
@@ -8494,12 +8525,20 @@ pub async fn capture(
         duration_ms = t_format.elapsed().as_millis() as u64
     );
 
-    let _ = page.close().await;
-    // Best-effort dispose — if it fails, the browser's context GC eventually
-    // collects the orphaned context. Errors here shouldn't fail the request.
-    let _ = browser
-        .execute(DisposeBrowserContextParams::new(ctx_id))
-        .await;
+    // Teardown off the critical path: the caller already has its result —
+    // closing the page and disposing the incognito context are pure cleanup,
+    // so run them in a detached task instead of spending 1-2 CDP round-trips
+    // on every response's tail. Both are best-effort — if either fails, the
+    // browser's context GC / the pool's instance recycle eventually reclaims
+    // the orphan. The cloned `Arc<Browser>` keeps the CDP connection alive
+    // for the task even if the pool swaps the instance meanwhile.
+    let teardown_browser = Arc::clone(browser);
+    tokio::spawn(async move {
+        let _ = page.close().await;
+        let _ = teardown_browser
+            .execute(DisposeBrowserContextParams::new(ctx_id))
+            .await;
+    });
     Ok(stat)
 }
 

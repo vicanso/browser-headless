@@ -173,7 +173,9 @@ pub struct Checkout {
 }
 
 impl Checkout {
-    pub fn browser(&self) -> &Browser {
+    /// Shared handle to this checkout's browser. Returned as `&Arc<Browser>`
+    /// so `browser::capture` can clone it into its detached teardown task.
+    pub fn browser(&self) -> &Arc<Browser> {
         &self.browser
     }
 
