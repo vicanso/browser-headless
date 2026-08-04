@@ -893,7 +893,7 @@ this README).
 
 | Env var | Default | Effect |
 |---|---|---|
-| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no API port); `all` runs both in one process sharing one browser pool (handy on a single box — they compete for `POOL_SIZE × MAX_PAGES`). See [Worker mode](#worker-mode-redis-queue). |
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` runs the HTTP API; `worker` runs the Redis queue consumer (no API port); `all` runs both in one process sharing one browser pool (handy on a single box — they compete for `POOL_SIZE × MAX_PAGES`); `mcp` serves the Model Context Protocol over stdio for locally-spawned AI clients. See [Worker mode](#worker-mode-redis-queue) and [MCP server](#mcp-server-ai-agents). |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | **Worker mode only.** Port for the worker's `/healthz` + `/readyz` + `/metrics` listener (serve / all already serve these on the API port 3000). The `healthcheck` subcommand probes this port in worker mode. |
 | `BROWSER_HEADLESS_API_KEY` | unset (open) | Enables API key auth. When set, every `/summary` call must carry header `X-Api-Key: <value>`; mismatch / missing returns 401. `/healthz`, `/readyz`, and `/metrics` are always open so probes / scrapers work. The key is compared in constant time (`subtle::ConstantTimeEq`); still use a high-entropy key (≥32 random bytes) since the comparison short-circuits on length. |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | Number of chromium processes in the pool. Total concurrency = `POOL_SIZE × MAX_PAGES`. `1` reproduces the original single-instance behaviour. Each instance uses its own profile dir and is supervised independently. |
@@ -913,6 +913,7 @@ this README).
 | `BROWSER_HEADLESS_RATE_LIMIT_RPS` | 0 (off) | Process-wide token-bucket rate limit for capture/job routes. Health probes are not limited. |
 | `BROWSER_HEADLESS_RATE_LIMIT_BURST` | max(rps, 1) | Burst capacity when rate limiting is on. |
 | `BROWSER_HEADLESS_DISABLE_SCRIPT` | false | When true, reject requests that include a `script` param (403). Multi-tenant hardening. |
+| `BROWSER_HEADLESS_DISABLE_MCP` | false | When true, do **not** mount the [MCP endpoint](#mcp-server-ai-agents) at `/mcp` in serve/all mode (REST-only deployment). Does not affect `MODE=mcp` (explicit stdio opt-in). |
 | `BROWSER_HEADLESS_REQUIRE_API_KEY` | false | When true, refuse to start serve/all without `BROWSER_HEADLESS_API_KEY`. |
 | `BROWSER_HEADLESS_PROTECT_METRICS` | false | When true, `/metrics` requires the same `X-Api-Key` as the API. `/healthz` stays open. |
 | `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` or `json` (structured logs for k8s). |
@@ -930,15 +931,37 @@ this README).
 ## Worker mode (Redis queue)
 
 For horizontal scaling across machines, run instances as **queue workers**
-instead of (or alongside) the HTTP API. With `BROWSER_HEADLESS_MODE=worker` the
-process binds no HTTP port, joins a Redis Streams consumer group, and for each
-job runs the same capture engine on its own browser pool, writing the result to
-a `result:{id}` key. Add workers to add throughput; the HTTP API is fully
-decoupled (the two share only library code, never call each other).
+instead of (or alongside) the HTTP API. Add workers to add throughput; the
+HTTP API is fully decoupled (the two share only library code, never call each
+other).
 
-**Start a worker** — same binary as the HTTP service, switched with
-`BROWSER_HEADLESS_MODE=worker`. It needs Chrome (like serve mode) plus a Redis
-URL:
+```
+          XADD payload              XREADGROUP (blocking)
+producer ─────────────► jobs stream ─────────────────────► worker
+                                                             │ capture on its
+          GET (poll) or                    SETEX + PUBLISH   │ own browser pool
+consumer ◄───────────── result:{id} ◄────────────────────────┤
+          SUBSCRIBE (push)  (TTL'd)                          └─ then XACK + XDEL
+```
+
+**Lifecycle of one job:**
+
+1. A producer `XADD`s a JSON payload to the jobs stream (via `redis-cli`,
+   your own code, or the HTTP API's `POST /jobs` with the Redis backend).
+2. A worker's blocking `XREADGROUP` picks it up the instant it lands — the
+   consumer group hands each worker a disjoint slice of the stream.
+3. The worker flips `result:{id}` to a `running` marker (resetting its TTL)
+   and runs the capture on its own browser pool.
+4. On completion it writes the result to `result:{id}` (`SETEX`, TTL'd) and
+   `PUBLISH`es the same JSON to a channel of the same name.
+5. Only then is the entry `XACK`ed (+ `XDEL`ed). A worker that crashes before
+   step 5 leaves the entry pending; another worker reclaims it via
+   `XAUTOCLAIM` once it has been idle past `JOB_VISIBILITY_MS`.
+
+### Quick start
+
+Same binary as the HTTP service, switched with `BROWSER_HEADLESS_MODE=worker`.
+It needs Chrome (like serve mode) plus a Redis URL:
 
 ```bash
 # Docker
@@ -954,20 +977,26 @@ BROWSER_HEADLESS_REDIS_URL=redis://127.0.0.1:6379 \
   ./target/release/browser-headless
 ```
 
-Run as many workers as you like (one per machine / container) — they share the
-consumer group and Redis hands each a disjoint slice of the stream. There's no
-HTTP port to expose; the worker logs `worker mode starting` once it's connected.
+Run as many workers as you like (one per machine / container). There's no
+HTTP port to expose; the worker logs `worker mode starting` once connected.
 
-**Enqueue** a job by `XADD`-ing a single `payload` field (JSON) to the stream —
-`{ "id": "...", "url": "...", ...any /summary param... }` (`id` optional, falls
-back to the stream entry id):
+### Submitting jobs
+
+`XADD` a single `payload` field (JSON) to the stream — `{ "id": "...",
+"url": "...", ...any /summary param... }` (`id` optional, falls back to the
+stream entry id):
 
 ```bash
 redis-cli XADD browser_headless:jobs '*' payload \
   '{"id":"job1","url":"https://example.com","content_only":true,"data_format":"markdown"}'
 ```
 
-**Read** the result (JSON, TTL'd):
+If the HTTP API runs with the Redis jobs backend, `POST /jobs` does this for
+you (and mints a collision-safe UUID id).
+
+### Reading results
+
+Poll the result key (JSON, TTL'd):
 
 ```bash
 redis-cli GET browser_headless:result:job1
@@ -975,20 +1004,37 @@ redis-cli GET browser_headless:result:job1
 ```
 
 `data` mirrors the single-endpoint payload (the compact content object when
-`content_only`, otherwise the full `WebPageStat`); on failure the result carries
-`status` + `error` instead. Delivery is **at-least-once**: a job is acked only
-after its result is written, and entries abandoned by a crashed worker are
-reclaimed (`XAUTOCLAIM`) after the visibility timeout — so a capture may run
-twice (fine for read-only captures; add an idempotency key for side-effecting
-`script`s). Transient failures (408 / 502 / 503 / 504) are retried in-process up
-to `JOB_MAX_RETRIES` before a terminal error is written. Concurrency per worker =
-its pool capacity (`POOL_SIZE × MAX_PAGES`); jobs run in a continuous pipeline,
-so a slow capture never holds back the others.
+`content_only`, otherwise the full `WebPageStat`); on failure the result
+carries `status` + `error` instead. While the job is waiting / executing the
+key holds a `{"phase":"queued"}` / `{"phase":"running"}` marker.
 
-**Block-waiting for a result:** instead of polling `GET result:{id}`, a client
-can `SUBSCRIBE` to the channel of the same name — the worker `PUBLISH`es the
-result JSON there on completion (`RESULT_NOTIFY`, on by default). The key is
-still written, so polling and late subscribers keep working.
+**Push instead of poll:** `SUBSCRIBE` to the channel with the same name as
+the result key — the worker `PUBLISH`es the result JSON there on completion
+(`RESULT_NOTIFY`, on by default). The key is still written, so polling and
+late subscribers keep working.
+
+### Delivery semantics
+
+- **At-least-once.** A job is acked only after its result is written; entries
+  abandoned by a crashed worker are reclaimed after the visibility timeout.
+  A capture may therefore run twice — fine for read-only captures; add an
+  idempotency key for side-effecting `script`s.
+- **Transient retries.** 408 / 502 / 503 / 504 capture failures are retried
+  in-process up to `JOB_MAX_RETRIES` before a terminal error is written;
+  definitive failures (400 / 401 / 403 / 404) are never retried.
+- **Concurrency** per worker = its pool capacity (`POOL_SIZE × MAX_PAGES`).
+  Jobs run in a continuous pipeline — a slow capture never holds back others.
+- **Graceful shutdown.** On SIGTERM the worker stops pulling and drains
+  in-flight jobs (`WORKER_DRAIN_MS`); anything unfinished stays pending and
+  is reclaimed by another worker.
+
+### Configuration
+
+The pool / recycle / SSRF / timeout env vars from
+[Configuration](#configuration) apply to workers too. Worker-specific knobs,
+by concern:
+
+**Redis connection**
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -996,6 +1042,12 @@ still written, so polling and late subscribers keep working.
 | `BROWSER_HEADLESS_REDIS_CLUSTER` | unset (false) | Set to `1`/`true`/`yes`/`on` to treat `REDIS_URL` as Redis **Cluster** seed nodes. All worker commands are single-key so routing never hits CROSSSLOT; note the job stream lives on one node (`result:{id}` keys distribute across the cluster). |
 | `BROWSER_HEADLESS_REDIS_CA_CERT` | unset | Path to a PEM CA certificate to verify the server (private CA). When unset, the system trust store is used. Requires a `rediss://` URL. Applies to single-node and cluster. |
 | `BROWSER_HEADLESS_REDIS_CLIENT_CERT` / `BROWSER_HEADLESS_REDIS_CLIENT_KEY` | unset | Paths to a PEM client certificate + key for **mutual TLS**. Both must be set together (setting only one is a fatal config error). |
+| `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | TCP + TLS + auth handshake timeout when opening a Redis connection. Raised from redis-rs's 1s default, which is too tight for a high-latency / cross-region Redis (e.g. Upstash) and surfaces as `timed out` on connect. |
+
+**Queue & results**
+
+| Env var | Default | Effect |
+|---|---|---|
 | `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | Stream consumed for jobs. |
 | `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | Consumer group — load-balances jobs across all workers. |
 | `BROWSER_HEADLESS_GROUP_START` | `0` | Start position when the group is **first** created: `0` consumes everything already in the stream (backlog enqueued before the worker started); `$` only consumes messages added after creation. Only affects first creation — once the group exists it keeps its own position across restarts. |
@@ -1004,21 +1056,75 @@ still written, so polling and late subscribers keep working.
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | TTL (seconds) on result keys. |
 | `BROWSER_HEADLESS_RESULT_NOTIFY` | `true` | After writing `result:{id}`, `PUBLISH` the result JSON to a channel of the same name so clients can `SUBSCRIBE` and block instead of polling. The key is still written; set `false` to skip publishing. |
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | `XDEL` each entry from the stream after it's processed + acked, so the stream doesn't grow forever (the result still lives in `result:{id}`). Set `false` to retain entries — e.g. for replay or a second consumer group on the same stream, since `XDEL` removes the entry for **all** groups (then cap the stream with MAXLEN yourself). |
+
+**Tuning & shutdown**
+
+| Env var | Default | Effect |
+|---|---|---|
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 60000 | `XREADGROUP` block time before a reclaim pass. A long window does **not** delay job pickup (a blocking read returns the instant a new entry lands) — it only sets the idle churn rate (each timeout = 1 `XREADGROUP` + 1 `XAUTOCLAIM`), which matters on command-count-limited cloud Redis (e.g. Upstash free tier). Page detection isn't real-time work; minute-level idle cadence is plenty. Lower it only if you need faster crashed-worker reclaim (worst case ~1 window on top of `JOB_VISIBILITY_MS`). |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | Idle time before a pending entry is reclaimable by another worker. |
 | `BROWSER_HEADLESS_JOB_MAX_RETRIES` | 2 | Times to retry a *transient* capture failure (408 / 502 / 503 / 504) before writing a terminal error. Definitive failures (400 / 401 / 403 / 404) are never retried. `0` disables retries. |
 | `BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS` | 500 | Fixed backoff between transient-failure retries. |
-| `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | TCP + TLS + auth handshake timeout when opening a Redis connection. Raised from redis-rs's 1s default, which is too tight for a high-latency / cross-region Redis (e.g. Upstash) and surfaces as `timed out` on connect. |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | Port for the worker's `/healthz` + `/readyz` + `/metrics` listener (a worker binds no API port otherwise). The `healthcheck` subcommand probes it. |
 | `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 300 | How often the worker refreshes the queue-depth gauges (`worker_stream_length` / `worker_pending`) via `XLEN` + `XPENDING` (2 commands per sample). Queue depth for a non-real-time detection workload doesn't need finer than 5-minute resolution; raise/lower to trade observability granularity against Redis command budget. |
 | `BROWSER_HEADLESS_WORKER_DRAIN_MS` | 30000 | On SIGTERM / SIGINT, how long the worker waits for in-flight jobs to finish before exiting. Jobs still running at the deadline stay pending and are reclaimed by another worker. |
 
-The pool / recycle / SSRF / timeout env vars from [Configuration](#configuration)
-apply to workers too. A worker binds no API port but **does** serve `/healthz`,
-`/readyz`, and `/metrics` on `BROWSER_HEADLESS_HEALTH_PORT` (default 3000) — so
-it is probeable and scrapeable like the HTTP service, exposing the extra
-`worker_*` metrics (jobs, duration, in-flight, reclaimed, stream length,
-pending). Also watch Redis consumer-group lag (`worker_pending` / `XPENDING`).
+### Health & metrics
+
+A worker binds no API port but **does** serve `/healthz`, `/readyz`, and
+`/metrics` on `BROWSER_HEADLESS_HEALTH_PORT` (default 3000) — probeable and
+scrapeable like the HTTP service, exposing the extra `worker_*` metrics
+(jobs, duration, in-flight, reclaimed, stream length, pending). Also watch
+Redis consumer-group lag (`worker_pending` / `XPENDING`).
+
+---
+
+## MCP server (AI agents)
+
+The capture engine is also exposed via the
+[Model Context Protocol](https://modelcontextprotocol.io), so AI agents
+(Claude Code, Claude Desktop, or any MCP client) can drive the browser as
+tools. Same pool, same SSRF guard, same admission control and metrics as the
+REST API — MCP is a third front-end next to HTTP and the Redis worker.
+
+### Tools
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `fetch_page` | `url`, `format` (`markdown` default / `text` / `html`), `timeout_ms`, `wait_for_element`, `wait_for_network_idle` | The rendered page body (JavaScript executed, so SPAs work). Uses the fast `load`-event path by default; set `wait_for_network_idle=true` for late-XHR content. |
+| `screenshot` | `url`, `width`, `height`, `timeout_ms` | A PNG of the rendered viewport, returned as an MCP image block. |
+| `page_audit` | `url`, `lang` (`en` default / `zh`), `timeout_ms` | Markdown report: load timings, Core Web Vitals, resource/network summary, JS exceptions, security scan, metadata. The page body is omitted — use `fetch_page` for content. |
+
+The heavyweight REST payloads (`resources[]`, HAR, DOM snapshots, PDF) are
+deliberately **not** exposed as tools — tool output lands in a model's context
+window, so the tool surface stays lean by design.
+
+Capture failures (SSRF-blocked URL, pool saturation, timeout) surface as
+tool-level errors carrying the HTTP status (`capture failed (HTTP 403):
+blocked IPv4 host …`), so the model can react — fix the URL, back off, retry.
+
+### Streamable HTTP (serve / all mode)
+
+`/mcp` is mounted on the API port automatically (opt out with
+`BROWSER_HEADLESS_DISABLE_MCP=true`). It sits behind the same `X-Api-Key`
+auth and rate limit as the capture routes:
+
+```bash
+claude mcp add --transport http browser http://your-host:3000/mcp \
+  --header "X-Api-Key: your-key"
+```
+
+### stdio (`BROWSER_HEADLESS_MODE=mcp`)
+
+For MCP clients that spawn a local process. The process launches its own
+browser pool and logs to **stderr** (stdout is the protocol channel):
+
+```bash
+claude mcp add browser \
+  --env BROWSER_HEADLESS_MODE=mcp \
+  --env CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  -- /path/to/browser-headless
+```
 
 ---
 

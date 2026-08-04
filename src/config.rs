@@ -189,6 +189,15 @@ pub(crate) fn disable_script() -> bool {
     *V.get_or_init(|| env_bool("BROWSER_HEADLESS_DISABLE_SCRIPT", false))
 }
 
+/// When true, do NOT mount the MCP endpoint at `/mcp` in serve/all mode
+/// (`BROWSER_HEADLESS_DISABLE_MCP`, default false — MCP enabled). The
+/// endpoint shares the API-key auth of the capture routes, so it adds no
+/// new trust surface; disable it only when you want a REST-only deployment.
+pub(crate) fn disable_mcp() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| env_bool("BROWSER_HEADLESS_DISABLE_MCP", false))
+}
+
 /// When true, refuse to start in serve/all mode without
 /// `BROWSER_HEADLESS_API_KEY` (`BROWSER_HEADLESS_REQUIRE_API_KEY`, default
 /// false).

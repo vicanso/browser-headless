@@ -51,16 +51,16 @@ pub(crate) enum ResponseFormat {
 pub(crate) struct ContentResponse {
     /// HTTP status of the final (post-redirect) main document. `0` when no
     /// Document response carried timing (fully-cached / unusual flow).
-    status: u32,
+    pub(crate) status: u32,
     /// Final document URL after redirects. Equal to the requested URL when
     /// no redirect happened; compare against it to detect hijacks/landings.
-    final_url: String,
+    pub(crate) final_url: String,
     /// Unicode-scalar length of `data`. A near-zero count on a 200 is the
     /// signal for a blank / JS-skeleton page that failed to render content.
-    char_count: usize,
+    pub(crate) char_count: usize,
     /// The page content in the caller's chosen `data_format` (`html`
     /// default / `text` / `markdown`).
-    data: String,
+    pub(crate) data: String,
 }
 
 /// All capture knobs. Deserialized from the HTTP query/body and, for

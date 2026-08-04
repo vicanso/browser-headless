@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRef, Path, State},
+    extract::{DefaultBodyLimit, FromRef, Path, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -23,6 +24,7 @@ use crate::capture::{
 use crate::config::{self, max_batch_urls};
 use crate::error::CaptureError;
 use crate::jobs::{JobView, JobsBackend};
+use crate::mcp;
 use crate::rate_limit::RateLimiter;
 
 #[derive(Clone)]
@@ -92,6 +94,21 @@ pub(crate) fn router(state: AppState) -> Router {
         r = r
             .route("/jobs", post(jobs_submit))
             .route("/jobs/{id}", get(jobs_get));
+    }
+
+    // MCP endpoint (Streamable HTTP) — the capture engine as AI-callable
+    // tools, sharing this process's pool. Handlers can't run the per-route
+    // `check_auth` (the MCP service is a raw tower service), so the same
+    // X-Api-Key check is applied as a middleware scoped to `/mcp` only.
+    // Rate limiting happens inside the tool calls (see `mcp::McpServer`).
+    if !config::disable_mcp() {
+        let mcp_router = Router::new()
+            .nest_service(
+                "/mcp",
+                mcp::streamable_service(state.ctx.clone(), Arc::clone(&state.rate_limiter)),
+            )
+            .layer(middleware::from_fn_with_state(state.clone(), mcp_auth));
+        r = r.merge(mcp_router);
     }
 
     r.layer(DefaultBodyLimit::max(body_limit))
@@ -357,6 +374,16 @@ fn check_rate(state: &AppState) -> Result<(), CaptureError> {
 
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), CaptureError> {
     check_api_key(state.api_key.as_ref(), headers)
+}
+
+/// API-key middleware for the `/mcp` mount — the MCP transport is a raw tower
+/// service, so auth wraps it from outside instead of running inside a handler.
+/// Same key, same constant-time comparison as the capture routes.
+async fn mcp_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    match check_api_key(state.api_key.as_ref(), req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Shared-secret API key check. No-op when `api_key` is `None` (auth disabled).

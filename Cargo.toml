@@ -25,6 +25,12 @@ subtle = "2.6"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 redis = { version = "1.4.1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"] }
+# MCP (Model Context Protocol) server front-end: tools over stdio
+# (BROWSER_HEADLESS_MODE=mcp) and Streamable HTTP (mounted at /mcp).
+# Default features already include `server` + `macros`.
+rmcp = { version = "3.1.0", features = ["transport-io", "transport-streamable-http-server"] }
+# JSON Schema derive for MCP tool argument structs (same major as rmcp uses).
+schemars = "1.0"
 # redis's `tokio-rustls-comp` pulls rustls 0.23 but selects no crypto provider,
 # so we enable + install `ring` ourselves (see main.rs). `ring` avoids the
 # cmake/C build deps that `aws-lc-rs` needs.

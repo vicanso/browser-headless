@@ -203,6 +203,7 @@ curl -X POST http://localhost:3000/summary \
 | `BROWSER_HEADLESS_RATE_LIMIT_RPS` | 0（关） | 进程级 token-bucket 限流（仅 capture/job 路由；health 不受限）。 |
 | `BROWSER_HEADLESS_RATE_LIMIT_BURST` | max(rps, 1) | 限流开启时的突发容量。 |
 | `BROWSER_HEADLESS_DISABLE_SCRIPT` | false | 为 true 时拒绝带 `script` 参数的请求（403）。多租户加固。 |
+| `BROWSER_HEADLESS_DISABLE_MCP` | false | 为 true 时 serve/all 模式**不**挂载 [MCP 端点](#mcp-服务ai-agent-接入) `/mcp`（纯 REST 部署）。不影响 `MODE=mcp`（显式 stdio 启用）。 |
 | `BROWSER_HEADLESS_REQUIRE_API_KEY` | false | 为 true 时 serve/all 启动必须配置 `BROWSER_HEADLESS_API_KEY`。 |
 | `BROWSER_HEADLESS_PROTECT_METRICS` | false | 为 true 时 `/metrics` 需要与 API 相同的 `X-Api-Key`。`/healthz` 仍开放。 |
 | `BROWSER_HEADLESS_LOG_FORMAT` | `text` | `text` 或 `json`（k8s 友好结构化日志）。 |
@@ -832,7 +833,7 @@ curl -X POST http://localhost:3000/summary/batch \
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 API 端口）；`all` 一个进程同时跑两者、共享一个浏览器池（单机方便——两者抢 `POOL_SIZE × MAX_PAGES` 容量）。见 [Worker 模式](#worker-模式redis-队列)。 |
+| `BROWSER_HEADLESS_MODE` | `serve` | `serve` 跑 HTTP 接口；`worker` 跑 Redis 队列消费者（无 API 端口）；`all` 一个进程同时跑两者、共享一个浏览器池（单机方便——两者抢 `POOL_SIZE × MAX_PAGES` 容量）；`mcp` 以 stdio 提供 Model Context Protocol，供本地拉起的 AI 客户端使用。见 [Worker 模式](#worker-模式redis-队列)与 [MCP 服务](#mcp-服务ai-agent-接入)。 |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | **仅 worker 模式。** worker 的 `/healthz` + `/readyz` + `/metrics` 监听端口（serve / all 已在 API 端口 3000 上提供这些）。`healthcheck` 子命令在 worker 模式下探测此端口。 |
 | `BROWSER_HEADLESS_API_KEY` | 未设置（开放） | 开启 API key 鉴权。设置后，`/summary` 必须带 `X-Api-Key: <value>` header，不匹配 / 缺失返 401。`/healthz`、`/readyz`、`/metrics` 永远开放（保证探针 / 抓取可用）。key 采用常量时间比对（`subtle::ConstantTimeEq`）；但因长度不同会短路，仍建议使用高熵 key（≥32 随机字节）。 |
 | `BROWSER_HEADLESS_POOL_SIZE` | 1 | 池中 chromium 进程数。总并发 = `POOL_SIZE × MAX_PAGES`。`1` 即原单实例行为。每个实例用独立 profile 目录、独立监督。 |
@@ -854,13 +855,34 @@ curl -X POST http://localhost:3000/summary/batch \
 ## Worker 模式（Redis 队列）
 
 为了跨机横向扩展，可以把实例跑成**队列 worker**，与 HTTP 接口并存或替代它。
-设 `BROWSER_HEADLESS_MODE=worker`：进程不绑任何 HTTP 口，加入 Redis Streams
-consumer group，对每个 job 用同一套抓取引擎在自己的浏览器池上跑，把结果写回
-`result:{id}` 键。加机器 = 加 worker；HTTP 接口完全解耦（两者只共享库代码，
-互不调用）。
+加机器 = 加吞吐；HTTP 接口完全解耦（两者只共享库代码，互不调用）。
 
-**启动 worker**——与 HTTP 服务同一个 binary，靠 `BROWSER_HEADLESS_MODE=worker`
-切换。和 serve 模式一样需要 Chrome，再加一个 Redis URL：
+```
+         XADD payload            XREADGROUP（阻塞）
+生产者 ────────────► jobs stream ──────────────────► worker
+                                                       │ 在自己的浏览器池上
+         GET（轮询）或             SETEX + PUBLISH      │ 执行抓取
+消费者 ◄──────────── result:{id} ◄─────────────────────┤
+         SUBSCRIBE（推送） （带 TTL）                    └─ 最后 XACK + XDEL
+```
+
+**一个 job 的生命周期：**
+
+1. 生产者往 jobs stream `XADD` 一条 JSON payload（`redis-cli`、自己的代码，
+   或走 Redis 后端的 HTTP `POST /jobs`）。
+2. worker 的阻塞 `XREADGROUP` 在条目落流的瞬间取到它——consumer group 给每个
+   worker 分发互不重叠的一份。
+3. worker 把 `result:{id}` 置为 `running` marker（同时重置其 TTL），在自己的
+   浏览器池上执行抓取。
+4. 完成后把结果写入 `result:{id}`（`SETEX`，带 TTL），并向同名频道
+   `PUBLISH` 同一份 JSON。
+5. 此后才 `XACK`（+ `XDEL`）。第 5 步之前崩溃的 worker 会留下 pending 条目，
+   空闲超过 `JOB_VISIBILITY_MS` 后由其它 worker 经 `XAUTOCLAIM` 重认领。
+
+### 快速开始
+
+与 HTTP 服务同一个 binary，靠 `BROWSER_HEADLESS_MODE=worker` 切换。和 serve
+模式一样需要 Chrome，再加一个 Redis URL：
 
 ```bash
 # Docker
@@ -876,36 +898,58 @@ BROWSER_HEADLESS_REDIS_URL=redis://127.0.0.1:6379 \
   ./target/release/browser-headless
 ```
 
-想跑几个 worker 就跑几个（一机/一容器一个）——它们共享 consumer group，Redis
-给每个分发互不重叠的一份 stream。没有 HTTP 口要暴露；连上后 worker 会打印一条
-`worker mode starting`。
+想跑几个 worker 就跑几个（一机/一容器一个）。没有 HTTP 口要暴露；连上后
+worker 会打印一条 `worker mode starting`。
 
-**入队**：往 stream `XADD` 一个 `payload` 字段（JSON）——
-`{ "id": "...", "url": "...", ...任意 /summary 参数... }`（`id` 可选，缺省回退到
-stream entry id）：
+### 提交任务
+
+往 stream `XADD` 一个 `payload` 字段（JSON）——`{ "id": "...", "url": "...",
+...任意 /summary 参数... }`（`id` 可选，缺省回退到 stream entry id）：
 
 ```bash
 redis-cli XADD browser_headless:jobs '*' payload \
   '{"id":"job1","url":"https://example.com","content_only":true,"data_format":"markdown"}'
 ```
 
-**取结果**（JSON，带 TTL）：
+如果 HTTP 服务以 Redis jobs 后端运行，`POST /jobs` 会替你完成这一步（并生成
+防碰撞的 UUID id）。
+
+### 读取结果
+
+轮询结果键（JSON，带 TTL）：
 
 ```bash
 redis-cli GET browser_headless:result:job1
 # {"id":"job1","status":200,"data":{"status":200,"final_url":"https://example.com/","char_count":167,"data":"# ..."}}
 ```
 
-`data` 与单接口返回同款（`content_only` 为紧凑内容对象，否则完整 `WebPageStat`）；
-失败时结果带 `status` + `error`。投递为 **at-least-once**：结果写完才 ack，崩溃
-worker 遗留的条目在可见性超时后被 `XAUTOCLAIM` 重认领——所以同一 URL 可能抓两次
-（只读抓取无害；带副作用的 `script` 请加幂等键）。瞬时失败（408 / 502 / 503 /
-504）会在进程内重试至多 `JOB_MAX_RETRIES` 次后才写终态错误。单 worker 并发 = 其池
-容量（`POOL_SIZE × MAX_PAGES`）；任务以连续流水线方式运行，慢任务不会拖住其它任务。
+`data` 与单接口返回同款（`content_only` 为紧凑内容对象，否则完整
+`WebPageStat`）；失败时结果带 `status` + `error`。任务等待 / 执行期间，该键
+分别是 `{"phase":"queued"}` / `{"phase":"running"}` marker。
 
-**阻塞等待结果：** 客户端无需轮询 `GET result:{id}`，可 `SUBSCRIBE` 同名频道——
-worker 完成时把结果 JSON `PUBLISH` 到该频道（`RESULT_NOTIFY`，默认开启）。结果键
-仍会写入，所以轮询和迟到的订阅者照常工作。
+**推送代替轮询：** `SUBSCRIBE` 与结果键同名的频道——worker 完成时把结果 JSON
+`PUBLISH` 到该频道（`RESULT_NOTIFY`，默认开启）。结果键仍会写入，所以轮询和
+迟到的订阅者照常工作。
+
+### 投递语义
+
+- **At-least-once。** 结果写完才 ack；崩溃 worker 遗留的条目在可见性超时后被
+  重认领。因此同一 URL 可能抓两次——只读抓取无害；带副作用的 `script` 请加
+  幂等键。
+- **瞬时重试。** 408 / 502 / 503 / 504 的抓取失败在进程内重试至多
+  `JOB_MAX_RETRIES` 次后才写终态错误；确定性失败（400 / 401 / 403 / 404）
+  不重试。
+- **并发** = 单 worker 的池容量（`POOL_SIZE × MAX_PAGES`）。任务以连续流水线
+  方式运行——慢任务不会拖住其它任务。
+- **优雅关停。** 收到 SIGTERM 后停止拉取并排空 in-flight 任务
+  （`WORKER_DRAIN_MS`）；没跑完的保持 pending，由其它 worker 重认领。
+
+### 配置
+
+上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。
+worker 专属配置按用途分组：
+
+**Redis 连接**
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
@@ -913,6 +957,12 @@ worker 完成时把结果 JSON `PUBLISH` 到该频道（`RESULT_NOTIFY`，默认
 | `BROWSER_HEADLESS_REDIS_CLUSTER` | 未设置（false） | 设为 `1`/`true`/`yes`/`on` 把 `REDIS_URL` 当作 Redis **Cluster** 种子节点。worker 所有命令都是单 key，路由不会触发 CROSSSLOT；注意 job 流落在单个节点上（`result:{id}` 键分散到整个集群）。 |
 | `BROWSER_HEADLESS_REDIS_CA_CERT` | 未设置 | PEM 格式 CA 证书路径，用于验证服务端（私有 CA）。不设则用系统信任库。需配合 `rediss://` URL。单节点与 cluster 都生效。 |
 | `BROWSER_HEADLESS_REDIS_CLIENT_CERT` / `BROWSER_HEADLESS_REDIS_CLIENT_KEY` | 未设置 | PEM 格式客户端证书 + 私钥路径，用于**双向 TLS（mTLS）**。两者必须同时设置（只设其一是致命配置错误）。 |
+| `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | 打开 Redis 连接时 TCP + TLS + 认证握手的超时。从 redis-rs 默认的 1s 上调——1s 对高延迟 / 跨区域 Redis（如 Upstash）太短，会表现为连接 `timed out`。 |
+
+**队列与结果**
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
 | `BROWSER_HEADLESS_JOBS_STREAM` | `browser_headless:jobs` | 消费 job 的 stream。 |
 | `BROWSER_HEADLESS_CONSUMER_GROUP` | `workers` | consumer group——在多 worker 间均衡 job。 |
 | `BROWSER_HEADLESS_GROUP_START` | `0` | 消费组**首次创建**时的起点：`0` 消费 stream 里已有的全部（worker 启动前就入队的积压）；`$` 只消费创建之后的新消息。仅影响首次创建——组一旦存在就按自己的位置跨重启续读。 |
@@ -921,20 +971,71 @@ worker 完成时把结果 JSON `PUBLISH` 到该频道（`RESULT_NOTIFY`，默认
 | `BROWSER_HEADLESS_RESULT_TTL_SECS` | 3600 | 结果键 TTL（秒）。 |
 | `BROWSER_HEADLESS_RESULT_NOTIFY` | `true` | 写完 `result:{id}` 后把结果 JSON `PUBLISH` 到同名频道，客户端可 `SUBSCRIBE` 阻塞等待而非轮询。结果键仍会写入；设 `false` 关闭发布。 |
 | `BROWSER_HEADLESS_DELETE_ON_ACK` | `true` | 处理 + ack 后 `XDEL` 把该条从 stream 删除，避免 stream 无限增长（结果仍在 `result:{id}`）。设 `false` 保留条目——例如要回放、或同一 stream 上挂第二个消费组（`XDEL` 是全局的、对**所有**消费组生效，那时改用 MAXLEN 自己控量）。 |
+
+**调优与关停**
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
 | `BROWSER_HEADLESS_JOB_BLOCK_MS` | 60000 | `XREADGROUP` 阻塞时长，到点后做一次 reclaim。窗口拉长**不会**增加任务延迟（阻塞读在新条目到达的瞬间立即返回），只降低空转频率（每次超时 = 1 条 `XREADGROUP` + 1 条 `XAUTOCLAIM`）——对按命令条数计费/限额的云 Redis（如 Upstash 免费档）很重要。网页检测本就不是实时型负载，分钟级空转节奏完全够用。仅当需要更快接管崩溃 worker 的遗留任务时才调小（最坏多等 ~1 个窗口，叠加在 `JOB_VISIBILITY_MS` 之上）。 |
 | `BROWSER_HEADLESS_JOB_VISIBILITY_MS` | 120000 | 条目空闲多久后可被其它 worker 重认领。 |
 | `BROWSER_HEADLESS_JOB_MAX_RETRIES` | 2 | 写终态错误前对**瞬时**失败（408 / 502 / 503 / 504）的重试次数。确定性失败（400 / 401 / 403 / 404）不重试。`0` 关闭重试。 |
 | `BROWSER_HEADLESS_JOB_RETRY_BACKOFF_MS` | 500 | 瞬时失败重试之间的固定退避。 |
-| `BROWSER_HEADLESS_REDIS_CONNECT_TIMEOUT_MS` | 5000 | 打开 Redis 连接时 TCP + TLS + 认证握手的超时。从 redis-rs 默认的 1s 上调——1s 对高延迟 / 跨区域 Redis（如 Upstash）太短，会表现为连接 `timed out`。 |
 | `BROWSER_HEADLESS_HEALTH_PORT` | 3000 | worker 的 `/healthz` + `/readyz` + `/metrics` 监听端口（worker 本身不绑 API 端口）。`healthcheck` 子命令探测此端口。 |
 | `BROWSER_HEADLESS_METRICS_SAMPLE_SECS` | 300 | worker 多久刷新一次队列深度 gauge（`worker_stream_length` / `worker_pending`），通过 `XLEN` + `XPENDING`（每次采样 2 条命令）。非实时的检测型负载，队列深度 5 分钟粒度足够；按可观测性粒度与 Redis 命令预算的取舍调整。 |
 | `BROWSER_HEADLESS_WORKER_DRAIN_MS` | 30000 | 收到 SIGTERM / SIGINT 后，worker 等待 in-flight 任务完成多久再退出。到点仍在跑的任务保持 pending，由其它 worker 重认领。 |
 
-上面[配置](#配置)里的 池 / 回收 / SSRF / 超时 等环境变量对 worker 同样生效。
+### 健康与指标
+
 worker 不绑 API 端口，但**会**在 `BROWSER_HEADLESS_HEALTH_PORT`（默认 3000）上
 提供 `/healthz`、`/readyz`、`/metrics`——和 HTTP 服务一样可探针 / 可抓取，并额外
 暴露 `worker_*` 指标（任务数、耗时、in-flight、reclaim、stream 长度、pending）。
 同时关注 Redis consumer-group lag（`worker_pending` / `XPENDING`）。
+
+---
+
+## MCP 服务（AI agent 接入）
+
+抓取引擎同时通过 [Model Context Protocol](https://modelcontextprotocol.io)
+暴露为工具，AI agent（Claude Code、Claude Desktop 或任意 MCP 客户端）可以
+直接驱动浏览器。与 REST API 共用同一个浏览器池、同一套 SSRF 守卫、准入控制
+与指标 —— MCP 是继 HTTP、Redis worker 之后的第三个前端。
+
+### 工具
+
+| 工具 | 参数 | 返回 |
+|---|---|---|
+| `fetch_page` | `url`、`format`（默认 `markdown` / `text` / `html`）、`timeout_ms`、`wait_for_element`、`wait_for_network_idle` | 渲染后的页面正文（JavaScript 已执行，SPA 可用）。默认走较快的 `load` 事件路径；内容靠后续 XHR 加载时设 `wait_for_network_idle=true`。 |
+| `screenshot` | `url`、`width`、`height`、`timeout_ms` | 渲染视口的 PNG 截图，以 MCP image block 返回。 |
+| `page_audit` | `url`、`lang`（默认 `en` / `zh`）、`timeout_ms` | markdown 报告：加载耗时、Core Web Vitals、资源/网络汇总、JS 异常、安全扫描、元数据。不含页面正文 —— 取正文用 `fetch_page`。 |
+
+REST 侧的重量级载荷（`resources[]`、HAR、DOM 快照、PDF）**刻意不**做成
+工具 —— 工具输出会进入模型的上下文窗口，所以工具面有意保持精简。
+
+抓取失败（SSRF 拦截、池饱和、超时）以带 HTTP 状态码的工具级错误返回
+（`capture failed (HTTP 403): blocked IPv4 host …`），模型可据此
+反应 —— 修正 URL、退避、重试。
+
+### Streamable HTTP（serve / all 模式）
+
+`/mcp` 自动挂载在 API 端口上（用 `BROWSER_HEADLESS_DISABLE_MCP=true`
+关闭）。与 capture 路由共用同一套 `X-Api-Key` 鉴权和限流：
+
+```bash
+claude mcp add --transport http browser http://your-host:3000/mcp \
+  --header "X-Api-Key: your-key"
+```
+
+### stdio（`BROWSER_HEADLESS_MODE=mcp`）
+
+适用于由 MCP 客户端本地拉起进程的场景。进程自带浏览器池，日志走
+**stderr**（stdout 是协议通道）：
+
+```bash
+claude mcp add browser \
+  --env BROWSER_HEADLESS_MODE=mcp \
+  --env CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  -- /path/to/browser-headless
+```
 
 ---
 

@@ -47,10 +47,11 @@ capture engine is reusable outside HTTP:
   `BROWSER_HEADLESS_MODE` — `serve` (default) runs the HTTP API, `worker` runs
   the Redis queue consumer (plus a health-only `/healthz`+`/readyz`+`/metrics`
   listener on `BROWSER_HEADLESS_HEALTH_PORT`, default 3000), `all` runs both in
-  one process (worker as a background task) sharing one `CaptureCtx` / pool. A
-  `healthcheck` argv subcommand (`browser-headless healthcheck`) does an
-  internal `GET /healthz` and exits 0/1 — it's the container HEALTHCHECK, so
-  the image needs no curl/wget.
+  one process (worker as a background task) sharing one `CaptureCtx` / pool,
+  `mcp` serves MCP over stdio (logs rerouted to stderr — stdout is the
+  protocol channel). A `healthcheck` argv subcommand
+  (`browser-headless healthcheck`) does an internal `GET /healthz` and exits
+  0/1 — it's the container HEALTHCHECK, so the image needs no curl/wget.
 - **`config.rs`** — env-backed knobs, each cached once (`default_timeout_ms`,
   `deadline_buffer_ms`, `max_batch_urls`, `checkout_wait_ms`, `health_port`).
 - **`capture.rs`** — the **HTTP-agnostic capture core**. `CaptureCtx { pool,
@@ -69,6 +70,18 @@ capture engine is reusable outside HTTP:
   `CaptureCtx`; `HealthState` (a `FromRef` sub-state, no API key) backs the
   probe/metrics routes, and `health_router()` exposes just those three for
   worker mode.
+- **`mcp.rs`** — the MCP (Model Context Protocol) front-end via the official
+  `rmcp` SDK: three lean tools (`fetch_page` / `screenshot` / `page_audit`)
+  that all funnel into `capture::capture_one`, so SSRF, admission control,
+  clamps, and metrics apply unchanged. Two transports off one `McpServer`:
+  Streamable HTTP mounted at `/mcp` by `http::router` (behind the same
+  X-Api-Key check, via router-side middleware — the MCP service is a raw tower
+  service and can't run handler auth), and stdio for `BROWSER_HEADLESS_MODE=mcp`.
+  Depends on `capture` + `browser` + `rate_limit` — never axum. Heavy payloads
+  (`resources[]`, HAR, PDF, DOM snapshots) are deliberately NOT exposed as
+  tools; `page_audit` blanks `stat.data` before `to_markdown` so the report
+  isn't drowned by page HTML. Disable the HTTP mount with
+  `BROWSER_HEADLESS_DISABLE_MCP`.
 - **`pool.rs`** — `BrowserPool`: a fixed pool of N chromium instances.
   `checkout()` routes each request to the least-loaded active instance and is
   the concurrency gate (per-instance semaphore of `pages_per_instance`; total

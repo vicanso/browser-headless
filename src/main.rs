@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod http;
 mod jobs;
+mod mcp;
 mod pool;
 mod queue;
 mod rate_limit;
@@ -25,15 +26,31 @@ use crate::rate_limit::RateLimiter;
 fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,chromiumoxide::conn=off,chromiumoxide::handler=off".into());
-    match config::log_format() {
-        LogFormat::Json => {
+    // stdio MCP mode speaks JSON-RPC on stdout — a single log line there
+    // corrupts the protocol stream, so logs must go to stderr.
+    let log_to_stderr = std::env::var("BROWSER_HEADLESS_MODE").is_ok_and(|m| m == "mcp");
+    match (config::log_format(), log_to_stderr) {
+        (LogFormat::Json, false) => {
             tracing_subscriber::fmt()
                 .json()
                 .with_env_filter(filter)
                 .init();
         }
-        LogFormat::Text => {
+        (LogFormat::Json, true) => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+        (LogFormat::Text, false) => {
             tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        (LogFormat::Text, true) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
         }
     }
 
@@ -56,8 +73,11 @@ fn main() {
 
 /// Dispatch on `BROWSER_HEADLESS_MODE`: `serve` (default) runs the HTTP API,
 /// `worker` runs the Redis queue consumer, `all` runs both in one process
-/// sharing a single browser pool. The serve and worker code paths never call
-/// into each other; `all` just starts both against the same `CaptureCtx`.
+/// sharing a single browser pool, `mcp` runs an MCP server over stdio (for
+/// clients that spawn the binary locally — the HTTP API already exposes the
+/// same tools at `/mcp` in serve/all mode). The serve and worker code paths
+/// never call into each other; `all` just starts both against the same
+/// `CaptureCtx`.
 async fn run() {
     // `browser-headless healthcheck` — probe the local health endpoint and exit
     // 0 (HTTP 200) / 1 (anything else). Used as the container HEALTHCHECK so the
@@ -74,10 +94,22 @@ async fn run() {
         "serve" => run_serve().await,
         "worker" => run_worker().await,
         "all" => run_all().await,
+        "mcp" => run_mcp().await,
         other => {
-            panic!("unknown BROWSER_HEADLESS_MODE `{other}` (expected `serve`, `worker`, or `all`)")
+            panic!(
+                "unknown BROWSER_HEADLESS_MODE `{other}` (expected `serve`, `worker`, `all`, or `mcp`)"
+            )
         }
     }
+}
+
+/// stdio MCP mode: launch the pool, then serve MCP over stdin/stdout until
+/// the client disconnects or the process is signalled. No HTTP listener and
+/// no Prometheus recorder — the metric macros inside `capture_one` no-op
+/// without one, which is fine for a client-spawned local process.
+async fn run_mcp() {
+    let ctx = build_capture_ctx().await;
+    mcp::run_stdio(ctx, install_shutdown()).await;
 }
 
 /// Launch the browser pool and build the shared, HTTP-agnostic capture context.
@@ -202,6 +234,9 @@ async fn serve_http(
     let jobs = queue::init_jobs_backend().await;
     if jobs.is_some() {
         tracing::info!("async job API enabled at POST /jobs + GET /jobs/:id");
+    }
+    if !config::disable_mcp() {
+        tracing::info!("MCP endpoint enabled at /mcp (streamable HTTP)");
     }
     // Kept for the post-serve drain — `state` is consumed by the router.
     let jobs_drain = jobs.clone();
