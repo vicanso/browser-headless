@@ -1004,9 +1004,12 @@ worker 不绑 API 端口，但**会**在 `BROWSER_HEADLESS_HEALTH_PORT`（默认
 
 | 工具 | 参数 | 返回 |
 |---|---|---|
-| `fetch_page` | `url`、`format`（默认 `markdown` / `text` / `html`）、`timeout_ms`、`wait_for_element`、`wait_for_network_idle` | 渲染后的页面正文（JavaScript 已执行，SPA 可用）。默认走较快的 `load` 事件路径；内容靠后续 XHR 加载时设 `wait_for_network_idle=true`。 |
-| `screenshot` | `url`、`width`、`height`、`timeout_ms` | 渲染视口的 PNG 截图，以 MCP image block 返回。 |
-| `page_audit` | `url`、`lang`（默认 `en` / `zh`）、`timeout_ms` | markdown 报告：加载耗时、Core Web Vitals、资源/网络汇总、JS 异常、安全扫描、元数据。不含页面正文 —— 取正文用 `fetch_page`。 |
+| `fetch_page` | `url`、`format`（默认 `markdown` / `text` / `html`）、`timeout_ms`、`wait_for_element`、`wait_for_network_idle`、`max_chars`（默认 30000，上限 200000） | **读正文默认工具。** 固定元数据头（`status` / `final_url` / `char_count` / `truncated`）+ 正文；正文按 `max_chars` 截断，避免撑爆模型上下文。默认走 `load` 快路径。 |
+| `page_signals` | `url`、`timeout_ms`、`wait_for_network_idle` | **轻量健康/性能/安全信号。** 仅紧凑 JSON（状态、跳转、load/FCP、Web Vitals、异常计数、4xx/5xx、安全头、title、`ok`）。优先于 `page_audit`。 |
+| `screenshot` | `url`、`width`、`height`、`timeout_ms` | 视口 PNG（image block）。仅在需要「看」布局时用。 |
+| `page_audit` | `url`、`lang`（默认 `en` / `zh`）、`timeout_ms` | **重** markdown 诊断报告。不含正文。优先用 `page_signals` 做初筛。 |
+
+**Agent 选型：** 读内容 → `fetch_page`；快慢/是否坏 → `page_signals`；深度报告 → `page_audit`；看 UI → `screenshot`。
 
 REST 侧的重量级载荷（`resources[]`、HAR、DOM 快照、PDF）**刻意不**做成
 工具 —— 工具输出会进入模型的上下文窗口，所以工具面有意保持精简。

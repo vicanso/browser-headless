@@ -200,6 +200,15 @@ pub(crate) fn init_metrics() -> PrometheusHandle {
         Unit::Seconds,
         "Per-job local async capture time (queue wait + capture)"
     );
+    describe_counter!(
+        "browser_headless_mcp_tool_calls_total",
+        "MCP tool invocations, labelled by tool name and outcome (ok/error/rate_limited)"
+    );
+    describe_histogram!(
+        "browser_headless_mcp_tool_duration_seconds",
+        Unit::Seconds,
+        "MCP tool wall time, labelled by tool name"
+    );
     handle
 }
 

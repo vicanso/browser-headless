@@ -1091,13 +1091,25 @@ REST API — MCP is a third front-end next to HTTP and the Redis worker.
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `fetch_page` | `url`, `format` (`markdown` default / `text` / `html`), `timeout_ms`, `wait_for_element`, `wait_for_network_idle` | The rendered page body (JavaScript executed, so SPAs work). Uses the fast `load`-event path by default; set `wait_for_network_idle=true` for late-XHR content. |
-| `screenshot` | `url`, `width`, `height`, `timeout_ms` | A PNG of the rendered viewport, returned as an MCP image block. |
-| `page_audit` | `url`, `lang` (`en` default / `zh`), `timeout_ms` | Markdown report: load timings, Core Web Vitals, resource/network summary, JS exceptions, security scan, metadata. The page body is omitted — use `fetch_page` for content. |
+| `fetch_page` | `url`, `format` (`markdown` default / `text` / `html`), `timeout_ms`, `wait_for_element`, `wait_for_network_idle`, `max_chars` (default 30000, cap 200000) | **Default for reading content.** Always starts with a meta header (`status`, `final_url`, `char_count`, `truncated` [+ `truncated_note`]), then the body. Body is truncated at `max_chars` so large pages do not flood the model context. Fast `load` path by default. |
+| `page_signals` | `url`, `timeout_ms`, `wait_for_network_idle` | **Cheap triage.** Compact JSON only: status, redirects, load/FCP/DCL, Core Web Vitals, JS exception counts, 4xx/5xx/network failure counts, security header flags, title/metadata, `ok` boolean. Prefer this over `page_audit` for health/perf checks. |
+| `screenshot` | `url`, `width`, `height`, `timeout_ms` | Viewport PNG as an MCP image block. Use only when the agent must *see* layout. |
+| `page_audit` | `url`, `lang` (`en` default / `zh`), `timeout_ms` | **Heavy** markdown report (vitals, network summary, exceptions, security, SEO). Page body omitted. Prefer `page_signals` first. |
+
+**Agent decision tree (also advertised in MCP `instructions`):**
+
+1. Read / summarize text → `fetch_page`
+2. Is it slow / broken / redirected / missing HSTS? → `page_signals`
+3. Deep diagnosis after signals or user asks for a full report → `page_audit`
+4. Visual layout only → `screenshot`
 
 The heavyweight REST payloads (`resources[]`, HAR, DOM snapshots, PDF) are
 deliberately **not** exposed as tools — tool output lands in a model's context
 window, so the tool surface stays lean by design.
+
+**Metrics:** `browser_headless_mcp_tool_calls_total{tool,outcome}` and
+`browser_headless_mcp_tool_duration_seconds{tool}` (stdio mode has no Prometheus
+recorder unless you scrape another process; serve/all expose them on `/metrics`).
 
 Capture failures (SSRF-blocked URL, pool saturation, timeout) surface as
 tool-level errors carrying the HTTP status (`capture failed (HTTP 403):

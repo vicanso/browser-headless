@@ -71,7 +71,8 @@ capture engine is reusable outside HTTP:
   probe/metrics routes, and `health_router()` exposes just those three for
   worker mode.
 - **`mcp.rs`** — the MCP (Model Context Protocol) front-end via the official
-  `rmcp` SDK: three lean tools (`fetch_page` / `screenshot` / `page_audit`)
+  `rmcp` SDK: four agent-oriented tools (`fetch_page` with max_chars + meta
+  header / `page_signals` compact JSON / `screenshot` / `page_audit`)
   that all funnel into `capture::capture_one`, so SSRF, admission control,
   clamps, and metrics apply unchanged. Two transports off one `McpServer`:
   Streamable HTTP mounted at `/mcp` by `http::router` (behind the same
